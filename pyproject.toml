@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sidepulse-agent-monitor"
+version = "0.1.0"
+description = "Provider-neutral agent status collection for Codex and Claude hooks."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+sidepulse = "agent_monitor.cli:sidepulse_main"
+agent-monitor = "agent_monitor.cli:main"
+agent-status-bar = "agent_monitor.status_bar:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
