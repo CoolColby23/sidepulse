@@ -189,19 +189,18 @@ def hook_command(
     python_executable: str | None = None,
 ) -> str:
     executable = python_executable or sys.executable or "python3"
+    entry_point = Path(__file__).with_name("hook_entry.py")
     command = " ".join(
         [
             shlex.quote(executable),
-            "-m",
-            "agent_monitor",
-            "hook-log",
+            shlex.quote(str(entry_point)),
             "--provider",
             shlex.quote(provider),
             "--log",
             shlex.quote(str(log_path.expanduser())),
         ]
     )
-    return hook_pythonpath_assignment() + command
+    return command
 
 
 def hook_pythonpath_assignment() -> str:
@@ -351,7 +350,7 @@ def resolve_codex_hook_hashes(
         key = hook.get("key")
         if hook.get("sourcePath") != source_path:
             continue
-        if not isinstance(command, str) or "agent_monitor hook-log" not in command:
+        if not isinstance(command, str) or "hook_entry.py" not in command:
             continue
         if not isinstance(current_hash, str) or not isinstance(key, str):
             continue
@@ -364,6 +363,7 @@ def codex_cli_path() -> Path | None:
     candidates = [
         Path(env_path).expanduser() if env_path else None,
         Path("/Applications/Codex.app/Contents/Resources/codex"),
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
         Path(shutil.which("codex")).expanduser() if shutil.which("codex") else None,
     ]
     for candidate in candidates:
@@ -422,12 +422,11 @@ def toml_basic_string_escape(value: str) -> str:
 
 
 def strip_managed_block(text: str) -> str:
-    pattern = re.compile(
-        rf"^[^\n]*{re.escape(MANAGED_START)}[^\n]*\n.*?"
-        rf"^[^\n]*{re.escape(MANAGED_END)}[^\n]*\n?",
-        re.MULTILINE | re.DOTALL,
-    )
-    return pattern.sub("", text)
+    # Codex may append its own tables between these comments when it rewrites
+    # config.toml.  Remove only the comments; hook tables are removed below.
+    return "\n".join(
+        line for line in text.splitlines() if line.strip() not in {MANAGED_START, MANAGED_END}
+    ) + ("\n" if text.endswith("\n") else "")
 
 
 def remove_codex_hook_blocks_for_log(text: str, log_path: Path) -> str:
@@ -448,7 +447,7 @@ def remove_codex_hook_blocks_for_log(text: str, log_path: Path) -> str:
                     break
                 end += 1
             block = "".join(lines[index:end])
-            if target in block or "agent_monitor hook-log" in block:
+            if target in block or "agent_monitor hook-log" in block or "hook_entry.py" in block:
                 index = end
                 continue
 
@@ -476,7 +475,7 @@ def remove_claude_hooks_for_log(entries: list[Any], log_path: Path) -> list[dict
             if not isinstance(hook, dict):
                 continue
             command = hook.get("command", "")
-            if target in command or "agent_monitor hook-log" in command:
+            if target in command or "agent_monitor hook-log" in command or "hook_entry.py" in command:
                 continue
             cleaned_hooks.append(hook)
         if cleaned_hooks:

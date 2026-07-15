@@ -163,6 +163,12 @@ Install locally for the `sidepulse` CLI:
 python3 -m pip install -e .
 ```
 
+To use the macOS status-bar app, install its Cocoa extra:
+
+```sh
+python3 -m pip install -e ".[status-bar]"
+```
+
 On Homebrew Python, use the user-site install form:
 
 ```sh
@@ -183,6 +189,10 @@ sidepulse agent-monitor install
 sidepulse agent-monitor install codex
 sidepulse agent-monitor install claude
 ```
+
+Each hook invokes a small, standard-library-only Python entry point. It writes
+the event to the monitor log and then makes a short best-effort local socket
+delivery to the status-bar app.
 
 Show current aggregated status:
 

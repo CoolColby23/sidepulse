@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+status-bar = ["pyobjc-framework-Cocoa>=10"]
+
 [project.scripts]
 sidepulse = "agent_monitor.cli:sidepulse_main"
 agent-monitor = "agent_monitor.cli:main"

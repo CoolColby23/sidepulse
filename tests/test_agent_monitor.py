@@ -304,8 +304,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn("hooks = true", text)
             self.assertIn('[hooks.state]', text)
             self.assertIn('source = "keep-me"', text)
-            self.assertIn("agent_monitor", text)
-            self.assertIn("hook-log", text)
+            self.assertIn("hook_entry.py", text)
             self.assertIn("--provider codex", text)
             self.assertIn(str(log), text)
             self.assertNotIn("echo old", text)
@@ -404,7 +403,7 @@ class AgentMonitorTests(unittest.TestCase):
                 for hook in entry["hooks"]
             ]
             self.assertIn("echo keep >> /tmp/other.log", commands)
-            self.assertTrue(any("agent_monitor" in command for command in commands))
+            self.assertTrue(any("hook_entry.py" in command for command in commands))
             self.assertFalse(any(command.startswith("jq -c") for command in commands))
             self.assertEqual(data["permissions"]["allow"], ["Bash(date)"])
 
