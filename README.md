@@ -9,9 +9,7 @@ PulseDot is the tiny two-LED USB-C version.
 They can display the status of an AI agent, battery level, or other system
 signals.
 
-The device mounts as a flash drive. Control the LEDs by writing to `LEDS.LED`
-on current firmware. Older PulseDot firmware exposes the same control as
-`LEDS.TXT`, and the CLI keeps that fallback.
+The device mounts as a flash drive. Control the LEDs by writing to `LEDS.LED`.
 
 The LED control DSL is described in [`LEDS_FORMAT.txt`](LEDS_FORMAT.txt).
 
@@ -22,14 +20,12 @@ sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat"
 ```
 
 The CLI auto-detects mounted devices under `/Volumes` by looking for a
-SidePulse/PulseDot-style volume name, an existing `LEDS.LED`, or a legacy
-`LEDS.TXT`. If more than one device is possible, pass the mounted folder or
-file explicitly:
+SidePulse/PulseDot-style volume name or an existing `LEDS.LED`. If more than
+one device is possible, pass the mounted folder or file explicitly:
 
 ```sh
 sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat" --device /Volumes/SidePulse
 sidepulse write "off" --device /Volumes/SidePulse/LEDS.LED
-sidepulse write "off" --device /Volumes/PulseDot/LEDS.TXT
 ```
 
 The writer decodes simple escapes such as `\n`, then enforces the controller's
@@ -128,8 +124,7 @@ small `latest.json` restart snapshot plus provider JSONL debug logs. It does
 not rescan historical logs or transcripts on every refresh.
 
 The package can also mirror the aggregate state to a mounted SidePulse or
-PulseDot by writing the current LED program to `LEDS.LED`, with `LEDS.TXT`
-fallback for legacy firmware.
+PulseDot by writing the current LED program to `LEDS.LED`.
 
 The monitor currently supports:
 
@@ -168,6 +163,44 @@ To use the macOS status-bar app, install its Cocoa extra:
 ```sh
 python3 -m pip install -e ".[status-bar]"
 ```
+
+Set up this Mac explicitly after package install:
+
+```sh
+sidepulse setup
+```
+
+`sidepulse setup` installs or refreshes Codex and Claude hooks, installs the SD
+eject guard, writes the status-bar LaunchAgent, starts both helpers
+immediately, and enables them at login. This is intentionally an explicit
+command instead of a `pip install` side effect. To set up only one provider, use
+`sidepulse setup codex` or `sidepulse setup claude`. To skip the status-bar app
+but still install hooks and the SD eject guard, use `sidepulse setup
+--no-status-bar`.
+
+The SD eject guard keeps the built-in SD reader attached after macOS hibernate
+or lock-screen mount refusals. By default setup installs it system-wide when
+already running with system permissions, otherwise as a per-user LaunchAgent:
+
+```sh
+sidepulse setup --sd-eject-guard-scope auto
+sidepulse setup --sd-eject-guard-scope user
+sidepulse setup --sd-eject-guard-scope system --no-status-bar
+```
+
+The system scope requires the command to already have system install
+permissions.
+
+Manage the SD eject guard directly:
+
+```sh
+sidepulse sdejectguard start
+sidepulse sdejectguard stop
+sidepulse sdejectguard logs
+sidepulse sdejectguard start -it
+```
+
+`start -it` runs the guard in the current terminal for interactive debugging.
 
 On Homebrew Python, use the user-site install form:
 
@@ -287,15 +320,16 @@ sidepulse agent-monitor uninstall claude
 Install and start the macOS status-bar app:
 
 ```sh
-sidepulse agent-monitor status-bar
+sidepulse status-bar
+sidepulse status-bar start
 ```
 
-This writes `~/Library/LaunchAgents/com.sidepulse.agentstatus.plist`, starts the
+This writes `~/Library/LaunchAgents/io.sidepulse.agentstatus.plist`, starts the
 menu-bar app immediately, enables it at login, and mirrors the same aggregate
 state to the LEDs. For debugging, run it in the foreground:
 
 ```sh
-sidepulse agent-monitor status-bar --foreground
+sidepulse status-bar start --foreground
 ```
 
 The status-bar item shows one of four collapsed states:
@@ -307,12 +341,10 @@ The status-bar item shows one of four collapsed states:
 | Done | The most recent active agent completed successfully. |
 | Ask | An agent needs input, permission, or attention. |
 
-Click the status-bar item to expand the recent session list. Each session row
-has two actions:
-
-- `Deep Link` opens the provider app. Codex uses `codex://threads/<session-id>`.
-- `Resume` opens Terminal in the session working directory and runs the
-  provider CLI resume command.
+Click the status-bar item to expand the recent session list. Click a session
+row to open that agent using the remembered choice for that provider. Use the
+session's Open Options row to choose and remember another opener, such as the
+provider app, Terminal resume, or Claude Code in VS Code.
 
 The dropdown also includes a checked `Connect to Device` item. A checkmark means
 the status-bar app is actively connected to a mounted SidePulse/PulseDot target.
@@ -331,22 +363,47 @@ checkboxes control the file-based CLI/debug fallback; the status-bar app gets
 live updates from the local hook event socket. Settings are stored at
 `${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`.
 
-The checked `Keep Awake` item controls a macOS `caffeinate -dimsu` assertion.
-When enabled, the status-bar app keeps the Mac awake while agents are Working /
-Tool Running / Progressing. Done and Ask states keep the Mac awake for a
-five-minute grace period, then release the assertion so normal sleep can resume.
-While keep-awake is enabled and a device is connected, the app also touches a
-`keepalive` file on each SidePulse/PulseDot volume at least once per minute to
-keep the device volume active. Closed-lid sleep is still subject to macOS
-clamshell rules.
+The `Keep Awake With Lid Closed` menu section controls the stronger sleep
+prevention policy:
+
+| Choice | Behavior |
+| --- | --- |
+| Never | Do not use the closed-lid sleep override. |
+| When Agents Work | Keep the Mac awake while agents are Working / Tool Running / Progressing, plus the existing five-minute Ask / Done / Error grace period. |
+| Always | Keep the closed-lid sleep override active while the status-bar app is running. |
+
+The status-bar app still keeps the SidePulse/PulseDot volume active by touching
+a `keepalive` file on each connected device at least once per minute. The
+closed-lid policy uses `caffeinate` by default, so it does not ask for
+administrator permission in the background. For Macs that need the stronger
+system sleep-disable setting, explicitly enable `Strong Sleep Override...` in
+the menu or `Strong sleep override (requires helper)` in Settings, then run the
+one-time setup command:
+
+```sh
+sudo "$(command -v sidepulse)" status-bar install-sleep-helper
+```
+
+The helper is a narrow sudoers rule for exactly
+`/usr/bin/pmset -a disablesleep 0|1`, so the status-bar app can toggle it
+silently with non-interactive `sudo`. SidePulse only restores the setting if
+SidePulse changed it. Remove the helper with:
+
+```sh
+sudo "$(command -v sidepulse)" status-bar uninstall-sleep-helper
+```
+
+Open `Settings...` to edit and preview the Lid Closed and Lid Open LED
+animations. Animation programs use the same `LEDS.LED` syntax as
+`sidepulse write`; device brightness is applied automatically before writing.
 
 The app is also installed as a user LaunchAgent at
-`~/Library/LaunchAgents/com.sidepulse.agentstatus.plist`.
+`~/Library/LaunchAgents/io.sidepulse.agentstatus.plist`.
 
 Stop and remove the LaunchAgent:
 
 ```sh
-sidepulse agent-monitor status-bar --uninstall
+sidepulse status-bar stop
 ```
 
 Use it from another Python app:

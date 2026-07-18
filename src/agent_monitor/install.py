@@ -364,7 +364,6 @@ def codex_cli_path() -> Path | None:
         Path(env_path).expanduser() if env_path else None,
         Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
         Path("/Applications/Codex.app/Contents/Resources/codex"),
-        Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
         Path(shutil.which("codex")).expanduser() if shutil.which("codex") else None,
     ]
     for candidate in candidates:

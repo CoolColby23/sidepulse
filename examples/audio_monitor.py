@@ -17,11 +17,10 @@ if REPO_SRC.exists():
 from agent_monitor.device_writer import (  # noqa: E402
     DEFAULT_FILE_NAME,
     DeviceWriteError,
-    LEGACY_FILE_NAMES,
     validate_led_text,
     write_led_program,
 )
-from agent_monitor.led_status import led_count_for_target  # noqa: E402
+from agent_monitor.led_status import apply_brightness, led_count_for_target  # noqa: E402
 
 
 DEFAULT_FPS = 25.0
@@ -83,18 +82,20 @@ def build_led_program(
     peak = max(idle, clamp(max_brightness))
     fill = level * count
     duration = max(0, int(transition_ms))
+    global_brightness = int(round(peak * 255))
 
     segments: list[str] = []
     for index in range(count):
         segment_level = clamp(fill - index)
-        brightness = idle + ((peak - idle) * segment_level)
+        absolute_brightness = idle + ((peak - idle) * segment_level)
+        brightness = absolute_brightness / peak if peak > 0 else 0.0
         color = rgb_hex(scale_rgb(green_to_red_rgb(index, count), brightness))
         token = f"{index}:{color}"
         if duration:
             token += f" {duration}ms cosine"
         segments.append(token)
 
-    program = "; ".join(segments)
+    program = apply_brightness("; ".join(segments), global_brightness)
     validate_led_text(program)
     return program
 
@@ -381,10 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--file-name",
         default=DEFAULT_FILE_NAME,
-        help=(
-            f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}; "
-            f"legacy devices may use {', '.join(LEGACY_FILE_NAMES)}."
-        ),
+        help=f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}.",
     )
     parser.add_argument("--led-count", type=int, help="LED count. Defaults to device name, then 8.")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="LED update rate.")

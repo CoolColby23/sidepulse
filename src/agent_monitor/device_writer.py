@@ -5,8 +5,7 @@ from pathlib import Path
 from typing import Iterable
 
 DEFAULT_FILE_NAME = "LEDS.LED"
-LEGACY_FILE_NAMES = ("LEDS.TXT",)
-LED_FILE_NAMES = (DEFAULT_FILE_NAME, *LEGACY_FILE_NAMES)
+LED_FILE_NAMES = (DEFAULT_FILE_NAME,)
 KNOWN_LED_FILE_NAMES = frozenset(name.upper() for name in LED_FILE_NAMES)
 MAX_LED_BYTES = 512
 MAX_LED_LINES = 20
@@ -124,10 +123,6 @@ def resolve_target_path(
 def target_from_device_path(path: Path, file_name: str) -> Path:
     if path.name.upper() in KNOWN_LED_FILE_NAMES:
         return path
-    if file_name == DEFAULT_FILE_NAME:
-        existing = existing_led_file(path)
-        if existing is not None:
-            return existing
     return path / file_name
 
 
@@ -149,15 +144,6 @@ def discover_devices(
         elif name_matches:
             candidates.append(DeviceCandidate(volume, target, "name matches device"))
     return candidates
-
-
-def existing_led_file(volume: Path) -> Path | None:
-    for name in LED_FILE_NAMES:
-        target = volume / name
-        if path_exists(target):
-            return target
-    return None
-
 
 def iter_mounts(mount_root: Path) -> Iterable[Path]:
     try:

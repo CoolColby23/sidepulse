@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ from .battery import (
     render_battery_snapshot,
 )
 from .collector import AgentMonitor, SourceSpec, default_sources
-from .device_writer import DEFAULT_FILE_NAME, DeviceWriteError, LEGACY_FILE_NAMES, write_led_program
+from .device_writer import DEFAULT_FILE_NAME, DeviceWriteError, write_led_program
 from .hook import hook_log_main
 from .install import (
     install_claude_hooks,
@@ -25,6 +26,12 @@ from .install import (
     uninstall_codex_hooks,
 )
 from .led_status import AgentLedController, LedStatusWrite
+from .lid_sleep import (
+    install_sleep_helper,
+    sleep_helper_install_command,
+    sleep_helper_installed,
+    uninstall_sleep_helper,
+)
 from .models import AgentStatus
 from .providers import (
     detect_claude_config,
@@ -70,6 +77,34 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
         "agent-monitor",
         help="Install hooks and show live AI agent statuses.",
     )
+    setup = subparsers.add_parser(
+        "setup",
+        help="Install agent hooks and start the macOS status-bar app.",
+    )
+    setup.add_argument(
+        "provider",
+        choices=("all", "codex", "claude"),
+        nargs="?",
+        default="all",
+        help="Agent hooks to install. Default: all.",
+    )
+    setup.add_argument("--log-dir", type=Path, help="Directory for provider JSONL files.")
+    setup.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
+    setup.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
+    setup.add_argument("--dry-run", action="store_true", help="Show what would change.")
+    setup.add_argument(
+        "--sd-eject-guard-scope",
+        choices=("auto", "system", "user"),
+        default="auto",
+        help="Install the SD eject guard as a system service when possible, or as a user agent.",
+    )
+    setup.add_argument(
+        "--no-status-bar",
+        action="store_true",
+        help="Do not install or start the status-bar app.",
+    )
+    setup.set_defaults(func=cmd_sidepulse_setup)
+
     write = subparsers.add_parser(
         "write",
         help=f"Write an LED program to {DEFAULT_FILE_NAME} on a mounted SidePulse or PulseDot device.",
@@ -83,16 +118,85 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     write.add_argument(
         "--file-name",
         default=DEFAULT_FILE_NAME,
-        help=(
-            f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}; "
-            f"auto-detect falls back to {', '.join(LEGACY_FILE_NAMES)} when present."
-        ),
+        help=f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}.",
     )
     write.add_argument("--dry-run", action="store_true", help="Show the target without writing.")
     write.set_defaults(func=cmd_sidepulse_write)
 
+    add_sidepulse_status_bar_parser(subparsers)
+    add_sidepulse_sdejectguard_parser(subparsers)
     add_sidepulse_battery_parser(subparsers)
     return parser
+
+
+def add_sidepulse_status_bar_parser(subparsers: argparse._SubParsersAction) -> None:
+    status_bar = subparsers.add_parser(
+        "status-bar",
+        help="Start or stop the macOS SidePulse menu-bar app.",
+    )
+    status_bar.add_argument(
+        "status_bar_command",
+        choices=(
+            "start",
+            "stop",
+            "install-sleep-helper",
+            "uninstall-sleep-helper",
+            "sleep-helper-status",
+        ),
+        nargs="?",
+        default="start",
+        help="Start/stop the menu-bar app, or manage the closed-lid sleep helper. Default: start.",
+    )
+    status_bar.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Run the menu-bar app in the foreground instead of installing a LaunchAgent.",
+    )
+    status_bar.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show sleep-helper changes without writing them.",
+    )
+    status_bar.set_defaults(func=cmd_sidepulse_status_bar)
+
+
+def add_sidepulse_sdejectguard_parser(subparsers: argparse._SubParsersAction) -> None:
+    guard = subparsers.add_parser(
+        "sdejectguard",
+        help="Start, stop, or inspect the macOS SD eject guard.",
+    )
+    guard_subparsers = guard.add_subparsers(dest="sdejectguard_command", required=True)
+
+    start = guard_subparsers.add_parser("start", help="Install and start the SD eject guard.")
+    add_sdejectguard_scope_arg(start)
+    start.add_argument("--dry-run", action="store_true", help="Show what would change.")
+    start.add_argument(
+        "-it",
+        "--interactive",
+        action="store_true",
+        help="Run the guard in this terminal instead of launchd.",
+    )
+    start.set_defaults(func=cmd_sidepulse_sdejectguard_start)
+
+    stop = guard_subparsers.add_parser("stop", help="Stop the SD eject guard.")
+    add_sdejectguard_scope_arg(stop)
+    stop.add_argument("--dry-run", action="store_true", help="Show what would stop.")
+    stop.set_defaults(func=cmd_sidepulse_sdejectguard_stop)
+
+    logs = guard_subparsers.add_parser("logs", help="Show SD eject guard logs.")
+    add_sdejectguard_scope_arg(logs)
+    logs.add_argument("--lines", type=int, default=80, help="Lines to show per log file.")
+    logs.add_argument("-f", "--follow", action="store_true", help="Follow existing log files.")
+    logs.set_defaults(func=cmd_sidepulse_sdejectguard_logs)
+
+
+def add_sdejectguard_scope_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--scope",
+        choices=("auto", "system", "user"),
+        default="auto",
+        help="Use system scope when possible, or target one scope explicitly.",
+    )
 
 
 def add_sidepulse_battery_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -120,10 +224,7 @@ def add_sidepulse_battery_parser(subparsers: argparse._SubParsersAction) -> None
     leds.add_argument(
         "--file-name",
         default=DEFAULT_FILE_NAME,
-        help=(
-            f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}; "
-            f"auto-detect falls back to {', '.join(LEGACY_FILE_NAMES)} when present."
-        ),
+        help=f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}.",
     )
     leds.add_argument("--dry-run", action="store_true", help="Show writes without touching the device.")
     leds.add_argument("--once", action="store_true", help="Write the current battery state once and exit.")
@@ -251,6 +352,187 @@ def cmd_sidepulse_battery_configure(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sidepulse_status_bar(args: argparse.Namespace) -> int:
+    if args.status_bar_command == "install-sleep-helper":
+        return cmd_sidepulse_sleep_helper_install(args)
+    if args.status_bar_command == "uninstall-sleep-helper":
+        return cmd_sidepulse_sleep_helper_uninstall(args)
+    if args.status_bar_command == "sleep-helper-status":
+        return cmd_sidepulse_sleep_helper_status(args)
+
+    args.uninstall = args.status_bar_command == "stop"
+    args.no_start = False
+    if args.uninstall:
+        args.foreground = False
+    return cmd_status_bar(args)
+
+
+def cmd_sidepulse_sleep_helper_install(args: argparse.Namespace) -> int:
+    try:
+        result = install_sleep_helper(dry_run=args.dry_run)
+    except (PermissionError, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f"sleep-helper: {exc}", file=sys.stderr)
+        return 1
+
+    action = "would install" if result.dry_run and result.changed else "installed"
+    if not result.changed:
+        action = "already installed"
+    print(f"sleep-helper: {action}")
+    print(f"  user: {result.user}")
+    print(f"  sudoers: {result.path}")
+    return 0
+
+
+def cmd_sidepulse_sleep_helper_uninstall(args: argparse.Namespace) -> int:
+    try:
+        result = uninstall_sleep_helper(dry_run=args.dry_run)
+    except (PermissionError, OSError) as exc:
+        print(f"sleep-helper: {exc}", file=sys.stderr)
+        return 1
+
+    action = "would remove" if result.dry_run and result.changed else "removed"
+    if not result.changed:
+        action = "not installed"
+    print(f"sleep-helper: {action}")
+    print(f"  sudoers: {result.path}")
+    return 0
+
+
+def cmd_sidepulse_sleep_helper_status(_args: argparse.Namespace) -> int:
+    installed = sleep_helper_installed()
+    print(f"sleep-helper: {'installed' if installed else 'not installed'}")
+    if not installed:
+        print(f"  install: {sleep_helper_install_command()}")
+    return 0
+
+
+def cmd_sidepulse_sdejectguard_start(args: argparse.Namespace) -> int:
+    from .sd_eject_guard_launch import (
+        SdEjectGuardInstallError,
+        install_sd_eject_guard,
+        run_sd_eject_guard_interactive,
+    )
+
+    try:
+        if args.interactive:
+            if args.dry_run:
+                print(f"sd-eject-guard: would run interactively ({args.scope})")
+                return 0
+            return run_sd_eject_guard_interactive(scope=args.scope)
+
+        result = install_sd_eject_guard(scope=args.scope, dry_run=args.dry_run)
+    except (SdEjectGuardInstallError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"sd-eject-guard: {exc}", file=sys.stderr)
+        return 1
+
+    print_sd_eject_guard_result(result)
+    return 0
+
+
+def cmd_sidepulse_sdejectguard_stop(args: argparse.Namespace) -> int:
+    from .sd_eject_guard_launch import SdEjectGuardInstallError, stop_sd_eject_guard
+
+    try:
+        results = stop_sd_eject_guard(scope=args.scope, dry_run=args.dry_run)
+    except (SdEjectGuardInstallError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"sd-eject-guard: {exc}", file=sys.stderr)
+        return 1
+
+    for result in results:
+        if result.skipped:
+            action = f"skipped ({result.skipped})"
+        elif result.stopped:
+            action = "would stop" if args.dry_run else "stopped"
+        else:
+            action = "not installed"
+        print(f"sd-eject-guard: {action} ({result.scope})")
+        print(f"  plist: {result.plist_path}")
+    return 0
+
+
+def cmd_sidepulse_sdejectguard_logs(args: argparse.Namespace) -> int:
+    from .sd_eject_guard_launch import log_paths_for_requested_scope, read_log_tail
+
+    try:
+        paths = log_paths_for_requested_scope(args.scope)
+    except Exception as exc:
+        print(f"sd-eject-guard logs: {exc}", file=sys.stderr)
+        return 1
+
+    existing_paths = [path for path in paths if path.exists()]
+    if args.follow:
+        if not existing_paths:
+            for path in paths:
+                print(f"{path}: missing")
+            return 1
+        try:
+            return subprocess.run(
+                ["tail", "-n", str(args.lines), "-f", *(str(path) for path in existing_paths)],
+                check=False,
+            ).returncode
+        except KeyboardInterrupt:
+            return 130
+
+    for path in paths:
+        print(f"==> {path} <==")
+        if not path.exists():
+            print("(missing)")
+            continue
+        text = read_log_tail(path, args.lines)
+        print(text if text else "(empty)")
+    return 0
+
+
+def cmd_sidepulse_setup(args: argparse.Namespace) -> int:
+    results = install_hook_results(args)
+    print_install_results(results, dry_run=args.dry_run)
+
+    from .sd_eject_guard_launch import SdEjectGuardInstallError, install_sd_eject_guard
+
+    try:
+        guard_result = install_sd_eject_guard(
+            scope=args.sd_eject_guard_scope,
+            dry_run=args.dry_run,
+        )
+    except (SdEjectGuardInstallError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"sd-eject-guard: {exc}", file=sys.stderr)
+        return 1
+    print_sd_eject_guard_result(guard_result)
+
+    if args.no_status_bar:
+        return 0
+
+    if args.dry_run:
+        print("status-bar: would install and start")
+        return 0
+
+    from .status_bar_launch import install_launch_agent
+
+    result = install_launch_agent(start=True)
+    action = "installed" if result.changed else "already installed"
+    if result.started:
+        action += " and started"
+    print(f"status-bar: {action}")
+    print(f"  plist: {result.plist_path}")
+    return 0
+
+
+def print_sd_eject_guard_result(result) -> None:
+    if result.dry_run:
+        action = "would install and start" if result.changed else "would start (already configured)"
+    else:
+        action = "installed" if result.changed else "already installed"
+        if result.started:
+            action += " and started"
+    print(f"sd-eject-guard: {action} ({result.scope})")
+    print(f"  plist: {result.plist_path}")
+    print(f"  binary: {result.binary_path}")
+    if result.cleanup_removed:
+        print(f"  removed other scope: {result.cleanup_removed}")
+    if result.cleanup_skipped:
+        print(f"  cleanup skipped: {result.cleanup_skipped}")
+
+
 def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
@@ -280,10 +562,7 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
     leds.add_argument(
         "--file-name",
         default=DEFAULT_FILE_NAME,
-        help=(
-            f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}; "
-            f"auto-detect falls back to {', '.join(LEGACY_FILE_NAMES)} when present."
-        ),
+        help=f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}.",
     )
     leds.add_argument("--dry-run", action="store_true", help="Show writes without touching the device.")
     leds.add_argument("--once", action="store_true", help="Write the current status once and exit.")
@@ -467,7 +746,17 @@ def cmd_status_bar(args: argparse.Namespace) -> int:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    providers = ("codex", "claude") if args.provider == "all" else (args.provider,)
+    results = install_hook_results(args)
+    print_install_results(results, dry_run=args.dry_run)
+    return 0
+
+
+def selected_hook_providers(provider: str) -> tuple[str, ...]:
+    return ("codex", "claude") if provider == "all" else (provider,)
+
+
+def install_hook_results(args: argparse.Namespace):
+    providers = selected_hook_providers(args.provider)
     results = []
     for provider in providers:
         log_path = install_log_path(provider, args)
@@ -475,9 +764,12 @@ def cmd_install(args: argparse.Namespace) -> int:
             results.append(install_codex_hooks(log_path=log_path, dry_run=args.dry_run))
         else:
             results.append(install_claude_hooks(log_path=log_path, dry_run=args.dry_run))
+    return results
 
+
+def print_install_results(results, *, dry_run: bool) -> None:
     for result in results:
-        action = "would update" if args.dry_run and result.changed else "updated"
+        action = "would update" if dry_run and result.changed else "updated"
         if not result.changed:
             action = "already configured"
         print(f"{result.provider}: {action}")
@@ -485,7 +777,6 @@ def cmd_install(args: argparse.Namespace) -> int:
         print(f"  log: {result.log_path}")
         if result.backup_path:
             print(f"  backup: {result.backup_path}")
-    return 0
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
@@ -538,11 +829,12 @@ def monitor_from_args(args: argparse.Namespace) -> AgentMonitor:
 
 
 def install_log_path(provider: str, args: argparse.Namespace) -> Path:
-    explicit = args.codex_log if provider == "codex" else args.claude_log
+    explicit = getattr(args, "codex_log", None) if provider == "codex" else getattr(args, "claude_log", None)
     if explicit:
         return explicit.expanduser()
-    if args.log_dir:
-        return args.log_dir.expanduser() / f"{provider}.jsonl"
+    log_dir = getattr(args, "log_dir", None)
+    if log_dir:
+        return log_dir.expanduser() / f"{provider}.jsonl"
     return default_log_path(provider)
 
 

@@ -18,13 +18,18 @@ try:
         NSBezelStyleRounded,
         NSButton,
         NSButtonTypeSwitch,
+        NSFont,
         NSImage,
         NSMenu,
         NSMenuItem,
         NSOffState,
         NSOnState,
+        NSScrollView,
+        NSSlider,
         NSStatusBar,
         NSTextField,
+        NSTextView,
+        NSView,
         NSWorkspace,
         NSWindow,
         NSWindowStyleMaskClosable,
@@ -42,7 +47,6 @@ except ImportError as exc:  # pragma: no cover - only exercised on non-macOS set
 from .battery import (
     BatteryLedController,
     BatterySnapshot,
-    battery_state_label,
     format_watts,
     read_battery_snapshot,
 )
@@ -51,9 +55,13 @@ from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
     DeviceCandidate,
+    DeviceWriteError,
     discover_devices,
+    normalize_led_text,
     path_exists,
     target_from_device_path,
+    validate_led_text,
+    write_led_program,
 )
 from .keep_awake import KEEPALIVE_FILE_NAME, KeepAwakeController
 from .ipc import HookEventServer, default_event_socket_path, default_latest_state_path
@@ -63,7 +71,21 @@ from .install import (
     uninstall_claude_hooks,
     uninstall_codex_hooks,
 )
-from .led_status import AgentLedController, normalized_device_name, write_mode_to_leds
+from .led_status import (
+    AgentLedController,
+    apply_brightness,
+    brightness_percent,
+    normalize_brightness,
+    normalized_device_name,
+    write_mode_to_leds,
+)
+from .lid_sleep import (
+    LID_POLL_SECONDS,
+    ClosedLidAwakeController,
+    read_lid_closed,
+    sleep_helper_install_command,
+    sleep_helper_installed,
+)
 from .models import AgentMode, AgentStatus
 from .providers import (
     ProviderConfig,
@@ -72,12 +94,26 @@ from .providers import (
     detect_log_path,
     parse_log_line,
 )
-from .session_actions import session_deep_link, session_resume_command
+from .session_actions import (
+    available_session_open_actions,
+    default_session_open_action,
+    session_open_action_label,
+    session_open_target,
+)
 from .settings import (
+    CLOSED_LID_AWAKE_AGENTS,
+    CLOSED_LID_AWAKE_ALWAYS,
+    CLOSED_LID_AWAKE_CHOICES,
+    CLOSED_LID_AWAKE_NEVER,
     LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
+    LID_ANIMATION_CLOSED,
+    LID_ANIMATION_OPEN,
+    LedAnimationSetting,
     default_settings_path,
+    default_lid_animation,
     load_settings,
+    normalize_animation_duration,
     save_settings,
 )
 
@@ -97,6 +133,7 @@ class StatusBarDevice:
     target: Path
     connected: bool
     display: str
+    brightness: int = 255
     reason: str = ""
 
 
@@ -109,6 +146,16 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = ("SidePulse", "PulseDot")
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
 STATUS_BAR_STARTUP_REPLAY_LINES = 200
+LID_ANIMATION_RESTORE_FUDGE_SECONDS = 0.15
+LID_ANIMATION_LABELS = {
+    LID_ANIMATION_CLOSED: "Lid Closed",
+    LID_ANIMATION_OPEN: "Lid Open",
+}
+CLOSED_LID_AWAKE_LABELS = {
+    CLOSED_LID_AWAKE_NEVER: "Never",
+    CLOSED_LID_AWAKE_AGENTS: "When Agents Work",
+    CLOSED_LID_AWAKE_ALWAYS: "Always",
+}
 
 
 def state_for_mode(mode: AgentMode) -> StatusBarState:
@@ -160,6 +207,7 @@ class StatusBarController(NSObject):
         self.event_server = None
         self.status_item = None
         self.timer = None
+        self.lid_timer = None
         self.settings_window = None
         self.settings_fields = {}
         self.settings_buttons = {}
@@ -180,9 +228,17 @@ class StatusBarController(NSObject):
         self.last_led_error = None
         self.last_led_display_kind = LED_DISPLAY_AGENT
         self.keep_awake = KeepAwakeController()
+        self.closed_lid_awake = ClosedLidAwakeController(
+            use_system_disable=self.settings.closed_lid_system_override_enabled,
+        )
         self.last_keep_awake_error = None
+        self.last_closed_lid_awake_error = None
         self.last_status_read_error = None
         self.event_refresh_pending = False
+        self.last_lid_closed = None
+        self.last_lid_error = None
+        self.led_animation_until_monotonic = 0.0
+        self.led_animation_token = 0
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
@@ -205,6 +261,13 @@ class StatusBarController(NSObject):
             STATUS_BAR_REFRESH_SECONDS,
             self,
             "refresh:",
+            None,
+            True,
+        )
+        self.lid_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            LID_POLL_SECONDS,
+            self,
+            "pollLid:",
             None,
             True,
         )
@@ -242,15 +305,24 @@ class StatusBarController(NSObject):
         url = sender.representedObject()
         if not url:
             return
-        ns_url = NSURL.URLWithString_(str(url))
-        if ns_url is not None:
-            NSWorkspace.sharedWorkspace().openURL_(ns_url)
+        open_url(str(url))
 
     @objc.IBAction
     def resumeSession_(self, sender):
         command = sender.representedObject()
         if command:
             open_terminal_command(str(command))
+
+    @objc.IBAction
+    def openSession_(self, sender):
+        self.open_session(sender.representedObject(), None, remember=False)
+
+    @objc.IBAction
+    def openSessionWithAction_(self, sender):
+        payload = sender.representedObject()
+        if not isinstance(payload, dict):
+            return
+        self.open_session(payload.get("status"), payload.get("action"), remember=True)
 
     @objc.IBAction
     def toggleDeviceConnection_(self, _sender):
@@ -265,6 +337,18 @@ class StatusBarController(NSObject):
         self.keep_awake.set_enabled(not self.keep_awake.enabled)
         log_status_bar(f"keep_awake={'on' if self.keep_awake.enabled else 'off'}")
         self.refresh_(None)
+
+    @objc.IBAction
+    def setClosedLidAwakePolicy_(self, sender):
+        self.set_closed_lid_awake_policy(sender.representedObject())
+
+    @objc.IBAction
+    def toggleClosedLidSystemOverride_(self, sender):
+        if hasattr(sender, "state"):
+            enabled = sender.state() != NSOnState
+        else:
+            enabled = not self.settings.closed_lid_system_override_enabled
+        self.set_closed_lid_system_override(enabled)
 
     @objc.IBAction
     def openSettings_(self, _sender):
@@ -311,6 +395,10 @@ class StatusBarController(NSObject):
         self.set_battery_power_preview(sender.state() == NSOnState)
 
     @objc.IBAction
+    def setClosedLidSystemOverrideFromCheckbox_(self, sender):
+        self.set_closed_lid_system_override(sender.state() == NSOnState)
+
+    @objc.IBAction
     def setDeviceDisplayAgent_(self, sender):
         self.set_device_display(sender.representedObject(), LED_DISPLAY_AGENT)
 
@@ -319,12 +407,49 @@ class StatusBarController(NSObject):
         self.set_device_display(sender.representedObject(), LED_DISPLAY_BATTERY)
 
     @objc.IBAction
+    def setDeviceBrightness_(self, sender):
+        device_id = sender.identifier()
+        if device_id is None:
+            return
+        self.set_device_brightness(str(device_id), sender.doubleValue())
+
+    @objc.IBAction
+    def saveLidAnimations_(self, _sender):
+        self.save_lid_animations_from_fields()
+
+    @objc.IBAction
+    def previewLidClosedAnimation_(self, _sender):
+        animation = self.lid_animation_from_fields(LID_ANIMATION_CLOSED)
+        if animation is not None:
+            self.play_lid_animation(LID_ANIMATION_CLOSED, animation=animation)
+
+    @objc.IBAction
+    def previewLidOpenAnimation_(self, _sender):
+        animation = self.lid_animation_from_fields(LID_ANIMATION_OPEN)
+        if animation is not None:
+            self.play_lid_animation(LID_ANIMATION_OPEN, animation=animation)
+
+    @objc.IBAction
+    def resetLidClosedAnimation_(self, _sender):
+        self.reset_lid_animation(LID_ANIMATION_CLOSED)
+
+    @objc.IBAction
+    def resetLidOpenAnimation_(self, _sender):
+        self.reset_lid_animation(LID_ANIMATION_OPEN)
+
+    @objc.IBAction
+    def removeRememberedDevice_(self, sender):
+        self.remove_remembered_device(sender.representedObject())
+
+    @objc.IBAction
     def quit_(self, _sender):
+        self.closed_lid_awake.release()
         self.keep_awake.release()
         NSApp.terminate_(self)
 
     def applicationWillTerminate_(self, _notification):
         self.stop_event_server()
+        self.closed_lid_awake.release()
         self.keep_awake.release()
 
     def set_status(self, state: StatusBarState) -> None:
@@ -440,6 +565,28 @@ class StatusBarController(NSObject):
             self.settings_buttons.get("battery_power_preview"),
             self.settings.battery_show_on_power_change,
         )
+        set_checkbox_state(
+            self.settings_buttons.get("closed_lid_system_override"),
+            self.settings.closed_lid_system_override_enabled,
+        )
+        closed = self.settings.lid_closed_animation
+        opened = self.settings.lid_open_animation
+        set_text_control_value(
+            self.settings_fields.get("closed_animation_program"),
+            closed.program,
+        )
+        set_text_control_value(
+            self.settings_fields.get("closed_animation_duration"),
+            f"{closed.duration_seconds:g}",
+        )
+        set_text_control_value(
+            self.settings_fields.get("open_animation_program"),
+            opened.program,
+        )
+        set_text_control_value(
+            self.settings_fields.get("open_animation_duration"),
+            f"{opened.duration_seconds:g}",
+        )
 
     def set_settings_message(self, message: str) -> None:
         set_field_value(self.settings_fields.get("message"), message)
@@ -532,6 +679,213 @@ class StatusBarController(NSObject):
         self.refresh_settings_window()
         self.refresh_(None)
 
+    def set_device_brightness(self, device_id: str | None, brightness: int | float) -> None:
+        if not device_id:
+            return
+        device = next(
+            (
+                entry
+                for entry in self.status_bar_devices(remember=False)
+                if entry.device_id == str(device_id)
+            ),
+            None,
+        )
+        value = normalize_brightness(brightness)
+        try:
+            self.settings = self.settings.with_device_brightness(
+                str(device_id),
+                value,
+                name=device.name if device else None,
+                path=str(device.root) if device else None,
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save brightness: {exc}")
+            self.settings = load_settings()
+            return
+
+        self.reset_led_controllers_for_device(str(device_id))
+        self.set_settings_message(
+            f"{device.name if device else device_id}: brightness {brightness_percent(value)}%."
+        )
+        self.refresh_settings_window()
+        if self.last_snapshot is not None:
+            self.sync_leds(
+                self.last_snapshot.aggregate.mode,
+                self.last_battery_snapshot,
+                self.active_led_display_kind(self.last_battery_snapshot),
+            )
+
+    def set_closed_lid_awake_policy(self, policy: str | None) -> None:
+        if policy not in CLOSED_LID_AWAKE_CHOICES:
+            return
+        try:
+            self.settings = self.settings.with_closed_lid_awake_policy(str(policy))
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save lid sleep setting: {exc}")
+            self.settings = load_settings()
+            return
+
+        self.set_settings_message(
+            f"Closed-lid awake: {CLOSED_LID_AWAKE_LABELS[self.settings.closed_lid_awake_policy]}."
+        )
+        self.sync_closed_lid_awake()
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def set_closed_lid_system_override(self, enabled: bool) -> None:
+        try:
+            self.settings = self.settings.with_closed_lid_system_override(enabled)
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save sleep override setting: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.closed_lid_awake.set_use_system_disable(
+            self.settings.closed_lid_system_override_enabled
+        )
+        if self.settings.closed_lid_system_override_enabled and not sleep_helper_installed():
+            self.set_settings_message(
+                "Strong sleep override needs setup: "
+                + sleep_helper_install_command()
+            )
+        else:
+            label = "enabled" if self.settings.closed_lid_system_override_enabled else "disabled"
+            self.set_settings_message(f"Strong sleep override {label}.")
+        self.sync_closed_lid_awake()
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def lid_animation_from_fields(self, kind: str) -> LedAnimationSetting | None:
+        program_field = self.settings_fields.get(f"{kind}_animation_program")
+        duration_field = self.settings_fields.get(f"{kind}_animation_duration")
+        current = self.settings.lid_animation(kind)
+        program = text_control_value(program_field) or current.program
+        duration_text = text_control_value(duration_field)
+        try:
+            duration = float(duration_text) if duration_text else current.duration_seconds
+        except ValueError:
+            self.set_settings_message(f"{LID_ANIMATION_LABELS[kind]} duration is not a number.")
+            return None
+
+        animation = LedAnimationSetting(
+            program=normalize_led_text(program),
+            duration_seconds=normalize_animation_duration(duration),
+        )
+        try:
+            validate_lid_animation(animation)
+        except DeviceWriteError as exc:
+            self.set_settings_message(f"{LID_ANIMATION_LABELS[kind]} animation invalid: {exc}")
+            return None
+        return animation
+
+    def save_lid_animations_from_fields(self) -> None:
+        closed = self.lid_animation_from_fields(LID_ANIMATION_CLOSED)
+        if closed is None:
+            return
+        opened = self.lid_animation_from_fields(LID_ANIMATION_OPEN)
+        if opened is None:
+            return
+        try:
+            self.settings = self.settings.with_lid_animation(
+                LID_ANIMATION_CLOSED,
+                program=closed.program,
+                duration_seconds=closed.duration_seconds,
+            )
+            self.settings = self.settings.with_lid_animation(
+                LID_ANIMATION_OPEN,
+                program=opened.program,
+                duration_seconds=opened.duration_seconds,
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save lid animations: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.set_settings_message("Lid animations saved.")
+        self.refresh_settings_window()
+
+    def reset_lid_animation(self, kind: str) -> None:
+        animation = default_lid_animation(kind)
+        try:
+            self.settings = self.settings.with_lid_animation(
+                kind,
+                program=animation.program,
+                duration_seconds=animation.duration_seconds,
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not reset {LID_ANIMATION_LABELS[kind]}: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.set_settings_message(f"{LID_ANIMATION_LABELS[kind]} reset.")
+        self.refresh_settings_window()
+
+    def remove_remembered_device(self, device_id: str | None) -> None:
+        if not device_id:
+            return
+        device = next(
+            (
+                entry
+                for entry in self.status_bar_devices(remember=False)
+                if entry.device_id == str(device_id)
+            ),
+            None,
+        )
+        try:
+            self.settings = self.settings.without_device(str(device_id))
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not remove device: {exc}")
+            self.settings = load_settings()
+            return
+
+        self.reset_led_controllers_for_device(str(device_id))
+        self.set_settings_message(f"{device.name if device else device_id}: removed.")
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def open_session(self, status: AgentStatus | object, action: str | None, *, remember: bool) -> None:
+        if not isinstance(status, AgentStatus):
+            return
+        provider = status.provider.lower()
+        requested_action = (
+            action
+            or self.settings.session_open_action(provider)
+            or default_session_open_action(status)
+        )
+        target = session_open_target(status, requested_action)
+        if target is None:
+            requested_action = default_session_open_action(status)
+            target = session_open_target(status, requested_action)
+        if target is None:
+            self.set_settings_message(f"No open action available for {status.display_name}.")
+            return
+
+        kind, value = target
+        if kind == "url":
+            open_url(value)
+        elif kind == "terminal":
+            open_terminal_command(value)
+        else:
+            self.set_settings_message(f"Unknown open action for {status.display_name}.")
+            return
+
+        if remember:
+            try:
+                self.settings = self.settings.with_session_open_action(provider, requested_action)
+                save_settings(self.settings)
+            except Exception as exc:
+                self.set_settings_message(f"Could not save open preference: {exc}")
+                self.settings = load_settings()
+
     def set_battery_power_preview(self, enabled: bool) -> None:
         try:
             self.settings = self.settings.with_battery_power_change_preview(enabled=enabled)
@@ -612,6 +966,7 @@ class StatusBarController(NSObject):
             controller = AgentLedController(device_path=device.target)
             self.agent_led_controllers_by_device[device.device_id] = controller
         controller.device_path = device.target
+        controller.brightness = device.brightness
         return controller
 
     def battery_controller_for_device(self, device: StatusBarDevice) -> BatteryLedController:
@@ -620,6 +975,7 @@ class StatusBarController(NSObject):
             controller = BatteryLedController(device_path=device.target)
             self.battery_led_controllers_by_device[device.device_id] = controller
         controller.device_path = device.target
+        controller.brightness = device.brightness
         return controller
 
     def status_bar_devices(self, *, remember: bool = True) -> list[StatusBarDevice]:
@@ -640,6 +996,7 @@ class StatusBarController(NSObject):
                 target=candidate.target,
                 connected=True,
                 display=self.settings.display_for_device(device_id),
+                brightness=self.settings.brightness_for_device(device_id),
                 reason=candidate.reason,
             )
 
@@ -654,6 +1011,7 @@ class StatusBarController(NSObject):
                 target=target_from_device_path(root, DEFAULT_FILE_NAME),
                 connected=False,
                 display=device.led_display,
+                brightness=device.brightness,
                 reason="previously connected",
             )
 
@@ -701,6 +1059,9 @@ class StatusBarController(NSObject):
         display_kind: str,
     ) -> None:
         if not self.leds_enabled:
+            return
+
+        if time.monotonic() < self.led_animation_until_monotonic:
             return
 
         if self.led_sync_in_flight:
@@ -774,6 +1135,63 @@ class StatusBarController(NSObject):
 
         self.device_errors.update(active_errors)
         self.last_led_error = next(iter(self.device_errors.values()), None)
+
+    def play_lid_animation(
+        self,
+        kind: str,
+        *,
+        animation: LedAnimationSetting | None = None,
+    ) -> None:
+        if not self.leds_enabled:
+            return
+        animation = animation or self.settings.lid_animation(kind)
+        try:
+            validate_lid_animation(animation)
+        except DeviceWriteError as exc:
+            self.set_settings_message(f"{LID_ANIMATION_LABELS[kind]} animation invalid: {exc}")
+            return
+
+        devices = [device for device in self.status_bar_devices() if device.connected]
+        if not devices:
+            return
+
+        self.led_animation_token += 1
+        token = self.led_animation_token
+        duration = animation.duration_seconds + LID_ANIMATION_RESTORE_FUDGE_SECONDS
+        self.led_animation_until_monotonic = time.monotonic() + duration
+        thread = threading.Thread(
+            target=self.play_lid_animation_worker,
+            args=(kind, animation, devices, token),
+            daemon=True,
+        )
+        thread.start()
+
+    def play_lid_animation_worker(
+        self,
+        kind: str,
+        animation: LedAnimationSetting,
+        devices: list[StatusBarDevice],
+        token: int,
+    ) -> None:
+        label = LID_ANIMATION_LABELS[kind]
+        for device in devices:
+            try:
+                program = program_for_lid_animation(animation, brightness=device.brightness)
+                target = write_led_program(program, device_path=device.target)
+                log_status_bar(f"animation={label} device={device.name} target={target}")
+            except Exception as exc:
+                log_status_bar(f"animation error {label} {device.name}: {exc}")
+
+        time.sleep(animation.duration_seconds + LID_ANIMATION_RESTORE_FUDGE_SECONDS)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "restoreLedDisplay:",
+            str(token),
+            False,
+        )
+
+    @objc.IBAction
+    def restoreLedDisplay_(self, token_value):
+        restore_led_display(self, token_value)
 
     def connect_device(self) -> None:
         self.leds_enabled = True
@@ -859,6 +1277,31 @@ class StatusBarController(NSObject):
         self.led_controller.device_path = target
         self.battery_led_controller.device_path = target
 
+    @objc.IBAction
+    def pollLid_(self, _sender):
+        try:
+            closed = read_lid_closed()
+        except Exception as exc:
+            error = str(exc)
+            if error != self.last_lid_error:
+                self.last_lid_error = error
+                log_status_bar(f"lid_state error: {error}")
+            return
+
+        if closed is None:
+            return
+        self.last_lid_error = None
+        if self.last_lid_closed is None:
+            self.last_lid_closed = closed
+            return
+        if closed == self.last_lid_closed:
+            return
+
+        self.last_lid_closed = closed
+        kind = LID_ANIMATION_CLOSED if closed else LID_ANIMATION_OPEN
+        log_status_bar(f"lid_state={'closed' if closed else 'open'}")
+        self.play_lid_animation(kind)
+
     def sync_keep_awake(self, mode: AgentMode) -> None:
         was_running = self.keep_awake.process_running()
         self.keep_awake.update(mode)
@@ -869,6 +1312,8 @@ class StatusBarController(NSObject):
             self.last_keep_awake_error = self.keep_awake.last_error
             if self.last_keep_awake_error:
                 log_status_bar(f"keep_awake error: {self.last_keep_awake_error}")
+
+        self.sync_closed_lid_awake()
 
         if not self.leds_enabled:
             return
@@ -882,6 +1327,28 @@ class StatusBarController(NSObject):
             self.last_status_read_error = self.keep_awake.last_status_error
             if self.last_status_read_error:
                 log_status_bar(f"sd_keepalive error: {self.last_status_read_error}")
+
+    def sync_closed_lid_awake(self) -> None:
+        was_active = self.closed_lid_awake.active()
+        self.closed_lid_awake.set_use_system_disable(
+            self.settings.closed_lid_system_override_enabled
+        )
+        self.closed_lid_awake.update(
+            self.settings.closed_lid_awake_policy,
+            agents_active=self.keep_awake.holding_requested,
+        )
+        is_active = self.closed_lid_awake.active()
+        if was_active != is_active:
+            log_status_bar(
+                f"closed_lid_awake={'active' if is_active else 'released'} "
+                f"policy={self.settings.closed_lid_awake_policy}"
+            )
+        if self.closed_lid_awake.last_error != self.last_closed_lid_awake_error:
+            self.last_closed_lid_awake_error = self.closed_lid_awake.last_error
+            if self.last_closed_lid_awake_error:
+                log_status_bar(
+                    f"closed_lid_awake error: {self.last_closed_lid_awake_error}"
+                )
 
     def status_keepalive_targets(self) -> list[Path]:
         targets = self.current_led_targets()
@@ -898,142 +1365,40 @@ class StatusBarController(NSObject):
 def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> NSMenu:
     menu = NSMenu.alloc().init()
 
-    title = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        f"Agent Status: {state.label}",
-        None,
-        "",
-    )
-    title.setEnabled_(False)
-    menu.addItem_(title)
-
-    updated = snapshot.collected_at.astimezone().strftime("%H:%M:%S")
-    counts = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        f"{snapshot.aggregate.active_count} active, {snapshot.aggregate.stale_count} stale - {updated}",
-        None,
-        "",
-    )
-    counts.setEnabled_(False)
-    menu.addItem_(counts)
+    menu.addItem_(disabled_menu_item("SidePulse"))
     menu.addItem_(NSMenuItem.separatorItem())
 
-    devices_title = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Devices",
-        None,
-        "",
-    )
-    devices_title.setEnabled_(False)
-    menu.addItem_(devices_title)
-
-    device_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "LED Output",
-        "toggleDeviceConnection:",
-        "",
-    )
-    device_item.setTarget_(target)
-    device_item.setState_(1 if target.device_connected() else 0)
-    menu.addItem_(device_item)
-
-    detail = device_connection_detail(target)
-    if detail:
-        detail_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            detail,
-            None,
-            "",
-        )
-        detail_item.setEnabled_(False)
-        menu.addItem_(detail_item)
-
+    menu.addItem_(disabled_menu_item("Devices"))
     devices = target.status_bar_devices()
     if devices:
-        connected_devices = [device for device in devices if device.connected]
-        previous_devices = [device for device in devices if not device.connected]
-        if connected_devices:
-            menu.addItem_(disabled_menu_item("Connected"))
-        for device in connected_devices:
-            menu.addItem_(build_device_menu_item(device, target))
-        if previous_devices:
-            menu.addItem_(disabled_menu_item("Previously Connected"))
-        for device in previous_devices:
+        for device in devices:
             menu.addItem_(build_device_menu_item(device, target))
     else:
-        no_devices = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "No SidePulse or PulseDot devices seen",
-            None,
-            "",
-        )
-        no_devices.setEnabled_(False)
-        menu.addItem_(no_devices)
+        menu.addItem_(disabled_menu_item("No devices"))
 
     menu.addItem_(NSMenuItem.separatorItem())
-
-    keep_awake_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Keep Awake",
-        "toggleKeepAwake:",
-        "",
+    menu.addItem_(disabled_menu_item("Keep Awake With Lid Closed"))
+    for policy in CLOSED_LID_AWAKE_CHOICES:
+        menu.addItem_(build_closed_lid_awake_policy_item(policy, target))
+    menu.addItem_(build_closed_lid_system_override_item(target))
+    helper_title = (
+        "Sleep Helper Installed"
+        if sleep_helper_installed()
+        else "Sleep Helper Missing"
     )
-    keep_awake_item.setTarget_(target)
-    keep_awake_item.setState_(1 if target.keep_awake.enabled else 0)
-    menu.addItem_(keep_awake_item)
-
-    keep_awake_detail_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        target.keep_awake.detail(),
-        None,
-        "",
-    )
-    keep_awake_detail_item.setEnabled_(False)
-    menu.addItem_(keep_awake_detail_item)
-
-    battery_preview_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Show Battery on Plug/Unplug",
-        "toggleBatteryPowerPreview:",
-        "",
-    )
-    battery_preview_item.setTarget_(target)
-    battery_preview_item.setState_(1 if target.settings.battery_show_on_power_change else 0)
-    menu.addItem_(battery_preview_item)
-
-    battery_detail = battery_status_detail(target)
-    if battery_detail:
-        battery_detail_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            battery_detail,
-            None,
-            "",
-        )
-        battery_detail_item.setEnabled_(False)
-        menu.addItem_(battery_detail_item)
+    menu.addItem_(disabled_menu_item(helper_title))
+    if target.closed_lid_awake.last_error:
+        menu.addItem_(disabled_menu_item(f"Sleep warning: {target.closed_lid_awake.last_error}"))
 
     menu.addItem_(NSMenuItem.separatorItem())
+    menu.addItem_(disabled_menu_item("Agents"))
 
     statuses = recent_statuses(snapshot)
     if not statuses:
-        empty = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "No recent sessions",
-            None,
-            "",
-        )
-        empty.setEnabled_(False)
-        menu.addItem_(empty)
+        menu.addItem_(disabled_menu_item("No recent sessions"))
     else:
         for status in statuses:
             menu.addItem_(build_session_menu_item(status, snapshot.collected_at, target))
-
-    menu.addItem_(NSMenuItem.separatorItem())
-    sources_title = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Sources",
-        None,
-        "",
-    )
-    sources_title.setEnabled_(False)
-    menu.addItem_(sources_title)
-    for source in snapshot.sources:
-        marker = "OK" if source.path.exists() else "Missing"
-        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            f"{marker}  {source.provider}: {source.path}",
-            None,
-            "",
-        )
-        item.setEnabled_(False)
-        menu.addItem_(item)
 
     menu.addItem_(NSMenuItem.separatorItem())
     settings = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -1044,16 +1409,8 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     settings.setTarget_(target)
     menu.addItem_(settings)
 
-    refresh = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Refresh",
-        "forceRefresh:",
-        "r",
-    )
-    refresh.setTarget_(target)
-    menu.addItem_(refresh)
-
     quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Quit Agent Status",
+        "Quit",
         "quit:",
         "q",
     )
@@ -1063,26 +1420,34 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     return menu
 
 
-def build_device_menu_item(device: StatusBarDevice, target: StatusBarController) -> NSMenuItem:
-    title = f"{device.name} - {device_display_label(device.display)}"
-    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
-    item.setImage_(
-        image_for_symbol(
-            device_display_symbol(device.display),
-            device_display_label(device.display),
-        )
+def build_closed_lid_awake_policy_item(policy: str, target: StatusBarController) -> NSMenuItem:
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        CLOSED_LID_AWAKE_LABELS[policy],
+        "setClosedLidAwakePolicy:",
+        "",
     )
+    item.setTarget_(target)
+    item.setRepresentedObject_(policy)
+    item.setState_(1 if target.settings.closed_lid_awake_policy == policy else 0)
+    return item
+
+
+def build_closed_lid_system_override_item(target: StatusBarController) -> NSMenuItem:
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Strong Sleep Override...",
+        "toggleClosedLidSystemOverride:",
+        "",
+    )
+    item.setTarget_(target)
+    item.setState_(1 if target.settings.closed_lid_system_override_enabled else 0)
+    return item
+
+
+def build_device_menu_item(device: StatusBarDevice, target: StatusBarController) -> NSMenuItem:
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(device.name, None, "")
+    item.setState_(1 if device.connected else 0)
     submenu = NSMenu.alloc().init()
 
-    status_text = "Connected" if device.connected else "Not Connected"
-    submenu.addItem_(disabled_menu_item(status_text))
-    location_text = f"Mounted at {device.root}" if device.connected else f"Last seen at {device.root}"
-    submenu.addItem_(disabled_menu_item(location_text))
-
-    if device.connected and device.reason:
-        submenu.addItem_(disabled_menu_item(f"Detected by {device.reason}"))
-
-    submenu.addItem_(NSMenuItem.separatorItem())
     agent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Agent Status",
         "setDeviceDisplayAgent:",
@@ -1103,13 +1468,48 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     battery.setState_(1 if device.display == LED_DISPLAY_BATTERY else 0)
     submenu.addItem_(battery)
 
+    submenu.addItem_(NSMenuItem.separatorItem())
+    submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
+    submenu.addItem_(build_brightness_slider_item(device, target))
+
+    if not device.connected:
+        submenu.addItem_(NSMenuItem.separatorItem())
+        submenu.addItem_(disabled_menu_item("Not connected"))
+        remove = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Remove",
+            "removeRememberedDevice:",
+            "",
+        )
+        remove.setTarget_(target)
+        remove.setRepresentedObject_(device.device_id)
+        submenu.addItem_(remove)
+
     item.setSubmenu_(submenu)
     return item
 
 
+def build_brightness_slider_item(
+    device: StatusBarDevice,
+    target: StatusBarController,
+) -> NSMenuItem:
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+    view = NSView.alloc().initWithFrame_(((0, 0), (230, 34)))
+    slider = NSSlider.alloc().initWithFrame_(((14, 6), (202, 22)))
+    slider.setMinValue_(0.0)
+    slider.setMaxValue_(255.0)
+    slider.setDoubleValue_(float(normalize_brightness(device.brightness)))
+    slider.setContinuous_(False)
+    slider.setTarget_(target)
+    slider.setAction_("setDeviceBrightness:")
+    slider.setIdentifier_(device.device_id)
+    view.addSubview_(slider)
+    item.setView_(view)
+    return item
+
+
 def build_settings_window(target: StatusBarController) -> NSWindow:
-    width = 600
-    height = 460
+    width = 680
+    height = 840
     style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
@@ -1125,24 +1525,24 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     window.center()
     content = window.contentView()
 
-    add_label(content, "Agent Hooks", 24, 412, 200, 24)
-    add_label(content, "Codex", 32, 370, 80, 22)
-    codex_status = add_label(content, "", 112, 370, 230, 22)
-    add_button(content, "Install", 352, 366, 90, 28, target, "installCodexHooks:")
-    add_button(content, "Uninstall", 452, 366, 100, 28, target, "uninstallCodexHooks:")
+    add_label(content, "Agent Hooks", 24, 792, 200, 24)
+    add_label(content, "Codex", 32, 750, 80, 22)
+    codex_status = add_label(content, "", 112, 750, 270, 22)
+    add_button(content, "Install", 432, 746, 90, 28, target, "installCodexHooks:")
+    add_button(content, "Uninstall", 532, 746, 100, 28, target, "uninstallCodexHooks:")
 
-    add_label(content, "Claude", 32, 328, 80, 22)
-    claude_status = add_label(content, "", 112, 328, 230, 22)
-    add_button(content, "Install", 352, 324, 90, 28, target, "installClaudeHooks:")
-    add_button(content, "Uninstall", 452, 324, 100, 28, target, "uninstallClaudeHooks:")
+    add_label(content, "Claude", 32, 708, 80, 22)
+    claude_status = add_label(content, "", 112, 708, 270, 22)
+    add_button(content, "Install", 432, 704, 90, 28, target, "installClaudeHooks:")
+    add_button(content, "Uninstall", 532, 704, 100, 28, target, "uninstallClaudeHooks:")
 
-    add_separator(content, 24, 296, width - 48)
-    add_label(content, "Transcript Monitoring", 24, 262, 240, 24)
+    add_separator(content, 24, 676, width - 48)
+    add_label(content, "Transcript Monitoring", 24, 642, 240, 24)
     codex_transcripts = add_checkbox(
         content,
         "CLI fallback: Codex transcripts",
         32,
-        228,
+        608,
         260,
         24,
         target,
@@ -1152,20 +1552,20 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         content,
         "CLI fallback: Claude transcripts",
         32,
-        196,
+        576,
         260,
         24,
         target,
         "toggleClaudeTranscripts:",
     )
 
-    add_separator(content, 24, 176, width - 48)
-    add_label(content, "LED Display", 24, 142, 240, 24)
+    add_separator(content, 24, 556, width - 48)
+    add_label(content, "LED Display", 24, 522, 240, 24)
     battery_leds = add_checkbox(
         content,
         "Show battery on LEDs",
         32,
-        108,
+        488,
         260,
         24,
         target,
@@ -1175,20 +1575,50 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         content,
         "Show battery for 7s on plug/unplug",
         32,
-        76,
+        456,
         320,
         24,
         target,
         "setBatteryPowerPreviewFromCheckbox:",
     )
 
-    add_separator(content, 24, 56, width - 48)
-    message = add_label(content, "", 24, 30, width - 48, 22)
-    settings_path = add_label(content, "", 24, 8, width - 48, 18)
+    add_separator(content, 24, 436, width - 48)
+    add_label(content, "Lid & Sleep", 24, 402, 240, 24)
+    closed_lid_system_override = add_checkbox(
+        content,
+        "Strong sleep override (requires helper)",
+        300,
+        402,
+        300,
+        24,
+        target,
+        "setClosedLidSystemOverrideFromCheckbox:",
+    )
+    add_label(content, "Lid Closed", 32, 368, 120, 22)
+    add_label(content, "Duration", 520, 368, 70, 22)
+    closed_duration = add_editable_field(content, "", 590, 366, 48, 24)
+    closed_program = add_text_view(content, "", 32, 276, 606, 82)
+    add_button(content, "Preview", 32, 238, 90, 28, target, "previewLidClosedAnimation:")
+    add_button(content, "Reset", 132, 238, 90, 28, target, "resetLidClosedAnimation:")
+
+    add_label(content, "Lid Open", 32, 202, 120, 22)
+    add_label(content, "Duration", 520, 202, 70, 22)
+    open_duration = add_editable_field(content, "", 590, 200, 48, 24)
+    open_program = add_text_view(content, "", 32, 110, 606, 82)
+    add_button(content, "Preview", 32, 72, 90, 28, target, "previewLidOpenAnimation:")
+    add_button(content, "Reset", 132, 72, 90, 28, target, "resetLidOpenAnimation:")
+    add_button(content, "Save Animations", 492, 72, 146, 28, target, "saveLidAnimations:")
+
+    message = add_label(content, "", 24, 34, width - 48, 22)
+    settings_path = add_label(content, "", 24, 12, width - 48, 18)
 
     target.settings_fields = {
         "codex_hook_status": codex_status,
         "claude_hook_status": claude_status,
+        "closed_animation_program": closed_program,
+        "closed_animation_duration": closed_duration,
+        "open_animation_program": open_program,
+        "open_animation_duration": open_duration,
         "message": message,
         "settings_path": settings_path,
     }
@@ -1197,6 +1627,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "claude_transcripts": claude_transcripts,
         "battery_leds": battery_leds,
         "battery_power_preview": battery_power_preview,
+        "closed_lid_system_override": closed_lid_system_override,
     }
     return window
 
@@ -1250,6 +1681,32 @@ def add_checkbox(
     return checkbox
 
 
+def add_editable_field(parent, text: str, x: int, y: int, width: int, height: int):
+    field = NSTextField.alloc().initWithFrame_(((x, y), (width, height)))
+    field.setStringValue_(text)
+    field.setEditable_(True)
+    field.setSelectable_(True)
+    parent.addSubview_(field)
+    return field
+
+
+def add_text_view(parent, text: str, x: int, y: int, width: int, height: int):
+    scroll = NSScrollView.alloc().initWithFrame_(((x, y), (width, height)))
+    scroll.setHasVerticalScroller_(True)
+    scroll.setHasHorizontalScroller_(False)
+    text_view = NSTextView.alloc().initWithFrame_(((0, 0), (width, height)))
+    text_view.setString_(text)
+    text_view.setVerticallyResizable_(True)
+    text_view.setHorizontallyResizable_(False)
+    try:
+        text_view.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11.0, 0.0))
+    except Exception:
+        pass
+    scroll.setDocumentView_(text_view)
+    parent.addSubview_(scroll)
+    return text_view
+
+
 def add_separator(parent, x: int, y: int, width: int):
     separator = NSTextField.alloc().initWithFrame_(((x, y), (width, 1)))
     separator.setStringValue_("")
@@ -1265,9 +1722,61 @@ def set_field_value(field, value: str) -> None:
         field.setStringValue_(value)
 
 
+def set_text_control_value(control, value: str) -> None:
+    if control is None:
+        return
+    if hasattr(control, "setString_"):
+        control.setString_(value)
+    else:
+        control.setStringValue_(value)
+
+
+def text_control_value(control) -> str:
+    if control is None:
+        return ""
+    if hasattr(control, "string"):
+        return str(control.string())
+    return str(control.stringValue())
+
+
 def set_checkbox_state(button, enabled: bool) -> None:
     if button is not None:
         button.setState_(NSOnState if enabled else NSOffState)
+
+
+def validate_lid_animation(animation: LedAnimationSetting) -> None:
+    program = normalize_led_text(animation.program)
+    validate_led_text(program)
+    validate_led_text(apply_brightness(program, 1))
+    normalize_animation_duration(animation.duration_seconds)
+
+
+def program_for_lid_animation(
+    animation: LedAnimationSetting,
+    *,
+    brightness: int | float = 255,
+) -> str:
+    validate_lid_animation(animation)
+    return apply_brightness(normalize_led_text(animation.program), brightness)
+
+
+def restore_led_display(target, token_value) -> None:
+    try:
+        token = int(str(token_value))
+    except ValueError:
+        token = target.led_animation_token
+    if token != target.led_animation_token:
+        return
+    target.led_animation_until_monotonic = 0.0
+    target.reset_led_controllers_for_display_change()
+    if target.last_snapshot is not None:
+        target.sync_leds(
+            target.last_snapshot.aggregate.mode,
+            target.last_battery_snapshot,
+            target.active_led_display_kind(target.last_battery_snapshot),
+        )
+    else:
+        target.refresh_(None)
 
 
 def hook_status_text(config: ProviderConfig) -> str:
@@ -1299,12 +1808,6 @@ def device_display_label(display: str) -> str:
     return "Agent Status"
 
 
-def device_display_symbol(display: str) -> str:
-    if display == LED_DISPLAY_BATTERY:
-        return "battery.100"
-    return "waveform.path.ecg"
-
-
 def disabled_menu_item(title: str) -> NSMenuItem:
     item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")
     item.setEnabled_(False)
@@ -1332,6 +1835,7 @@ def disambiguate_device_names(devices: list[StatusBarDevice]) -> list[StatusBarD
                 target=device.target,
                 connected=device.connected,
                 display=device.display,
+                brightness=device.brightness,
                 reason=device.reason,
             )
         )
@@ -1346,44 +1850,6 @@ def duplicate_device_suffix(device: StatusBarDevice) -> str:
         suffix = root_name[len(device.name) :].strip()
         return suffix
     return root_name
-
-
-def device_connection_detail(target: StatusBarController) -> str:
-    if not target.leds_enabled:
-        return "LED output disabled"
-    if target.last_led_error:
-        return f"Device error: {target.last_led_error}"
-    if target.led_controller.last_error:
-        return f"Device error: {target.led_controller.last_error}"
-    if target.battery_led_controller.last_error:
-        return f"Device error: {target.battery_led_controller.last_error}"
-    devices = target.status_bar_devices(remember=False)
-    connected = [device for device in devices if device.connected]
-    previous_count = max(0, len(devices) - len(connected))
-    if connected:
-        suffix = "device" if len(connected) == 1 else "devices"
-        if previous_count:
-            return f"{len(connected)} connected {suffix}, {previous_count} remembered"
-        return f"{len(connected)} connected {suffix}"
-    if previous_count:
-        suffix = "device" if previous_count == 1 else "devices"
-        return f"No devices connected, {previous_count} remembered {suffix}"
-    return "No devices connected"
-
-
-def battery_status_detail(target: StatusBarController) -> str:
-    if target.last_battery_error:
-        return f"Battery error: {target.last_battery_error}"
-    snapshot = target.last_battery_snapshot
-    if snapshot is None:
-        return ""
-    state = battery_state_label(snapshot)
-    if snapshot.is_plugged:
-        return (
-            f"Battery: {snapshot.percent}% {state}, "
-            f"adapter {format_watts(snapshot.adapter_power)}"
-        )
-    return f"Battery: {snapshot.percent}% {state}"
 
 
 def preferred_status_bar_device(candidates: list[DeviceCandidate]) -> DeviceCandidate:
@@ -1408,25 +1874,79 @@ def build_session_menu_item(
         None,
         "",
     )
-    item.setEnabled_(True)
-
+    item.setImage_(provider_icon_for_status(status))
     submenu = NSMenu.alloc().init()
-    add_action_item(
-        submenu,
-        "Deep Link",
-        "openDeepLink:",
-        session_deep_link(status),
-        target,
-    )
-    add_action_item(
-        submenu,
-        "Resume",
-        "resumeSession:",
-        session_resume_command(status),
-        target,
-    )
+    submenu.addItem_(disabled_menu_item(flatten_menu_title(menu_title_for_status(status, now))))
+    submenu.addItem_(disabled_menu_item(session_detail_for_status(status, now)))
+    submenu.addItem_(NSMenuItem.separatorItem())
+
+    selected_action = getattr(target, "settings", None)
+    if selected_action is not None:
+        selected = target.settings.session_open_action(status.provider)
+    else:
+        selected = None
+    selected = selected or default_session_open_action(status)
+    for action in available_session_open_actions(status):
+        add_session_open_action_item(
+            submenu,
+            session_open_action_label(status, action),
+            status,
+            action,
+            target,
+            selected=action == selected,
+        )
     item.setSubmenu_(submenu)
+    item.setEnabled_(True)
     return item
+
+
+def add_session_open_action_item(
+    menu: NSMenu,
+    title: str,
+    status: AgentStatus,
+    action: str,
+    target: StatusBarController,
+    *,
+    selected: bool,
+) -> None:
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        title,
+        "openSessionWithAction:",
+        "",
+    )
+    item.setTarget_(target)
+    item.setRepresentedObject_({"status": status, "action": action})
+    item.setState_(1 if selected else 0)
+    menu.addItem_(item)
+
+
+def provider_icon_for_status(status: AgentStatus):
+    provider = status.provider.lower()
+    if provider == "codex":
+        for path in ("/Applications/Codex.app", "/Applications/ChatGPT.app"):
+            image = app_icon(path)
+            if image is not None:
+                return image
+        return image_for_symbol("sparkles", "Codex")
+    if provider == "claude":
+        image = app_icon("/Applications/Claude.app")
+        if image is not None:
+            return image
+        return image_for_symbol("brain.head.profile", "Claude")
+    return image_for_symbol("terminal", status.provider.title() or "Agent")
+
+
+def app_icon(path: str):
+    if not Path(path).exists():
+        return None
+    image = NSWorkspace.sharedWorkspace().iconForFile_(path)
+    if image is not None:
+        image.setSize_((18, 18))
+    return image
+
+
+def flatten_menu_title(title: str) -> str:
+    return " · ".join(part.strip() for part in title.splitlines() if part.strip())
 
 
 def add_action_item(
@@ -1468,10 +1988,54 @@ def recent_statuses(snapshot) -> list[AgentStatus]:
 
 def menu_title_for_status(status: AgentStatus, now: datetime) -> str:
     state = state_for_mode(status.mode)
+    title, project = session_title_parts(status)
+    first_line = f"{state.label}  {title}"
+    if project:
+        return f"{first_line}\n{project}"
+    return first_line
+
+
+def session_detail_for_status(status: AgentStatus, now: datetime) -> str:
+    state = state_for_mode(status.mode)
     age = format_age(status.age_seconds(now))
-    tool = f" - {status.tool_name}" if status.tool_name else ""
-    cwd = compact_path(status.cwd) if status.cwd else "-"
-    return f"{state.label:7}  {status.display_name}  {age}  {status.event_name}{tool}  {cwd}"
+    details = [state.label, age]
+    if status.tool_name:
+        details.append(status.tool_name)
+    return " · ".join(details)
+
+
+def session_title_parts(status: AgentStatus) -> tuple[str, str | None]:
+    project = project_name_from_cwd(status.cwd)
+    title = strip_session_short_id(status.display_name, status.session_id)
+    if project and title.startswith(f"{project}: "):
+        title = title[len(project) + 2 :]
+    elif ": " in title:
+        maybe_project, maybe_title = title.split(": ", 1)
+        if not project:
+            project = maybe_project
+        title = maybe_title
+    return title or status.display_name, project
+
+
+def strip_session_short_id(display_name: str, session_id: str | None) -> str:
+    text = display_name.strip()
+    if session_id:
+        suffix = f" ({session_id[:8]})"
+        if text.endswith(suffix):
+            return text[: -len(suffix)].strip()
+    if text.endswith(")") and " (" in text:
+        prefix, suffix = text.rsplit(" (", 1)
+        token = suffix[:-1]
+        if 6 <= len(token) <= 12 and all(char.isalnum() or char == "-" for char in token):
+            return prefix.strip()
+    return text
+
+
+def project_name_from_cwd(cwd: str | None) -> str | None:
+    if not cwd:
+        return None
+    name = Path(cwd).name
+    return name or cwd
 
 
 def image_for_symbol(symbol: str, description: str):
@@ -1508,6 +2072,12 @@ def format_age(seconds: float) -> str:
         return f"{minutes}m{rest:02d}s"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}h{minutes:02d}m"
+
+
+def open_url(url: str) -> None:
+    ns_url = NSURL.URLWithString_(url)
+    if ns_url is not None:
+        NSWorkspace.sharedWorkspace().openURL_(ns_url)
 
 
 def open_terminal_command(command: str) -> None:

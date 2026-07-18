@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import subprocess
 import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent_monitor.battery import (
@@ -52,18 +54,51 @@ from agent_monitor.led_status import (
     program_for_display_state,
     write_mode_to_leds,
 )
+from agent_monitor.lid_sleep import (
+    ClosedLidAwakeController,
+    SleepHelperRequiredError,
+    closed_lid_awake_should_hold,
+    parse_bool_ioreg_property,
+    run_sudo_pmset_disablesleep,
+    sleep_helper_sudoers_rule,
+)
 from agent_monitor.models import AgentMode, AgentStatus, AggregateStatus
 from agent_monitor.providers import default_log_path, default_state_dir, parse_log_line
-from agent_monitor.session_actions import session_deep_link, session_resume_command
+from agent_monitor.sd_eject_guard_launch import (
+    SD_EJECT_GUARD_LABEL,
+    SdEjectGuardInstallError,
+    SdEjectGuardPaths,
+    build_sd_eject_guard_plist,
+    install_sd_eject_guard,
+    stop_sd_eject_guard,
+)
+from agent_monitor.session_actions import (
+    SESSION_OPEN_TERMINAL,
+    default_session_open_action,
+    session_deep_link,
+    session_open_target,
+    session_resume_command,
+    session_vscode_link,
+)
 from agent_monitor.settings import (
+    CLOSED_LID_AWAKE_AGENTS,
+    CLOSED_LID_AWAKE_ALWAYS,
+    CLOSED_LID_AWAKE_NEVER,
+    LID_ANIMATION_CLOSED,
+    LID_ANIMATION_OPEN,
     AgentMonitorSettings,
     DeviceDisplaySetting,
     default_config_dir,
+    default_lid_animation,
     default_settings_path,
     load_settings,
     save_settings,
 )
-from agent_monitor.status_bar_launch import LAUNCH_AGENT_LABEL, build_launch_agent_plist
+from agent_monitor.status_bar_launch import (
+    LAUNCH_AGENT_LABEL,
+    build_launch_agent_plist,
+    install_launch_agent,
+)
 
 
 class FakeProcess:
@@ -269,6 +304,263 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(replayed, 1)
             self.assertEqual(snapshot.aggregate.mode, AgentMode.WORKING)
             self.assertIn("startup replay", snapshot.statuses[0].display_name)
+
+    def test_status_bar_session_menu_title_is_task_and_project(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        status = AgentStatus(
+            provider="codex",
+            agent_id="codex:session:019ee395",
+            display_name="pixiepulse-bridge: Refine README agent status modes (019ee395)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now,
+            event_name="Stop",
+            session_id="019ee395",
+            cwd="/Users/pero/pgit/pixiepulse-bridge",
+        )
+
+        self.assertEqual(
+            status_bar.menu_title_for_status(status, now),
+            "Done  Refine README agent status modes\npixiepulse-bridge",
+        )
+        self.assertEqual(
+            status_bar.session_detail_for_status(status, now).split(" · ")[0],
+            "Done",
+        )
+
+    def test_status_bar_session_row_has_inline_options(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        status = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:abc",
+            display_name="Claude abc",
+            mode=AgentMode.WAITING_FOR_INPUT,
+            updated_at=now,
+            event_name="Notification",
+            session_id="1ca4348e-2aec-4147-9e81-d7d56364d257",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+        )
+        target = SimpleNamespace(settings=AgentMonitorSettings())
+
+        row = status_bar.build_session_menu_item(status, now, target)
+        submenu = row.submenu()
+        titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).title()
+        ]
+
+        self.assertTrue(row.title().startswith("Ask  "))
+        self.assertIsNotNone(row.image())
+        self.assertIsNotNone(row.submenu())
+        self.assertTrue(any(title.startswith("Ask  Claude abc") for title in titles))
+        self.assertIn("Open in VS Code", titles)
+        self.assertIn("Resume in Terminal", titles)
+
+    def test_codex_session_options_are_codex_specific(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        status = AgentStatus(
+            provider="codex",
+            agent_id="codex:session:abc",
+            display_name="Codex abc",
+            mode=AgentMode.WORKING,
+            updated_at=now,
+            event_name="PreToolUse",
+            session_id="019ee395-2f64-7cc3-b566-afcc1d626160",
+            cwd="/tmp/project with spaces",
+        )
+        target = SimpleNamespace(settings=AgentMonitorSettings())
+
+        row = status_bar.build_session_menu_item(status, now, target)
+        submenu = row.submenu()
+        titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).title()
+        ]
+
+        self.assertTrue(row.title().startswith("Working  "))
+        self.assertIsNotNone(row.image())
+        self.assertTrue(any(title.startswith("Working  Codex abc") for title in titles))
+        self.assertIn("Open in Codex", titles)
+        self.assertIn("Resume in Terminal", titles)
+        self.assertNotIn("Open in VS Code", titles)
+        self.assertNotIn("Open Claude App", titles)
+
+    def test_status_bar_device_submenu_has_brightness_slider(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/PulseDot",
+            name="PulseDot",
+            root=Path("/Volumes/PulseDot"),
+            target=Path("/Volumes/PulseDot/LEDS.LED"),
+            connected=True,
+            display="agent",
+            brightness=128,
+        )
+
+        item = status_bar.build_device_menu_item(device, SimpleNamespace())
+        submenu = item.submenu()
+        titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).title()
+        ]
+        custom_view_count = sum(
+            1
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).view() is not None
+        )
+
+        self.assertIn("Brightness 50%", titles)
+        self.assertEqual(custom_view_count, 1)
+
+    def test_status_bar_menu_has_closed_lid_awake_policy_choices(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        snapshot = SimpleNamespace(
+            statuses=[],
+            collected_at=datetime.now(timezone.utc),
+        )
+        target = SimpleNamespace(
+            settings=AgentMonitorSettings(
+                closed_lid_awake_policy=CLOSED_LID_AWAKE_AGENTS,
+            ),
+            closed_lid_awake=SimpleNamespace(last_error=None),
+            status_bar_devices=lambda: [],
+        )
+
+        menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        items = [menu.itemAtIndex_(index) for index in range(menu.numberOfItems())]
+        by_title = {item.title(): item for item in items if item.title()}
+
+        self.assertIn("Keep Awake With Lid Closed", by_title)
+        self.assertEqual(by_title["Never"].state(), 0)
+        self.assertEqual(by_title["When Agents Work"].state(), 1)
+        self.assertEqual(by_title["Always"].state(), 0)
+        self.assertIn("Strong Sleep Override...", by_title)
+        self.assertEqual(by_title["Strong Sleep Override..."].state(), 0)
+
+    def test_lid_animation_program_uses_device_brightness(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        animation = default_lid_animation(LID_ANIMATION_CLOSED)
+        program = status_bar.program_for_lid_animation(animation, brightness=128)
+
+        validate_led_text(program)
+        self.assertTrue(program.startswith("brightness 128\n"))
+
+    def test_lid_animation_restore_forces_led_resync(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        calls: list[tuple[str, object]] = []
+        fake = SimpleNamespace(
+            led_animation_token=42,
+            led_animation_until_monotonic=100.0,
+            last_snapshot=SimpleNamespace(
+                aggregate=SimpleNamespace(mode=AgentMode.WORKING),
+            ),
+            last_battery_snapshot=object(),
+            reset_led_controllers_for_display_change=lambda: calls.append(("reset", None)),
+            active_led_display_kind=lambda snapshot: "agent",
+            sync_leds=lambda mode, snapshot, display: calls.append(
+                ("sync", (mode, snapshot, display))
+            ),
+            refresh_=lambda sender: calls.append(("refresh", sender)),
+        )
+
+        status_bar.restore_led_display(fake, "41")
+        self.assertEqual(calls, [])
+        self.assertEqual(fake.led_animation_until_monotonic, 100.0)
+
+        status_bar.restore_led_display(fake, "42")
+        self.assertEqual(fake.led_animation_until_monotonic, 0.0)
+        self.assertEqual(calls[0], ("reset", None))
+        self.assertEqual(calls[1][0], "sync")
+        self.assertEqual(calls[1][1][0], AgentMode.WORKING)
+
+    def test_status_bar_settings_window_has_lid_animation_controls(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        target = SimpleNamespace(settings_fields={}, settings_buttons={})
+
+        window = status_bar.build_settings_window(target)
+
+        self.assertEqual(window.title(), "SidePulse Agent Monitor Settings")
+        self.assertIn("closed_animation_program", target.settings_fields)
+        self.assertIn("closed_animation_duration", target.settings_fields)
+        self.assertIn("open_animation_program", target.settings_fields)
+        self.assertIn("open_animation_duration", target.settings_fields)
+        self.assertIn("closed_lid_system_override", target.settings_buttons)
+
+    def test_status_bar_open_session_remembers_action_by_provider(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        status = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:abc",
+            display_name="Claude abc",
+            mode=AgentMode.WAITING_FOR_INPUT,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Notification",
+            session_id="1ca4348e-2aec-4147-9e81-d7d56364d257",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+        )
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            messages=[],
+            set_settings_message=lambda message: None,
+        )
+
+        with (
+            patch("agent_monitor.status_bar.open_terminal_command") as open_terminal,
+            patch("agent_monitor.status_bar.save_settings") as save,
+        ):
+            status_bar.StatusBarController.open_session(
+                fake,
+                status,
+                SESSION_OPEN_TERMINAL,
+                remember=True,
+            )
+
+        open_terminal.assert_called_once_with(
+            "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257"
+        )
+        self.assertEqual(fake.settings.session_open_action("claude"), SESSION_OPEN_TERMINAL)
+        save.assert_called_once_with(fake.settings)
 
     def test_codex_installer_replaces_monitor_hook_and_preserves_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -523,6 +815,211 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(configure.battery_command, "configure")
         self.assertEqual(configure.display, "battery")
 
+    def test_sidepulse_status_bar_root_command_shape(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+
+        default = parser.parse_args(["status-bar"])
+        start = parser.parse_args(["status-bar", "start", "--foreground"])
+        stop = parser.parse_args(["status-bar", "stop"])
+        helper = parser.parse_args(["status-bar", "install-sleep-helper", "--dry-run"])
+
+        self.assertEqual(default.command, "status-bar")
+        self.assertEqual(default.status_bar_command, "start")
+        self.assertFalse(default.foreground)
+        self.assertEqual(start.status_bar_command, "start")
+        self.assertTrue(start.foreground)
+        self.assertEqual(stop.status_bar_command, "stop")
+        self.assertEqual(helper.status_bar_command, "install-sleep-helper")
+        self.assertTrue(helper.dry_run)
+
+    def test_sidepulse_sdejectguard_command_shape(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+
+        start = parser.parse_args(["sdejectguard", "start"])
+        interactive = parser.parse_args(["sdejectguard", "start", "-it", "--scope", "user"])
+        stop = parser.parse_args(["sdejectguard", "stop", "--scope", "system"])
+        logs = parser.parse_args(["sdejectguard", "logs", "--lines", "12", "--follow"])
+
+        self.assertEqual(start.command, "sdejectguard")
+        self.assertEqual(start.sdejectguard_command, "start")
+        self.assertEqual(start.scope, "auto")
+        self.assertFalse(start.interactive)
+        self.assertTrue(interactive.interactive)
+        self.assertEqual(interactive.scope, "user")
+        self.assertEqual(stop.sdejectguard_command, "stop")
+        self.assertEqual(stop.scope, "system")
+        self.assertEqual(logs.sdejectguard_command, "logs")
+        self.assertEqual(logs.lines, 12)
+        self.assertTrue(logs.follow)
+
+    def test_sidepulse_sdejectguard_start_uses_launchd_installer(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["sdejectguard", "start", "--scope", "user"])
+        guard_result = SimpleNamespace(
+            dry_run=False,
+            changed=True,
+            started=True,
+            scope="user",
+            plist_path=Path("/tmp/io.sidepulse.sdejectguard.plist"),
+            binary_path=Path("/tmp/sd_eject_guard"),
+            cleanup_removed=None,
+            cleanup_skipped=None,
+        )
+
+        with patch(
+            "agent_monitor.sd_eject_guard_launch.install_sd_eject_guard",
+            return_value=guard_result,
+        ) as install:
+            result = cli_module.cmd_sidepulse_sdejectguard_start(args)
+
+        self.assertEqual(result, 0)
+        install.assert_called_once_with(scope="user", dry_run=False)
+
+    def test_sidepulse_sdejectguard_start_interactive_runs_foreground(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["sdejectguard", "start", "-it", "--scope", "user"])
+
+        with patch(
+            "agent_monitor.sd_eject_guard_launch.run_sd_eject_guard_interactive",
+            return_value=0,
+        ) as run:
+            result = cli_module.cmd_sidepulse_sdejectguard_start(args)
+
+        self.assertEqual(result, 0)
+        run.assert_called_once_with(scope="user")
+
+    def test_sidepulse_sdejectguard_stop_calls_guard_stop(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["sdejectguard", "stop", "--scope", "user", "--dry-run"])
+        stop_result = SimpleNamespace(
+            scope="user",
+            plist_path=Path("/tmp/io.sidepulse.sdejectguard.plist"),
+            stopped=True,
+            skipped=None,
+        )
+
+        with patch(
+            "agent_monitor.sd_eject_guard_launch.stop_sd_eject_guard",
+            return_value=(stop_result,),
+        ) as stop:
+            result = cli_module.cmd_sidepulse_sdejectguard_stop(args)
+
+        self.assertEqual(result, 0)
+        stop.assert_called_once_with(scope="user", dry_run=True)
+
+    def test_sidepulse_setup_command_shape(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+
+        default = parser.parse_args(["setup"])
+        codex_only = parser.parse_args(
+            [
+                "setup",
+                "codex",
+                "--no-status-bar",
+                "--dry-run",
+                "--sd-eject-guard-scope",
+                "user",
+            ]
+        )
+
+        self.assertEqual(default.command, "setup")
+        self.assertEqual(default.provider, "all")
+        self.assertEqual(default.sd_eject_guard_scope, "auto")
+        self.assertFalse(default.no_status_bar)
+        self.assertFalse(default.dry_run)
+        self.assertEqual(codex_only.provider, "codex")
+        self.assertEqual(codex_only.sd_eject_guard_scope, "user")
+        self.assertTrue(codex_only.no_status_bar)
+        self.assertTrue(codex_only.dry_run)
+
+    def test_sidepulse_setup_installs_hooks_guard_and_status_bar(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["setup"])
+        codex_result = SimpleNamespace(
+            provider="codex",
+            config_path=Path("/tmp/codex.toml"),
+            log_path=Path("/tmp/codex.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
+        claude_result = SimpleNamespace(
+            provider="claude",
+            config_path=Path("/tmp/settings.json"),
+            log_path=Path("/tmp/claude.jsonl"),
+            changed=False,
+            backup_path=None,
+        )
+        launch_result = SimpleNamespace(
+            plist_path=Path("/tmp/io.sidepulse.agentstatus.plist"),
+            changed=True,
+            started=True,
+        )
+        guard_result = SimpleNamespace(
+            dry_run=False,
+            changed=True,
+            started=True,
+            scope="user",
+            plist_path=Path("/tmp/io.sidepulse.sdejectguard.plist"),
+            binary_path=Path("/tmp/sd_eject_guard"),
+            cleanup_removed=None,
+            cleanup_skipped=None,
+        )
+
+        with (
+            patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
+            patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
+            patch(
+                "agent_monitor.sd_eject_guard_launch.install_sd_eject_guard",
+                return_value=guard_result,
+            ) as guard,
+            patch(
+                "agent_monitor.status_bar_launch.install_launch_agent",
+                return_value=launch_result,
+            ) as launch,
+        ):
+            result = cli_module.cmd_sidepulse_setup(args)
+
+        self.assertEqual(result, 0)
+        codex.assert_called_once()
+        claude.assert_called_once()
+        guard.assert_called_once_with(scope="auto", dry_run=False)
+        launch.assert_called_once_with(start=True)
+
+    def test_sidepulse_setup_no_status_bar_still_installs_guard(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["setup", "--no-status-bar", "--sd-eject-guard-scope", "user"])
+        hook_result = SimpleNamespace(
+            provider="codex",
+            config_path=Path("/tmp/codex.toml"),
+            log_path=Path("/tmp/codex.jsonl"),
+            changed=False,
+            backup_path=None,
+        )
+        guard_result = SimpleNamespace(
+            dry_run=False,
+            changed=False,
+            started=True,
+            scope="user",
+            plist_path=Path("/tmp/io.sidepulse.sdejectguard.plist"),
+            binary_path=Path("/tmp/sd_eject_guard"),
+            cleanup_removed=None,
+            cleanup_skipped=None,
+        )
+
+        with (
+            patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
+            patch(
+                "agent_monitor.sd_eject_guard_launch.install_sd_eject_guard",
+                return_value=guard_result,
+            ) as guard,
+            patch("agent_monitor.status_bar_launch.install_launch_agent") as launch,
+        ):
+            result = cli_module.cmd_sidepulse_setup(args)
+
+        self.assertEqual(result, 0)
+        guard.assert_called_once_with(scope="user", dry_run=False)
+        launch.assert_not_called()
+
     def test_sidepulse_write_decodes_escaped_newlines_and_writes_leds_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "SidePulse"
@@ -536,7 +1033,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(target, device / "LEDS.LED")
             self.assertEqual(target.read_text(), "off\n#FF00FF pulse")
 
-    def test_sidepulse_write_falls_back_to_existing_legacy_leds_txt(self) -> None:
+    def test_sidepulse_write_uses_leds_led_even_when_old_file_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "PulseDot"
             device.mkdir()
@@ -547,21 +1044,21 @@ class AgentMonitorTests(unittest.TestCase):
                 device_path=device,
             )
 
-            self.assertEqual(target, device / "LEDS.TXT")
+            self.assertEqual(target, device / "LEDS.LED")
             self.assertEqual(target.read_text(), "off\n#FF00FF pulse")
+            self.assertEqual((device / "LEDS.TXT").read_text(), "off")
 
     def test_sidepulse_write_discovers_pulsedot_volume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             mount_root = Path(tmp)
             device = mount_root / "PulseDot"
             device.mkdir()
-            (device / "LEDS.TXT").write_text("off")
 
             candidates = discover_devices(mount_root=mount_root)
 
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].root, device)
-            self.assertEqual(candidates[0].target, device / "LEDS.TXT")
+            self.assertEqual(candidates[0].target, device / "LEDS.LED")
 
     def test_sidepulse_write_prefers_leds_led_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -569,12 +1066,22 @@ class AgentMonitorTests(unittest.TestCase):
             device = mount_root / "SidePulse"
             device.mkdir()
             (device / "LEDS.LED").write_text("off")
-            (device / "LEDS.TXT").write_text("legacy")
 
             candidates = discover_devices(mount_root=mount_root)
 
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].target, device / "LEDS.LED")
+
+    def test_device_discovery_ignores_old_leds_txt_on_unnamed_volume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mount_root = Path(tmp)
+            device = mount_root / "USB Drive"
+            device.mkdir()
+            (device / "LEDS.TXT").write_text("off")
+
+            candidates = discover_devices(mount_root=mount_root)
+
+            self.assertEqual(candidates, [])
 
     def test_device_discovery_skips_mount_io_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -583,7 +1090,7 @@ class AgentMonitorTests(unittest.TestCase):
             bad = mount_root / "SidePulse"
             good.mkdir()
             bad.mkdir()
-            (good / "LEDS.TXT").write_text("off")
+            (good / "LEDS.LED").write_text("off")
             original_is_dir = Path.is_dir
 
             def flaky_is_dir(path: Path) -> bool:
@@ -609,13 +1116,12 @@ class AgentMonitorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "PulseDot"
             device.mkdir()
-            (device / "LEDS.TXT").write_text("off")
             result = cli_module.sidepulse_main(
                 ["write", r"off\n#FF00FF pulse", "--device", str(device)]
             )
 
             self.assertEqual(result, 0)
-            self.assertEqual((device / "LEDS.TXT").read_text(), "off\n#FF00FF pulse")
+            self.assertEqual((device / "LEDS.LED").read_text(), "off\n#FF00FF pulse")
 
     def test_led_status_maps_agent_modes_to_programs(self) -> None:
         self.assertEqual(
@@ -653,19 +1159,22 @@ class AgentMonitorTests(unittest.TestCase):
             len(program_for_display_state(LedDisplayState.WORKING, led_count=8).splitlines()),
             3,
         )
+        self.assertEqual(
+            program_for_display_state(LedDisplayState.DONE, brightness=128),
+            "brightness 128\n#00FF66",
+        )
 
     def test_write_mode_to_leds_uses_device_specific_program(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "PulseDot"
             device.mkdir()
-            (device / "LEDS.TXT").write_text("off")
 
             result = write_mode_to_leds(AgentMode.WORKING, device_path=device)
 
             self.assertEqual(result.state, LedDisplayState.WORKING)
-            self.assertEqual(result.target, device / "LEDS.TXT")
+            self.assertEqual(result.target, device / "LEDS.LED")
             self.assertEqual(
-                (device / "LEDS.TXT").read_text(),
+                (device / "LEDS.LED").read_text(),
                 "off 160ms cosine\n"
                 "0:#00E5FF 760ms pulse 0ms; 1:#00E5FF 760ms pulse 260ms\n"
                 "repeat",
@@ -674,12 +1183,15 @@ class AgentMonitorTests(unittest.TestCase):
             write_mode_to_leds(AgentMode.IDLE_READY, device_path=device)
 
             self.assertEqual(
-                (device / "LEDS.TXT").read_text(),
+                (device / "LEDS.LED").read_text(),
                 "off\n#020204 6s pulse\nrepeat",
             )
 
+            write_mode_to_leds(AgentMode.COMPLETED, device_path=device, brightness=64)
+
+            self.assertEqual((device / "LEDS.LED").read_text(), "brightness 64\n#00FF66")
+
     def test_led_count_uses_product_name(self) -> None:
-        self.assertEqual(led_count_for_target(Path("/Volumes/PulseDot/LEDS.TXT")), 2)
         self.assertEqual(led_count_for_target(Path("/Volumes/PulseDot/LEDS.LED")), 2)
         self.assertEqual(led_count_for_target(Path("/Volumes/SidePulse/LEDS.LED")), 8)
 
@@ -794,6 +1306,14 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(segments[3], "3:#00FF66 360ms ease")
         self.assertEqual(segments[4], "4:#008F39 360ms ease")
         self.assertEqual(segments[5], "5:#000000 360ms ease")
+
+    def test_battery_program_uses_brightness_command(self) -> None:
+        snapshot = BatterySnapshot(percent=57, is_plugged=False)
+
+        program = program_for_battery(snapshot, led_count=8, brightness=128)
+
+        validate_led_text(program)
+        self.assertTrue(program.startswith("brightness 128\n"))
 
     def test_battery_program_uses_full_speed_steady_pulse(self) -> None:
         snapshot = BatterySnapshot(
@@ -913,7 +1433,6 @@ class AgentMonitorTests(unittest.TestCase):
             )
 
             self.assertEqual(status_file_for_target(device / "LEDS.LED"), status_path)
-            self.assertEqual(status_file_for_target(device / "LEDS.TXT"), status_path)
             self.assertEqual(status_file_for_target(device / "STATUS.TXT"), status_path)
             self.assertEqual(
                 controller.poke_status_file(device / "LEDS.LED", now=0),
@@ -925,6 +1444,135 @@ class AgentMonitorTests(unittest.TestCase):
                 status_path,
             )
             self.assertEqual(reads, [status_path, status_path])
+
+    def test_closed_lid_awake_policy_decisions(self) -> None:
+        self.assertFalse(
+            closed_lid_awake_should_hold(CLOSED_LID_AWAKE_NEVER, agents_active=True)
+        )
+        self.assertFalse(
+            closed_lid_awake_should_hold(CLOSED_LID_AWAKE_AGENTS, agents_active=False)
+        )
+        self.assertTrue(
+            closed_lid_awake_should_hold(CLOSED_LID_AWAKE_AGENTS, agents_active=True)
+        )
+        self.assertTrue(
+            closed_lid_awake_should_hold(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        )
+
+    def test_closed_lid_awake_controller_sets_and_restores_system_disable(self) -> None:
+        processes: list[FakeProcess] = []
+        disabled_calls: list[bool] = []
+
+        def factory(*_args, **_kwargs):
+            process = FakeProcess()
+            processes.append(process)
+            return process
+
+        controller = ClosedLidAwakeController(
+            process_factory=factory,
+            sleep_disabled_reader=lambda: False,
+            sleep_disabled_setter=disabled_calls.append,
+            use_system_disable=True,
+        )
+
+        self.assertTrue(
+            controller.update(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        )
+        self.assertEqual(disabled_calls, [True])
+        self.assertTrue(controller.changed_system_disable)
+        self.assertEqual(len(processes), 1)
+
+        controller.update(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        self.assertEqual(disabled_calls, [True])
+
+        self.assertFalse(
+            controller.update(CLOSED_LID_AWAKE_NEVER, agents_active=False)
+        )
+        self.assertEqual(disabled_calls, [True, False])
+        self.assertTrue(processes[0].terminated)
+
+    def test_closed_lid_awake_controller_defaults_to_user_mode_only(self) -> None:
+        disabled_calls: list[bool] = []
+        controller = ClosedLidAwakeController(
+            process_factory=lambda *_args, **_kwargs: FakeProcess(),
+            sleep_disabled_reader=lambda: False,
+            sleep_disabled_setter=disabled_calls.append,
+        )
+
+        self.assertTrue(
+            controller.update(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        )
+
+        self.assertEqual(disabled_calls, [])
+        self.assertTrue(controller.process_running())
+        self.assertFalse(controller.changed_system_disable)
+
+    def test_closed_lid_awake_controller_preserves_existing_system_disable(self) -> None:
+        disabled_calls: list[bool] = []
+        controller = ClosedLidAwakeController(
+            process_factory=lambda *_args, **_kwargs: FakeProcess(),
+            sleep_disabled_reader=lambda: True,
+            sleep_disabled_setter=disabled_calls.append,
+            use_system_disable=True,
+        )
+
+        controller.update(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        controller.update(CLOSED_LID_AWAKE_NEVER, agents_active=False)
+
+        self.assertEqual(disabled_calls, [])
+
+    def test_sleep_override_uses_noninteractive_sudo(self) -> None:
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        run_sudo_pmset_disablesleep(True, runner=runner)
+
+        self.assertEqual(
+            calls[0][0],
+            ["/usr/bin/sudo", "-n", "/usr/bin/pmset", "-a", "disablesleep", "1"],
+        )
+        self.assertEqual(calls[0][1]["check"], False)
+
+    def test_sleep_override_reports_missing_helper_without_prompting(self) -> None:
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                "",
+                "sudo: a password is required",
+            )
+
+        with self.assertRaises(SleepHelperRequiredError) as ctx:
+            run_sudo_pmset_disablesleep(False, runner=runner)
+
+        self.assertIn("install-sleep-helper", str(ctx.exception))
+        self.assertNotIn("/usr/bin/osascript", calls[0])
+
+    def test_sleep_helper_sudoers_rule_is_narrow(self) -> None:
+        self.assertEqual(
+            sleep_helper_sudoers_rule("pero"),
+            "pero ALL=(root) NOPASSWD: "
+            "/usr/bin/pmset -a disablesleep 0, "
+            "/usr/bin/pmset -a disablesleep 1\n",
+        )
+        with self.assertRaises(ValueError):
+            sleep_helper_sudoers_rule("bad user")
+
+    def test_lid_state_parser_reads_ioreg_booleans(self) -> None:
+        self.assertTrue(
+            parse_bool_ioreg_property('"AppleClamshellState" = Yes', "AppleClamshellState")
+        )
+        self.assertFalse(
+            parse_bool_ioreg_property('"AppleClamshellState" = No', "AppleClamshellState")
+        )
+        self.assertTrue(parse_bool_ioreg_property('"SleepDisabled" = true', "SleepDisabled"))
+        self.assertIsNone(parse_bool_ioreg_property('"Other" = Yes', "SleepDisabled"))
 
     def test_default_logs_use_sidepulse_xdg_state_dir(self) -> None:
         home = Path("/Users/example")
@@ -1009,6 +1657,7 @@ class AgentMonitorTests(unittest.TestCase):
                         name="PulseDot",
                         path="/Volumes/PulseDot",
                         led_display="battery",
+                        brightness=128,
                     ),
                 )
             )
@@ -1019,6 +1668,84 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(loaded.devices, settings.devices)
             self.assertEqual(loaded.display_for_device("/Volumes/SidePulse"), "agent")
             self.assertEqual(loaded.display_for_device("/Volumes/PulseDot"), "battery")
+            self.assertEqual(loaded.brightness_for_device("/Volumes/PulseDot"), 128)
+
+    def test_settings_round_trip_remembered_device_brightness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_device_brightness(
+                "/Volumes/PulseDot",
+                96,
+                name="PulseDot",
+                path="/Volumes/PulseDot",
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.brightness_for_device("/Volumes/PulseDot"), 96)
+
+    def test_settings_round_trip_session_open_preferences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_session_open_action(
+                "Claude",
+                SESSION_OPEN_TERMINAL,
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.session_open_action("claude"), SESSION_OPEN_TERMINAL)
+
+    def test_settings_round_trip_closed_lid_policy_and_animations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_closed_lid_awake_policy(
+                CLOSED_LID_AWAKE_AGENTS
+            )
+            settings = settings.with_lid_animation(
+                LID_ANIMATION_CLOSED,
+                program="off\n#FF3A00 200ms ease",
+                duration_seconds=1.4,
+            )
+            settings = settings.with_lid_animation(
+                LID_ANIMATION_OPEN,
+                program="off\n#00FF66 200ms ease",
+                duration_seconds=1.6,
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.closed_lid_awake_policy, CLOSED_LID_AWAKE_AGENTS)
+            self.assertEqual(
+                loaded.lid_animation(LID_ANIMATION_CLOSED).program,
+                "off\n#FF3A00 200ms ease",
+            )
+            self.assertEqual(
+                loaded.lid_animation(LID_ANIMATION_OPEN).duration_seconds,
+                1.6,
+            )
+
+            enabled = settings.with_closed_lid_system_override(True)
+            save_settings(enabled, settings_path)
+            loaded_enabled = load_settings(settings_path)
+            self.assertTrue(loaded_enabled.closed_lid_system_override_enabled)
+
+    def test_settings_migrate_missing_lid_fields_to_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(json.dumps({"led_display": "agent"}))
+
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.closed_lid_awake_policy, CLOSED_LID_AWAKE_NEVER)
+            self.assertFalse(loaded.closed_lid_system_override_enabled)
+            self.assertEqual(
+                loaded.lid_animation(LID_ANIMATION_CLOSED),
+                default_lid_animation(LID_ANIMATION_CLOSED),
+            )
 
     def test_settings_remember_device_preserves_existing_display_choice(self) -> None:
         settings = AgentMonitorSettings().with_device_display(
@@ -1035,6 +1762,55 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertEqual(remembered.display_for_device("/Volumes/PulseDot"), "battery")
+        self.assertEqual(remembered.brightness_for_device("/Volumes/PulseDot"), 255)
+
+    def test_settings_remove_remembered_device(self) -> None:
+        settings = AgentMonitorSettings(
+            devices=(
+                DeviceDisplaySetting(
+                    device_id="/Volumes/SidePulse",
+                    name="SidePulse",
+                    path="/Volumes/SidePulse",
+                    led_display="agent",
+                ),
+                DeviceDisplaySetting(
+                    device_id="/Volumes/PulseDot",
+                    name="PulseDot",
+                    path="/Volumes/PulseDot",
+                    led_display="battery",
+                ),
+            )
+        )
+
+        updated = settings.without_device("/Volumes/PulseDot")
+
+        self.assertEqual([device.device_id for device in updated.devices], ["/Volumes/SidePulse"])
+        self.assertEqual(updated.display_for_device("/Volumes/PulseDot"), "agent")
+
+    def test_disconnected_device_menu_has_remove_option(self) -> None:
+        try:
+            from agent_monitor import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulse",
+            name="SidePulse",
+            root=Path("/Volumes/SidePulse"),
+            target=Path("/Volumes/SidePulse/LEDS.LED"),
+            connected=False,
+            display="agent",
+        )
+        item = status_bar.build_device_menu_item(device, None)
+        submenu = item.submenu()
+        titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).title()
+        ]
+
+        self.assertIn("Not connected", titles)
+        self.assertIn("Remove", titles)
 
     def test_status_bar_launch_agent_plist_runs_foreground_command(self) -> None:
         plist = build_launch_agent_plist(
@@ -1058,6 +1834,251 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(plist["StandardOutPath"], "/tmp/sidepulse.out.log")
         self.assertEqual(plist["StandardErrorPath"], "/tmp/sidepulse.err.log")
         self.assertNotIn("KeepAlive", plist)
+
+    def test_status_bar_install_removes_legacy_com_sidepulse_plist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            target = base / "io.sidepulse.agentstatus.plist"
+            legacy = base / "com.sidepulse.agentstatus.plist"
+            legacy.write_bytes(b"old")
+
+            with (
+                patch("agent_monitor.status_bar_launch.default_state_dir", return_value=base / "state"),
+                patch("agent_monitor.status_bar_launch.subprocess.run") as run,
+            ):
+                result = install_launch_agent(
+                    start=False,
+                    plist_path=target,
+                    legacy_plist_path=legacy,
+                    python_executable="/usr/bin/python3",
+                )
+
+            self.assertTrue(result.changed)
+            self.assertTrue(target.exists())
+            self.assertFalse(legacy.exists())
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][0:2], ["launchctl", "bootout"])
+
+    def test_sd_eject_guard_plist_shapes_for_user_and_system_scopes(self) -> None:
+        for scope in ("user", "system"):
+            paths = SdEjectGuardPaths(
+                scope=scope,
+                plist_path=Path(f"/tmp/{scope}/io.sidepulse.sdejectguard.plist"),
+                binary_path=Path(f"/tmp/{scope}/sd_eject_guard"),
+                stdout_path=Path(f"/tmp/{scope}/sd-eject-guard.out.log"),
+                stderr_path=Path(f"/tmp/{scope}/sd-eject-guard.err.log"),
+            )
+
+            plist = build_sd_eject_guard_plist(paths)
+
+            self.assertEqual(plist["Label"], SD_EJECT_GUARD_LABEL)
+            self.assertEqual(plist["ProgramArguments"], [str(paths.binary_path)])
+            self.assertTrue(plist["RunAtLoad"])
+            self.assertTrue(plist["KeepAlive"])
+            self.assertEqual(plist["StandardOutPath"], str(paths.stdout_path))
+            self.assertEqual(plist["StandardErrorPath"], str(paths.stderr_path))
+
+    def test_sd_eject_guard_auto_falls_back_to_user_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "sd_eject_guard.c"
+            source.write_text("int main(void) { return 0; }\n")
+            user_paths = SdEjectGuardPaths(
+                scope="user",
+                plist_path=base / "user" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "user" / "sd_eject_guard",
+                stdout_path=base / "user" / "out.log",
+                stderr_path=base / "user" / "err.log",
+            )
+            system_paths = SdEjectGuardPaths(
+                scope="system",
+                plist_path=base / "system" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "system" / "sd_eject_guard",
+                stdout_path=base / "system" / "out.log",
+                stderr_path=base / "system" / "err.log",
+            )
+            calls = []
+
+            def fake_run(command, *args, **kwargs):
+                calls.append(command)
+                if command[0] == "clang":
+                    Path(command[3]).write_bytes(b"binary")
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                patch("agent_monitor.sd_eject_guard_launch.os.geteuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.os.getuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.subprocess.run", side_effect=fake_run),
+            ):
+                result = install_sd_eject_guard(
+                    scope="auto",
+                    source_path=source,
+                    user_paths=user_paths,
+                    system_paths=system_paths,
+                )
+
+            self.assertEqual(result.scope, "user")
+            self.assertTrue(result.compiled)
+            self.assertTrue(result.started)
+            self.assertTrue(user_paths.binary_path.exists())
+            self.assertTrue(user_paths.plist_path.exists())
+            self.assertEqual(calls[0][0:4], ["clang", "-O2", "-o", str(user_paths.binary_path.with_name("sd_eject_guard.tmp"))])
+            self.assertIn("-framework", calls[0])
+            self.assertIn(["launchctl", "bootstrap", "gui/501", str(user_paths.plist_path)], calls)
+
+    def test_sd_eject_guard_user_install_reports_skipped_system_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "sd_eject_guard.c"
+            source.write_text("int main(void) { return 0; }\n")
+            user_paths = SdEjectGuardPaths(
+                scope="user",
+                plist_path=base / "user" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "user" / "sd_eject_guard",
+                stdout_path=base / "user" / "out.log",
+                stderr_path=base / "user" / "err.log",
+            )
+            system_paths = SdEjectGuardPaths(
+                scope="system",
+                plist_path=base / "system" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "system" / "sd_eject_guard",
+                stdout_path=base / "system" / "out.log",
+                stderr_path=base / "system" / "err.log",
+            )
+            system_paths.plist_path.parent.mkdir(parents=True)
+            system_paths.plist_path.write_bytes(b"old")
+
+            def fake_run(command, *args, **kwargs):
+                if command[0] == "clang":
+                    Path(command[3]).write_bytes(b"binary")
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                patch("agent_monitor.sd_eject_guard_launch.os.geteuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.os.getuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.subprocess.run", side_effect=fake_run),
+            ):
+                result = install_sd_eject_guard(
+                    scope="user",
+                    source_path=source,
+                    user_paths=user_paths,
+                    system_paths=system_paths,
+                )
+
+            self.assertIsNone(result.cleanup_removed)
+            self.assertIn(str(system_paths.plist_path), result.cleanup_skipped or "")
+            self.assertTrue(system_paths.plist_path.exists())
+
+    def test_sd_eject_guard_stop_auto_stops_user_and_skips_system_without_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            user_paths = SdEjectGuardPaths(
+                scope="user",
+                plist_path=base / "user" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "user" / "sd_eject_guard",
+                stdout_path=base / "user" / "out.log",
+                stderr_path=base / "user" / "err.log",
+            )
+            system_paths = SdEjectGuardPaths(
+                scope="system",
+                plist_path=base / "system" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "system" / "sd_eject_guard",
+                stdout_path=base / "system" / "out.log",
+                stderr_path=base / "system" / "err.log",
+            )
+            user_paths.plist_path.parent.mkdir(parents=True)
+            system_paths.plist_path.parent.mkdir(parents=True)
+            user_paths.plist_path.write_bytes(b"user")
+            system_paths.plist_path.write_bytes(b"system")
+
+            with (
+                patch("agent_monitor.sd_eject_guard_launch.os.geteuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.os.getuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.subprocess.run") as run,
+            ):
+                results = stop_sd_eject_guard(
+                    scope="auto",
+                    user_paths=user_paths,
+                    system_paths=system_paths,
+                )
+
+            self.assertEqual(len(results), 2)
+            self.assertTrue(results[0].stopped)
+            self.assertFalse(results[1].stopped)
+            self.assertIn("missing permissions", results[1].skipped or "")
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0][0:3], ["launchctl", "bootout", "gui/501"])
+
+    def test_sd_eject_guard_system_scope_requires_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "sd_eject_guard.c"
+            source.write_text("int main(void) { return 0; }\n")
+            system_paths = SdEjectGuardPaths(
+                scope="system",
+                plist_path=base / "system" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "system" / "sd_eject_guard",
+                stdout_path=base / "system" / "out.log",
+                stderr_path=base / "system" / "err.log",
+            )
+
+            with patch("agent_monitor.sd_eject_guard_launch.os.geteuid", return_value=501):
+                with self.assertRaisesRegex(SdEjectGuardInstallError, "requires root"):
+                    install_sd_eject_guard(
+                        scope="system",
+                        source_path=source,
+                        system_paths=system_paths,
+                    )
+
+    def test_sd_eject_guard_system_install_cleans_user_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "sd_eject_guard.c"
+            source.write_text("int main(void) { return 0; }\n")
+            user_paths = SdEjectGuardPaths(
+                scope="user",
+                plist_path=base / "user" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "user" / "sd_eject_guard",
+                stdout_path=base / "user" / "out.log",
+                stderr_path=base / "user" / "err.log",
+            )
+            system_paths = SdEjectGuardPaths(
+                scope="system",
+                plist_path=base / "system" / "io.sidepulse.sdejectguard.plist",
+                binary_path=base / "system" / "sd_eject_guard",
+                stdout_path=base / "system" / "out.log",
+                stderr_path=base / "system" / "err.log",
+            )
+            user_paths.plist_path.parent.mkdir(parents=True)
+            user_paths.plist_path.write_bytes(b"old")
+            calls = []
+
+            def fake_run(command, *args, **kwargs):
+                calls.append(command)
+                if command[0] == "clang":
+                    Path(command[3]).write_bytes(b"binary")
+                return subprocess.CompletedProcess(command, 0)
+
+            with (
+                patch("agent_monitor.sd_eject_guard_launch.os.geteuid", return_value=0),
+                patch("agent_monitor.sd_eject_guard_launch.os.getuid", return_value=501),
+                patch("agent_monitor.sd_eject_guard_launch.os.chown") as chown,
+                patch("agent_monitor.sd_eject_guard_launch.subprocess.run", side_effect=fake_run),
+            ):
+                result = install_sd_eject_guard(
+                    scope="system",
+                    source_path=source,
+                    user_paths=user_paths,
+                    system_paths=system_paths,
+                )
+
+            self.assertEqual(result.scope, "system")
+            self.assertEqual(result.cleanup_removed, user_paths.plist_path)
+            self.assertFalse(user_paths.plist_path.exists())
+            self.assertTrue(system_paths.plist_path.exists())
+            self.assertIn(["launchctl", "bootstrap", "system", str(system_paths.plist_path)], calls)
+            chown.assert_any_call(system_paths.binary_path, 0, 0)
+            chown.assert_any_call(system_paths.plist_path, 0, 0)
 
     def test_watch_filters_to_recent_statuses(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2380,6 +3401,18 @@ team id 5QJ7W2AQ8H, push key '/Users/pero/Dropbox/keys/PixieDotPushKey.p8'
         self.assertEqual(
             session_resume_command(status),
             "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257",
+        )
+        self.assertEqual(
+            session_vscode_link(status),
+            "vscode://anthropic.claude-code/open?session=1ca4348e-2aec-4147-9e81-d7d56364d257",
+        )
+        self.assertEqual(default_session_open_action(status), "vscode")
+        self.assertEqual(
+            session_open_target(status, "vscode"),
+            (
+                "url",
+                "vscode://anthropic.claude-code/open?session=1ca4348e-2aec-4147-9e81-d7d56364d257",
+            ),
         )
 
 

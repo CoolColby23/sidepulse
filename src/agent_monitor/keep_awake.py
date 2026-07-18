@@ -41,6 +41,7 @@ class KeepAwakeController:
         self.watch_current_process = watch_current_process
         self.process = None
         self.last_mode: AgentMode | None = None
+        self.holding_requested = False
         self.grace_until_monotonic: float | None = None
         self.last_error: str | None = None
         self.last_status_read_monotonic_by_path: dict[Path, float] = {}
@@ -53,6 +54,7 @@ class KeepAwakeController:
         self.enabled = enabled
         if not enabled:
             self.release()
+            self.holding_requested = False
             self.grace_until_monotonic = None
             self.last_status_error = None
             self.last_status_read_monotonic_by_path.clear()
@@ -61,6 +63,7 @@ class KeepAwakeController:
     def update(self, mode: AgentMode, *, now: float | None = None) -> bool:
         current = time.monotonic() if now is None else now
         should_hold = self.should_hold_for_mode(mode, current)
+        self.holding_requested = should_hold
         self.last_mode = mode
 
         if not self.enabled or not should_hold:

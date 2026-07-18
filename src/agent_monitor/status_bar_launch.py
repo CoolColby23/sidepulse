@@ -10,8 +10,10 @@ from typing import Any
 
 from .providers import default_state_dir
 
-LAUNCH_AGENT_LABEL = "com.sidepulse.agentstatus"
+LAUNCH_AGENT_LABEL = "io.sidepulse.agentstatus"
 LAUNCH_AGENT_FILENAME = f"{LAUNCH_AGENT_LABEL}.plist"
+LEGACY_LAUNCH_AGENT_LABEL = "com.sidepulse.agentstatus"
+LEGACY_LAUNCH_AGENT_FILENAME = f"{LEGACY_LAUNCH_AGENT_LABEL}.plist"
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,11 @@ class LaunchAgentResult:
 def launch_agent_path(home: Path | None = None) -> Path:
     base = home or Path.home()
     return base / "Library" / "LaunchAgents" / LAUNCH_AGENT_FILENAME
+
+
+def legacy_launch_agent_path(home: Path | None = None) -> Path:
+    base = home or Path.home()
+    return base / "Library" / "LaunchAgents" / LEGACY_LAUNCH_AGENT_FILENAME
 
 
 def build_launch_agent_plist(
@@ -64,8 +71,12 @@ def install_launch_agent(
     start: bool = True,
     plist_path: Path | None = None,
     python_executable: Path | str | None = None,
+    legacy_plist_path: Path | None = None,
 ) -> LaunchAgentResult:
     target = plist_path or launch_agent_path()
+    legacy_target = legacy_plist_path if legacy_plist_path is not None else (
+        legacy_launch_agent_path() if plist_path is None else None
+    )
     plist = build_launch_agent_plist(python_executable=python_executable)
     data = plistlib.dumps(plist, sort_keys=False)
     existing = target.read_bytes() if target.exists() else None
@@ -75,6 +86,10 @@ def install_launch_agent(
     default_state_dir().mkdir(parents=True, exist_ok=True)
     if changed:
         target.write_bytes(data)
+    legacy_removed = False
+    if legacy_target is not None:
+        legacy_removed = remove_legacy_launch_agent(legacy_target)
+    changed = changed or legacy_removed
 
     started = False
     if start:
@@ -122,6 +137,15 @@ def bootout_launch_agent(plist_path: Path) -> None:
         stderr=subprocess.DEVNULL,
         check=False,
     )
+
+
+def remove_legacy_launch_agent(plist_path: Path | None = None) -> bool:
+    target = plist_path or legacy_launch_agent_path()
+    if not target.exists():
+        return False
+    bootout_launch_agent(target)
+    target.unlink()
+    return True
 
 
 def launch_domain() -> str:

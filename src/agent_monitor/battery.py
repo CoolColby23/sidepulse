@@ -18,6 +18,7 @@ from .device_writer import (
     write_led_program,
 )
 from .led_status import led_count_for_target
+from .led_status import apply_brightness, normalize_brightness
 
 
 BATTERY_LOW_RED = "#FF2600"
@@ -285,6 +286,7 @@ def program_for_battery(
     led_count: int = 8,
     full_charge_watts: float | None = None,
     transition_ms: int = 360,
+    brightness: int | float = 255,
 ) -> str:
     count = max(1, min(8, int(led_count)))
     percent = max(0, min(100, int(snapshot.percent)))
@@ -295,13 +297,19 @@ def program_for_battery(
     if not snapshot.is_plugged or snapshot.is_charged:
         color = battery_color(percent)
         if snapshot.is_charged or percent >= 100:
-            return ";".join(
-                battery_segment(index, BATTERY_HIGH_GREEN, transition)
-                for index in range(count)
+            return apply_brightness(
+                ";".join(
+                    battery_segment(index, BATTERY_HIGH_GREEN, transition)
+                    for index in range(count)
+                ),
+                brightness,
             )
-        return ";".join(
-            battery_segment(index, battery_fill_color(index, fill, color), transition)
-            for index in range(count)
+        return apply_brightness(
+            ";".join(
+                battery_segment(index, battery_fill_color(index, fill, color), transition)
+                for index in range(count)
+            ),
+            brightness,
         )
 
     color = BATTERY_CHARGING_MINT
@@ -322,7 +330,7 @@ def program_for_battery(
             f"{pulse_index}:{color} {pulse_ms}ms pulse",
         ]
     )
-    return "\n".join(lines)
+    return apply_brightness("\n".join(lines), brightness)
 
 
 @dataclass(frozen=True)
@@ -373,12 +381,14 @@ def write_battery_to_leds(
     file_name: str = DEFAULT_FILE_NAME,
     dry_run: bool = False,
     full_charge_watts: float | None = None,
+    brightness: int | float = 255,
 ) -> BatteryLedWrite:
     target = resolve_target_path(device_path=device_path, file_name=file_name)
     program = program_for_battery(
         snapshot,
         led_count=led_count_for_target(target),
         full_charge_watts=full_charge_watts,
+        brightness=brightness,
     )
     written_target = write_led_program(
         program,
@@ -401,11 +411,13 @@ class BatteryLedController:
         file_name: str = DEFAULT_FILE_NAME,
         dry_run: bool = False,
         error_retry_seconds: float = 10.0,
+        brightness: int | float = 255,
     ) -> None:
         self.device_path = device_path
         self.file_name = file_name
         self.dry_run = dry_run
         self.error_retry_seconds = error_retry_seconds
+        self.brightness = normalize_brightness(brightness)
         self.last_program: str | None = None
         self.last_error: str | None = None
         self.last_target: Path | None = None
@@ -423,7 +435,11 @@ class BatteryLedController:
         now = time.monotonic()
         try:
             target = resolve_target_path(device_path=self.device_path, file_name=self.file_name)
-            program = program_for_battery(snapshot, led_count=led_count_for_target(target))
+            program = program_for_battery(
+                snapshot,
+                led_count=led_count_for_target(target),
+                brightness=self.brightness,
+            )
         except (DeviceWriteError, OSError) as exc:
             self.last_error = str(exc)
             return BatteryLedWrite(

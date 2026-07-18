@@ -20,6 +20,16 @@ from .led_status import (
     program_for_display_state,
     write_mode_to_leds,
 )
+from .lid_sleep import (
+    ClosedLidAwakeController,
+    install_sleep_helper,
+    read_lid_closed,
+    read_sleep_disabled,
+    run_sudo_pmset_disablesleep,
+    sleep_helper_install_command,
+    sleep_helper_installed,
+    uninstall_sleep_helper,
+)
 from .models import AgentMode, AgentStatus, AggregateStatus, HookEvent
 
 __all__ = [
@@ -36,11 +46,19 @@ __all__ = [
     "LedDisplayState",
     "MonitorSnapshot",
     "SourceSpec",
+    "ClosedLidAwakeController",
     "default_event_socket_path",
     "default_latest_state_path",
     "display_state_for_mode",
     "program_for_battery",
     "read_battery_snapshot",
+    "read_lid_closed",
+    "read_sleep_disabled",
+    "install_sleep_helper",
+    "run_sudo_pmset_disablesleep",
+    "sleep_helper_install_command",
+    "sleep_helper_installed",
+    "uninstall_sleep_helper",
     "send_hook_event",
     "program_for_display_state",
     "write_mode_to_leds",

@@ -29,6 +29,14 @@ class AudioMonitorExampleTests(unittest.TestCase):
         self.assertIn("4:#FFDB00", program)
         self.assertTrue(program.endswith("7:#FF0000"))
 
+    def test_max_brightness_uses_firmware_brightness_command(self) -> None:
+        program = build_led_program(1.0, led_count=8, max_brightness=0.5, transition_ms=0)
+
+        validate_led_text(program)
+        self.assertTrue(program.startswith("brightness 128\n"))
+        self.assertIn("0:#00FF00", program)
+        self.assertTrue(program.endswith("7:#FF0000"))
+
     def test_half_level_keeps_back_half_dim(self) -> None:
         program = build_led_program(0.5, led_count=8, idle_brightness=0.08, transition_ms=0)
         segments = program.split("; ")
