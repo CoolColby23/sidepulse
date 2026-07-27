@@ -9,7 +9,9 @@ SidePulse Dot is the tiny two-LED USB-C device.
 They can display the status of an AI agent, battery level, or other system
 signals.
 
-📹 [Watch the demo](https://sidepulse.io/images/sidepulse-demo-v2.mp4) — agent status, at a glance.
+Agent status, at a glance:
+
+https://github.com/inteliwear/sidepulse/raw/main/media/sidepulse-demo.mp4
 
 The device mounts as a disk drive. You can control the LEDs by writing to `LEDS.LED`.
 
