@@ -6,7 +6,7 @@
 They can display the status of an AI agent, battery level, or other system
 signals.
 
-| <img src="media/sidepulse-pro.jpg" alt="SidePulse Pro glowing pink in a MacBook Pro SD card slot" width="400"> | <img src="media/sidepulse-dot.jpg" alt="SidePulse Dot glowing green in a MacBook USB-C port" width="400"> |
+| <img src="https://raw.githubusercontent.com/inteliwear/sidepulse/main/media/sidepulse-pro.jpg" alt="SidePulse Pro glowing pink in a MacBook Pro SD card slot" width="400"> | <img src="https://raw.githubusercontent.com/inteliwear/sidepulse/main/media/sidepulse-dot.jpg" alt="SidePulse Dot glowing green in a MacBook USB-C port" width="400"> |
 |:---:|:---:|
 | **SidePulse Pro** — eight-LED SD card device for MacBook Pro. | **SidePulse Dot** — tiny two-LED USB-C device. |
 
