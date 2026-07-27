@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/9de119ac-7b55-467f-8517-6c5f1570c1af
 
 The device mounts as a disk drive. You can control the LEDs by writing to `LEDS.LED`.
 
-The LED control DSL is described in [`LEDS_FORMAT.txt`](LEDS_FORMAT.txt).
+The LED control DSL is described in [`LEDS_FORMAT.md`](LEDS_FORMAT.md).
 
 ### TLDR
 ```sh
