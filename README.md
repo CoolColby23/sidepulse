@@ -3,15 +3,16 @@
 `sidepulse` is the command-line and macOS companion project for
 [SidePulse](https://sidepulse.io).
 
-SidePulse Pro is the eight-LED SD card device for MacBook Pro.
-SidePulse Dot is the tiny two-LED USB-C device.
-
 They can display the status of an AI agent, battery level, or other system
 signals.
 
+| <img src="media/sidepulse-pro.jpg" alt="SidePulse Pro glowing pink in a MacBook Pro SD card slot" width="400"> | <img src="media/sidepulse-dot.jpg" alt="SidePulse Dot glowing green in a MacBook USB-C port" width="400"> |
+|:---:|:---:|
+| **SidePulse Pro** — eight-LED SD card device for MacBook Pro. | **SidePulse Dot** — tiny two-LED USB-C device. |
+
 Agent status, at a glance:
 
-https://github.com/inteliwear/sidepulse/raw/main/media/sidepulse-demo.mp4
+https://github.com/user-attachments/assets/9de119ac-7b55-467f-8517-6c5f1570c1af
 
 The device mounts as a disk drive. You can control the LEDs by writing to `LEDS.LED`.
 
