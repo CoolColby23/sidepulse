@@ -3,23 +3,28 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sidepulse-agent-monitor"
+name = "sidepulse"
 version = "0.1.0"
-description = "Provider-neutral agent status collection for Codex and Claude hooks."
+description = "Command-line and macOS tools for SidePulse Pro and SidePulse Dot."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.urls]
+Homepage = "https://sidepulse.io"
+
 [project.optional-dependencies]
-status-bar = ["pyobjc-framework-Cocoa>=10"]
+status-bar = ["pyobjc-framework-Cocoa>=10", "pyobjc-framework-JavaScriptCore>=10"]
+reply-classifier = ["mlx-lm>=0.24,<1"]
 
 [project.scripts]
-sidepulse = "agent_monitor.cli:sidepulse_main"
-agent-monitor = "agent_monitor.cli:main"
-agent-status-bar = "agent_monitor.status_bar:main"
+sidepulse = "sidepulse.cli:sidepulse_main"
+agent-monitor = "sidepulse.cli:main"
+agent-status-bar = "sidepulse.status_bar:main"
+sidepulse-reply = "sidepulse.reply_classifier:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-"agent_monitor.resources" = ["sd_eject_guard.c"]
+"sidepulse.resources" = ["sd_eject_guard.c", "sdled.wasm"]

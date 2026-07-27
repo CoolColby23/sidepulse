@@ -1,3 +1,39 @@
+# SidePulse Pro and SidePulse Dot - How it works
+
+SidePulse Pro and SidePulse Dot expose an LED controller as a virtual filesystem, inspired by Linux sysfs. LED animations are controlled by writing commands to the LEDS.LED file.
+No drivers are needed.
+SidePulse Pro fits into the SD card slot on MacBook Pro 2021+ models and has 8 RGB LEDs. SidePulse Dot is a tiny 2-LED USB-C device for Mac, iPhone, Linux, and Windows.
+
+
+On macOS they mount under `/Volumes/SidePulsePro` and `/Volumes/SidePulseDot`.
+
+The simplest way to change the color is
+
+    $ echo "#FF00FF" > /Volumes/SidePulsePro/LEDS.LED
+
+Or to slowly pulse it.
+
+     $ echo "off\n#FF00FF 1s pulse\nrepeat" > /Volumes/SidePulsePro/LEDS.LED
+
+
+There is a quirk with the MacBook SD card reader: it can power off SidePulse Pro after 3 minutes of inactivity.
+A simple way to prevent it is to 'touch' it once a minute like
+
+    $ touch /Volumes/SidePulsePro/keepalive
+
+or
+
+    $ while touch /Volumes/SidePulsePro/keepalive; do sleep 60; done
+
+To recap, write to LEDS.LED what you want displayed.
+That's all you have to know.
+
+## Initial state.
+
+The content in INIT.LED is played on power up. It can be anything supported by LEDS.LED.
+Fresh firmware seeds INIT.LED with the one-second startup fill sequence.
+Writing INIT.LED also applies the new startup program immediately for visual confirmation.
+
 # LEDS.LED DSL
 
 Write LED animation programs to `LEDS.LED`. Each non-empty, non-comment line is
@@ -58,9 +94,8 @@ assigned more than once on a line, the last assignment wins:
 
 ## Brightness
 
-Brightness scales the RGB values. It does not change the stored animation
-colors. Each successful parse starts with brightness 255 unless the program
-includes `brightness N`.
+Brightness scales the RGB values. It does not change the stored animation colors. Each successful parse starts with brightness 255 unless
+the program includes `brightness N`.
 
 ```text
 brightness 128
@@ -117,13 +152,13 @@ color to the target color and back to the start color over one duration. The
 target color is the peak, not the final hold.
 
 ```text
-# fade to purple
+// fade to purple
 #ff00ff 0.33s cosine
 
-# pulse to purple and return to the current color
+// pulse to purple and return to the current color
 #ff00ff 1.4s pulse
 
-# same pulse using the default 330 ms duration
+// same pulse using the default 330 ms duration
 #ff00ff pulse
 ```
 
@@ -131,6 +166,29 @@ target color is the peak, not the final hold.
 
 ```text
 3:#ffffff 80ms none
+```
+
+## Roll
+
+Roll the current visible LED state by one full wraparound loop:
+
+```text
+roll 2s
+roll 2s linear
+roll 2s ease
+roll-left 800ms ease-in-out
+roll-right 1.5s cosine
+```
+
+`roll` is an alias for `roll-right`. Missing easing defaults to `linear`.
+Duration is the time for one complete loop, so `roll 2s` returns to the
+starting arrangement after 2 seconds. Roll always uses the current visible LED
+state as its source. To roll a chosen palette, set it first:
+
+```text
+#ff0044 #ff8800 #ffff00 #00ff66 #00ccff #004cff #8800ff #ff00cc
+roll 2s linear
+repeat
 ```
 
 ## Delays And Staggering
@@ -204,6 +262,16 @@ off 120ms ease-out
 repeat
 ```
 
-Compile-time LED count matters. On an 8 LED build, indexes `0` through `7`
-target visible LEDs. On a 2 LED build, only indexes `0` and `1` target visible
-LEDs. Extra valid indexes and color-list entries are parsed, then ignored.
+Smooth seeded roll:
+
+```text
+#ff0044 #ff8800 #ffff00 #00ff66 #00ccff #004cff #8800ff #ff00cc
+roll 2s linear
+repeat
+```
+
+Compile-time LED count matters, but shared scripts are portable. On an 8 LED
+build, indexes `0` through `7` affect LEDs. On a 2 LED build, only indexes `0`
+and `1` affect LEDs. Higher indexes and extra color-list entries are parsed so
+bad syntax still fails, but valid out-of-range LED targets are ignored. A line
+that only targets ignored LEDs is a no-op.

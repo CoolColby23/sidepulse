@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from agent_monitor.device_writer import MAX_LED_BYTES, validate_led_text
+from sidepulse.device_writer import MAX_LED_BYTES, validate_led_text
 from examples.audio_monitor import (
     build_led_program,
     green_to_red_rgb,

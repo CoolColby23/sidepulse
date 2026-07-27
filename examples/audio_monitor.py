@@ -14,13 +14,13 @@ REPO_SRC = Path(__file__).resolve().parents[1] / "src"
 if REPO_SRC.exists():
     sys.path.insert(0, str(REPO_SRC))
 
-from agent_monitor.device_writer import (  # noqa: E402
+from sidepulse.device_writer import (  # noqa: E402
     DEFAULT_FILE_NAME,
     DeviceWriteError,
     validate_led_text,
     write_led_program,
 )
-from agent_monitor.led_status import apply_brightness, led_count_for_target  # noqa: E402
+from sidepulse.led_status import apply_brightness, led_count_for_target  # noqa: E402
 
 
 DEFAULT_FPS = 25.0
@@ -440,7 +440,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-device", help="sounddevice input index or name.")
     parser.add_argument("--list-inputs", action="store_true", help="List audio input devices and exit.")
     parser.add_argument("--terminal", action="store_true", help="Show a terminal meter while running.")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing to a SidePulse device.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview without writing to a SidePulse Pro or SidePulse Dot device.",
+    )
     parser.add_argument("--off-on-exit", action="store_true", help="Write 'off' when the monitor exits.")
     return parser
 

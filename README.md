@@ -1,31 +1,37 @@
-# SidePulse
+# sidepulse
 
-SidePulse is the overall product for small LED status devices and the local
-agent-monitoring tools that drive them.
+`sidepulse` is the command-line and macOS companion project for
+[SidePulse](https://sidepulse.io).
 
-The SidePulse device is the eight-LED SD card slot version for MacBook Pro.
-PulseDot is the tiny two-LED USB-C version.
+SidePulse Pro is the eight-LED SD card device for MacBook Pro.
+SidePulse Dot is the tiny two-LED USB-C device.
 
 They can display the status of an AI agent, battery level, or other system
 signals.
 
-The device mounts as a flash drive. Control the LEDs by writing to `LEDS.LED`.
+The device mounts as a disk drive. You can control the LEDs by writing to `LEDS.LED`.
 
 The LED control DSL is described in [`LEDS_FORMAT.txt`](LEDS_FORMAT.txt).
 
-Write an LED program directly to a mounted SidePulse or PulseDot device:
+### TLDR
+```sh
+python3 -m pip install -e .
+sidepulse setup
+```
+
+Write an LED program directly to a mounted SidePulse Pro or SidePulse Dot device:
 
 ```sh
 sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat"
 ```
 
 The CLI auto-detects mounted devices under `/Volumes` by looking for a
-SidePulse/PulseDot-style volume name or an existing `LEDS.LED`. If more than
+SidePulse Pro/SidePulse Dot-style volume name or an existing `LEDS.LED`. If more than
 one device is possible, pass the mounted folder or file explicitly:
 
 ```sh
-sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat" --device /Volumes/SidePulse
-sidepulse write "off" --device /Volumes/SidePulse/LEDS.LED
+sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat" --device /Volumes/SidePulsePro
+sidepulse write "off" --device /Volumes/SidePulsePro/LEDS.LED
 ```
 
 The writer decodes simple escapes such as `\n`, then enforces the controller's
@@ -40,15 +46,15 @@ sidepulse battery status
 sidepulse battery status --json
 ```
 
-Mirror battery level to a mounted SidePulse/PulseDot:
+Mirror battery level to a mounted SidePulse Pro/SidePulse Dot:
 
 ```sh
 sidepulse battery leds
 sidepulse battery leds --once --dry-run
-sidepulse battery leds --device /Volumes/SidePulse --full-watts 140
+sidepulse battery leds --device /Volumes/SidePulsePro --full-watts 140
 ```
 
-SidePulse uses all eight LEDs as a battery bar. At 50%, LEDs 0-3 are filled;
+SidePulse Pro uses all eight LEDs as a battery bar. At 50%, LEDs 0-3 are filled;
 when charging, LED 4 is the pulsing frontier LED. Live updates ease the whole
 strip into its new base state, then trigger one frontier pulse. The app owns
 the animation cadence by rewriting that one-shot pulse; the device does not run
@@ -66,15 +72,16 @@ sidepulse battery configure --full-watts auto
 sidepulse battery configure --show-on-power-change yes --power-change-preview-seconds 7
 ```
 
-## SidePulse Bridge
+## sidepulse
 
-SidePulse Bridge is a companion app for macOS that controls SidePulse devices.
+`sidepulse` includes a companion menu-bar app for macOS that controls
+SidePulse Pro and SidePulse Dot.
 
 ### Main Functionality
 
 #### AI Agent Monitoring
 
-SidePulse can monitor AI agents such as Codex and Claude through hooks, then
+SidePulse can monitor AI agents such as Codex, Claude, and Grok through hooks, then
 translate the current agent state into a small, glanceable LED status.
 
 Agent status modes:
@@ -117,14 +124,16 @@ the display indefinitely.
 
 #### Agent Monitor Library
 
-The `agent_monitor` Python package collects and normalizes local AI agent hook
+The `sidepulse` Python package collects and normalizes local AI agent hook
 events. The macOS status-bar app receives hook events through a lightweight
 local Unix socket, keeps the latest agent states in memory, and writes only a
-small `latest.json` restart snapshot plus provider JSONL debug logs. It does
-not rescan historical logs or transcripts on every refresh.
+small `latest.json` restart snapshot plus provider JSONL debug logs. Hooks also
+append `event-status.jsonl`, a compact decision log that records each hook event
+and the SidePulse status it produced for debugging/export. The app does not
+rescan historical logs or transcripts on every refresh.
 
-The package can also mirror the aggregate state to a mounted SidePulse or
-PulseDot by writing the current LED program to `LEDS.LED`.
+The package can also mirror the aggregate state to a mounted SidePulse Pro or
+SidePulse Dot by writing the current LED program to `LEDS.LED`.
 
 The monitor currently supports:
 
@@ -132,6 +141,37 @@ The monitor currently supports:
 | --- | --- | --- |
 | Codex | `~/.codex/config.toml` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/codex.jsonl` |
 | Claude | `~/.claude/settings.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/claude.jsonl` |
+| Grok | `~/.grok/hooks/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/grok.jsonl` |
+
+#### Local reply classifier (Apple Silicon)
+
+Install the optional MLX dependency, then classify a message with the default
+4-bit `mlx-community/Qwen2.5-0.5B-Instruct-4bit` model:
+
+```sh
+python3 -m pip install -e '.[reply-classifier]'
+sidepulse-reply "Could you check this for me?"
+echo "Thanks, I received it." | sidepulse-reply --json
+```
+
+The model runs locally and uses deterministic greedy decoding. To benchmark the
+canonical labeled examples plus recent assistant messages collected in the
+SidePulse decision log:
+
+```sh
+python3 examples/benchmark_reply_classifier.py --warm-runs 20 --log-examples 12
+```
+
+Generate the labeled dataset (eight human-collected examples plus 300 balanced,
+reproducible synthetic examples):
+
+```sh
+python3 scripts/generate_reply_dataset.py
+```
+
+The resulting `data/reply_expectation.jsonl` records `label`, `source`, `split`,
+and `category`. Human-collected examples are kept in the test split and synthetic
+examples are explicitly marked so evaluation can report them separately.
 
 For CLI snapshots, debugging, or recovery after missed hook events, the
 file-based monitor can optionally read recent local transcripts as a fallback:
@@ -170,17 +210,18 @@ Set up this Mac explicitly after package install:
 sidepulse setup
 ```
 
-`sidepulse setup` installs or refreshes Codex and Claude hooks, installs the SD
-eject guard, writes the status-bar LaunchAgent, starts both helpers
+`sidepulse setup` installs or refreshes Codex, Claude, and Grok hooks, installs
+SidePulse Pro Eject Prevention, writes the status-bar LaunchAgent, starts both helpers
 immediately, and enables them at login. This is intentionally an explicit
 command instead of a `pip install` side effect. To set up only one provider, use
-`sidepulse setup codex` or `sidepulse setup claude`. To skip the status-bar app
-but still install hooks and the SD eject guard, use `sidepulse setup
---no-status-bar`.
+`sidepulse setup codex`, `sidepulse setup claude`, or `sidepulse setup grok`.
+To skip the status-bar app but still install hooks and SidePulse Pro Eject Prevention, use
+`sidepulse setup --no-status-bar`.
 
-The SD eject guard keeps the built-in SD reader attached after macOS hibernate
-or lock-screen mount refusals. By default setup installs it system-wide when
-already running with system permissions, otherwise as a per-user LaunchAgent:
+SidePulse Pro Eject Prevention keeps the built-in SD reader attached after
+macOS hibernate or lock-screen mount refusals. By default setup installs it
+system-wide when already running with system permissions, otherwise as a
+per-user LaunchAgent:
 
 ```sh
 sidepulse setup --sd-eject-guard-scope auto
@@ -191,11 +232,12 @@ sidepulse setup --sd-eject-guard-scope system --no-status-bar
 The system scope requires the command to already have system install
 permissions.
 
-Manage the SD eject guard directly:
+Manage SidePulse Pro Eject Prevention directly:
 
 ```sh
 sidepulse sdejectguard start
 sidepulse sdejectguard stop
+sidepulse sdejectguard uninstall
 sidepulse sdejectguard logs
 sidepulse sdejectguard start -it
 ```
@@ -209,6 +251,13 @@ python3 -m pip install --user --break-system-packages -e .
 ln -sf "$(python3 -m site --user-base)/bin/sidepulse" ~/.local/bin/sidepulse
 ```
 
+### macOS installer
+
+A signed and notarized PKG release can be built with
+[`packaging/build_macos_pkg.sh`](packaging/build_macos_pkg.sh). See
+[`packaging/README.md`](packaging/README.md) for the required Developer ID
+certificates and notarization profile.
+
 Check the current hook configuration:
 
 ```sh
@@ -221,6 +270,7 @@ Install or refresh the monitor hooks:
 sidepulse agent-monitor install
 sidepulse agent-monitor install codex
 sidepulse agent-monitor install claude
+sidepulse agent-monitor install grok
 ```
 
 Each hook invokes a small, standard-library-only Python entry point. It writes
@@ -252,6 +302,12 @@ By default, `Tool Running` events are not time-limited, so genuinely long tools
 remain visible. If a provider drops completion hooks and you want protection
 against stale tool starts, set `--tool-running-timeout`.
 
+`PostToolUse` means the tool returned, not that the whole turn is finished. The
+monitor keeps it as Working for a short settling window while the assistant
+writes the response, then treats it as Done if no newer hook event arrives. This
+prevents a missed final `Stop` event from leaving the status bar stuck on
+Working.
+
 `Completed` remains visible for 20 minutes so the status bar and LEDs can show
 Done long enough to be noticed. After that it drops out instead of counting as
 an active session for the full stale window, and the LEDs return to the very
@@ -281,8 +337,8 @@ Codex `PermissionRequest` events are treated as Ask and remain sticky until the
 matching tool command finishes. This prevents unrelated same-session activity
 from hiding an approval prompt that is still waiting on the user.
 
-For Codex or Claude projects that should report this reliably, add guidance like
-this to the relevant agent instructions:
+For Codex, Claude, or Grok projects that should report this reliably, add
+guidance like this to the relevant agent instructions:
 
 ```text
 When your final response needs user input, approval, or a decision, include
@@ -302,12 +358,12 @@ program:
 
 ```sh
 sidepulse agent-monitor leds --once --dry-run
-sidepulse agent-monitor leds --device /Volumes/PulseDot
+sidepulse agent-monitor leds --device /Volumes/SidePulseDot
 ```
 
-PulseDot programs are generated for two LEDs. SidePulse programs are generated
+SidePulse Dot programs are generated for two LEDs. SidePulse Pro programs are generated
 for eight LEDs. The monitor detects this from the mounted device name and falls
-back to the eight-LED SidePulse layout if the name is unknown.
+back to the eight-LED SidePulse Pro layout if the name is unknown.
 
 Remove monitor hooks:
 
@@ -315,6 +371,7 @@ Remove monitor hooks:
 sidepulse agent-monitor uninstall
 sidepulse agent-monitor uninstall codex
 sidepulse agent-monitor uninstall claude
+sidepulse agent-monitor uninstall grok
 ```
 
 Install and start the macOS status-bar app:
@@ -332,6 +389,14 @@ state to the LEDs. For debugging, run it in the foreground:
 sidepulse status-bar start --foreground
 ```
 
+On first launch, the status-bar app shows a SidePulse Setup window. It can:
+
+- enable Run at Login;
+- install or uninstall SidePulse Pro Eject Prevention, which keeps SidePulse Pro/SidePulse Dot available after sleep;
+- open the one-time closed-lid sleep prevention installer in Terminal.
+
+The Setup window can be reopened from the dropdown with `Setup...`.
+
 The status-bar item shows one of four collapsed states:
 
 | Label | Meaning |
@@ -347,9 +412,9 @@ session's Open Options row to choose and remember another opener, such as the
 provider app, Terminal resume, or Claude Code in VS Code.
 
 The dropdown also includes a checked `Connect to Device` item. A checkmark means
-the status-bar app is actively connected to a mounted SidePulse/PulseDot target.
-If both devices are mounted, the status-bar app prefers SidePulse, then
-PulseDot. Click the item to disconnect and turn the LEDs off; click it again to
+the status-bar app is actively connected to a mounted SidePulse Pro/SidePulse Dot target.
+If both devices are mounted, the status-bar app prefers SidePulse Pro, then
+SidePulse Dot. Click the item to disconnect and turn the LEDs off; click it again to
 reconnect.
 
 The dropdown and Settings window can switch the LEDs between agent status and
@@ -357,11 +422,26 @@ battery status. When agent status is selected, `Show Battery on Plug/Unplug`
 can briefly show the battery animation for seven seconds after the power source
 changes.
 
+The Devices section also offers **Add Screen Bar**, an optional virtual
+eight-LED device. It appears as a notch-shaped status-bar overlay that covers
+the camera island/notch footprint and adds a straight 5 px LED band along the
+bottom edge, or the corresponding top-center position on a display without a
+notch. Each virtual LED blends across a three-LED footprint: centered on the
+target LED, fading one LED width left and right. It shares the physical
+device's status animations, display-mode selection, and per-device brightness
+control. The Screen Bar evaluates the same `LEDS.LED` programs with the
+firmware/websim `sdled.wasm` engine, then AppKit only draws the returned RGB
+frames.
+
 Open `Settings...` from the dropdown to manage agent integrations. The settings
-window can install or uninstall Codex and Claude hooks. The transcript
+window can install or uninstall Codex, Claude, and Grok hooks. The transcript
 checkboxes control the file-based CLI/debug fallback; the status-bar app gets
 live updates from the local hook event socket. Settings are stored at
 `${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`.
+
+Settings can export the hook decision log as CSV or HTML. This log lives at
+`${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/event-status.jsonl`
+and shows the path from provider hook event to interpreted SidePulse status.
 
 The `Keep Awake With Lid Closed` menu section controls the stronger sleep
 prevention policy:
@@ -372,13 +452,11 @@ prevention policy:
 | When Agents Work | Keep the Mac awake while agents are Working / Tool Running / Progressing, plus the existing five-minute Ask / Done / Error grace period. |
 | Always | Keep the closed-lid sleep override active while the status-bar app is running. |
 
-The status-bar app still keeps the SidePulse/PulseDot volume active by touching
+The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by touching
 a `keepalive` file on each connected device at least once per minute. The
-closed-lid policy uses `caffeinate` by default, so it does not ask for
-administrator permission in the background. For Macs that need the stronger
-system sleep-disable setting, explicitly enable `Strong Sleep Override...` in
-the menu or `Strong sleep override (requires helper)` in Settings, then run the
-one-time setup command:
+closed-lid policy uses the SidePulse sleep helper when it is installed. The PKG
+installer sets this up automatically; source/dev installs can run the one-time
+setup command:
 
 ```sh
 sudo "$(command -v sidepulse)" status-bar install-sleep-helper
@@ -386,8 +464,9 @@ sudo "$(command -v sidepulse)" status-bar install-sleep-helper
 
 The helper is a narrow sudoers rule for exactly
 `/usr/bin/pmset -a disablesleep 0|1`, so the status-bar app can toggle it
-silently with non-interactive `sudo`. SidePulse only restores the setting if
-SidePulse changed it. Remove the helper with:
+silently with non-interactive `sudo`. SidePulse uses this automatically for
+`Keep Awake With Lid Closed` and only restores the setting if SidePulse changed
+it. Remove the helper with:
 
 ```sh
 sudo "$(command -v sidepulse)" status-bar uninstall-sleep-helper
@@ -409,7 +488,7 @@ sidepulse status-bar stop
 Use it from another Python app:
 
 ```python
-from agent_monitor import AgentMonitor, LiveAgentMonitor
+from sidepulse import AgentMonitor, LiveAgentMonitor
 
 snapshot = AgentMonitor.from_default_sources().snapshot()
 print(snapshot.aggregate.mode.value)
@@ -422,7 +501,7 @@ live = LiveAgentMonitor()
 Publish a hook-shaped event to the status-bar app from another local process:
 
 ```python
-from agent_monitor import send_hook_event
+from sidepulse import send_hook_event
 
 send_hook_event(
     "codex",
@@ -455,18 +534,18 @@ Preview the meter in the terminal without touching a device:
 python3 examples/audio_monitor.py --dry-run --terminal
 ```
 
-Write to a mounted SidePulse or PulseDot:
+Write to a mounted SidePulse Pro or SidePulse Dot:
 
 ```sh
-python3 examples/audio_monitor.py --device /Volumes/SidePulse --terminal
-python3 examples/audio_monitor.py --device /Volumes/PulseDot --terminal
+python3 examples/audio_monitor.py --device /Volumes/SidePulsePro --terminal
+python3 examples/audio_monitor.py --device /Volumes/SidePulseDot --terminal
 ```
 
 List audio inputs or tune sensitivity:
 
 ```sh
 python3 examples/audio_monitor.py --list-inputs
-python3 examples/audio_monitor.py --device /Volumes/SidePulse --gain-db 8 --release 0.45
+python3 examples/audio_monitor.py --device /Volumes/SidePulsePro --gain-db 8 --release 0.45
 ```
 
 #### Battery Monitor
