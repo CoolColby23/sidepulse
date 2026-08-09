@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console)"
+if [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    exit 0
+fi
+
+CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER")"
+CONSOLE_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | /usr/bin/awk '{print $2}')"
+APP_BINARY="/Applications/SidePulse.app/Contents/MacOS/SidePulse"
+
+/bin/mkdir -p /usr/local/bin
+/bin/ln -sfn "$APP_BINARY" /usr/local/bin/sidepulse
+
+# Install the narrow pmset helper while the package installer already has
+# privileges. This lets "Keep Awake With Lid Closed" work without exposing a
+# second technical toggle in the app UI.
+/usr/bin/env SUDO_USER="$CONSOLE_USER" USER="$CONSOLE_USER" LOGNAME="$CONSOLE_USER" \
+    "$APP_BINARY" status-bar install-sleep-helper || true
+
+# Configure user-owned hooks and LaunchAgents in the logged-in GUI session.
+/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" \
+    /usr/bin/env HOME="$CONSOLE_HOME" USER="$CONSOLE_USER" LOGNAME="$CONSOLE_USER" \
+    "$APP_BINARY" setup --sd-eject-guard-scope user || true
+
+exit 0
