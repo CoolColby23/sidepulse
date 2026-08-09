@@ -27,7 +27,10 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Utilities",
 ]
-dependencies = []
+dependencies = [
+    "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-WebKit>=10; sys_platform == 'darwin'",
+]
 
 [project.urls]
 Homepage = "https://sidepulse.io"
@@ -35,7 +38,9 @@ Repository = "https://github.com/inteliwear/sidepulse"
 Issues = "https://github.com/inteliwear/sidepulse/issues"
 
 [project.optional-dependencies]
-status-bar = ["pyobjc-framework-Cocoa>=10", "pyobjc-framework-WebKit>=10"]
+# Kept for backwards compatibility; the status-bar dependencies are installed by
+# default now, so this extra is a no-op alias.
+status-bar = []
 reply-classifier = ["mlx-lm>=0.24,<1"]
 
 [project.scripts]

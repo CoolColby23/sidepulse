@@ -27,7 +27,7 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$DIST_DIR"
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
-"$VENV_DIR/bin/python" -m pip install 'pyinstaller>=6.10' "$ROOT_DIR[status-bar]"
+"$VENV_DIR/bin/python" -m pip install 'pyinstaller>=6.10' "$ROOT_DIR"
 
 "$VENV_DIR/bin/pyinstaller" \
     --noconfirm --clean --windowed \

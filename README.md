@@ -203,11 +203,7 @@ Install locally for the `sidepulse` CLI:
 python3 -m pip install -e .
 ```
 
-To use the macOS status-bar app, install its Cocoa extra:
-
-```sh
-python3 -m pip install -e ".[status-bar]"
-```
+This also installs the Cocoa dependencies for the macOS status-bar app.
 
 Set up this Mac explicitly after package install:
 
