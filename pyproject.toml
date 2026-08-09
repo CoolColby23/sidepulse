@@ -35,7 +35,7 @@ Repository = "https://github.com/inteliwear/sidepulse"
 Issues = "https://github.com/inteliwear/sidepulse/issues"
 
 [project.optional-dependencies]
-status-bar = ["pyobjc-framework-Cocoa>=10", "pyobjc-framework-JavaScriptCore>=10"]
+status-bar = ["pyobjc-framework-Cocoa>=10", "pyobjc-framework-WebKit>=10"]
 reply-classifier = ["mlx-lm>=0.24,<1"]
 
 [project.scripts]
