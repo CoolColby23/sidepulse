@@ -65,6 +65,8 @@ def build_launch_agent_plist(
         "Label": LAUNCH_AGENT_LABEL,
         "ProgramArguments": program_arguments,
         "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 10,
         "StandardOutPath": str(stdout),
         "StandardErrorPath": str(stderr),
         "WorkingDirectory": str(Path.home()),

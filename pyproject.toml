@@ -55,4 +55,4 @@ where = ["src"]
 include = ["sidepulse*"]
 
 [tool.setuptools.package-data]
-"sidepulse.resources" = ["sd_eject_guard.c", "sdled.wasm"]
+"sidepulse.resources" = ["sd_eject_guard.c", "sdled.wasm", "system_audio_meter.swift"]

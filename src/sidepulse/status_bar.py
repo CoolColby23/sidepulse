@@ -580,6 +580,22 @@ class StatusBarController(NSObject):
         self.set_battery_power_preview(not self.settings.battery_show_on_power_change)
 
     @objc.IBAction
+    def toggleBatteryThresholdAlerts_(self, _sender):
+        self.settings = self.settings.with_ambient_features(
+            battery_alerts=not self.settings.battery_threshold_alerts_enabled
+        )
+        save_settings(self.settings)
+        self.refresh_(None)
+
+    @objc.IBAction
+    def toggleMusicVisualizer_(self, _sender):
+        self.settings = self.settings.with_ambient_features(
+            music_visualizer=not self.settings.music_visualizer_enabled
+        )
+        save_settings(self.settings)
+        self.refresh_(None)
+
+    @objc.IBAction
     def setBatteryPowerPreviewFromCheckbox_(self, sender):
         self.set_battery_power_preview(sender.state() == NSOnState)
 
@@ -665,6 +681,7 @@ class StatusBarController(NSObject):
             sources=(SourceSpec("event-bus", socket_path),),
             stale_after_seconds=3600,
             latest_state_path=default_latest_state_path(),
+            completed_visible_seconds=self.settings.completed_visible_seconds,
         )
 
     def build_codex_terminal_monitor(self) -> AgentMonitor:
@@ -1495,11 +1512,13 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
     ) -> tuple[str, str] | None:
-        if self.battery_threshold_alert.active():
+        if self.settings.battery_threshold_alerts_enabled and self.battery_threshold_alert.active():
             return "battery-warning", battery_warning_program(brightness=device.brightness)
 
         display = self.active_led_display_kind_for_device(device, battery_snapshot)
         if display != LED_DISPLAY_AGENT or mode != AgentMode.IDLE_READY:
+            return None
+        if not self.settings.music_visualizer_enabled:
             return None
         level = self.system_audio_meter.level()
         if level is None:
@@ -1947,6 +1966,20 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
         )
         virtual_toggle.setTarget_(target)
         menu.addItem_(virtual_toggle)
+
+    menu.addItem_(NSMenuItem.separatorItem())
+    battery_alerts = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Battery Threshold Alerts", "toggleBatteryThresholdAlerts:", ""
+    )
+    battery_alerts.setTarget_(target)
+    battery_alerts.setState_(1 if target.settings.battery_threshold_alerts_enabled else 0)
+    menu.addItem_(battery_alerts)
+    music = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Idle Music Visualizer", "toggleMusicVisualizer:", ""
+    )
+    music.setTarget_(target)
+    music.setState_(1 if target.settings.music_visualizer_enabled else 0)
+    menu.addItem_(music)
 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Keep Awake With Lid Closed"))

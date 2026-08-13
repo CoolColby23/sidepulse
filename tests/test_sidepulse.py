@@ -2664,7 +2664,8 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(plist["RunAtLoad"])
         self.assertEqual(plist["StandardOutPath"], "/tmp/sidepulse.out.log")
         self.assertEqual(plist["StandardErrorPath"], "/tmp/sidepulse.err.log")
-        self.assertNotIn("KeepAlive", plist)
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(plist["ThrottleInterval"], 10)
 
     def test_status_bar_launch_agent_installed_checks_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

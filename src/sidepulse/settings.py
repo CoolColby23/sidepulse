@@ -106,6 +106,9 @@ class AgentMonitorSettings:
     battery_full_charge_watts: float | None = None
     battery_show_on_power_change: bool = True
     battery_power_change_preview_seconds: float = DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
+    battery_threshold_alerts_enabled: bool = True
+    music_visualizer_enabled: bool = True
+    completed_visible_seconds: float = 15.0
     session_open_preferences: dict[str, str] = field(default_factory=dict)
     setup_screen_completed: bool = False
 
@@ -343,6 +346,26 @@ class AgentMonitorSettings:
     def with_virtual_status_device(self, enabled: bool) -> "AgentMonitorSettings":
         return replace(self, virtual_status_device_enabled=bool(enabled))
 
+    def with_ambient_features(
+        self,
+        *,
+        battery_alerts: bool | None = None,
+        music_visualizer: bool | None = None,
+    ) -> "AgentMonitorSettings":
+        return replace(
+            self,
+            battery_threshold_alerts_enabled=(
+                self.battery_threshold_alerts_enabled
+                if battery_alerts is None
+                else bool(battery_alerts)
+            ),
+            music_visualizer_enabled=(
+                self.music_visualizer_enabled
+                if music_visualizer is None
+                else bool(music_visualizer)
+            ),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "led_display": self.led_display,
@@ -360,7 +383,10 @@ class AgentMonitorSettings:
                 "full_charge_watts": self.battery_full_charge_watts,
                 "show_on_power_change": self.battery_show_on_power_change,
                 "power_change_preview_seconds": self.battery_power_change_preview_seconds,
+                "threshold_alerts_enabled": self.battery_threshold_alerts_enabled,
             },
+            "music_visualizer_enabled": self.music_visualizer_enabled,
+            "completed_visible_seconds": self.completed_visible_seconds,
             "session_open_preferences": dict(sorted(self.session_open_preferences.items())),
             "setup_screen_completed": self.setup_screen_completed,
         }
@@ -436,6 +462,11 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             battery.get("power_change_preview_seconds"),
             DEFAULT_POWER_CHANGE_PREVIEW_SECONDS,
         ),
+        battery_threshold_alerts_enabled=_bool_setting(
+            battery.get("threshold_alerts_enabled"), True
+        ),
+        music_visualizer_enabled=_bool_setting(data.get("music_visualizer_enabled"), True),
+        completed_visible_seconds=_float_setting(data.get("completed_visible_seconds"), 15.0),
         session_open_preferences=_session_open_preferences(data.get("session_open_preferences")),
         setup_screen_completed=_bool_setting(data.get("setup_screen_completed"), False),
     )
