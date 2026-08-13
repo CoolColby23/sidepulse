@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import threading
 import time
@@ -35,6 +36,8 @@ try:
         NSSavePanel,
         NSSlider,
         NSStatusBar,
+        NSTabView,
+        NSTabViewItem,
         NSTextField,
         NSTextView,
         NSView,
@@ -46,6 +49,7 @@ try:
         NSVariableStatusItemLength,
     )
     from Foundation import NSObject, NSString, NSTimer, NSURL
+    from ScriptingBridge import SBApplication
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
         "The status-bar app requires PyObjC/AppKit:\n"
@@ -187,6 +191,15 @@ class TerminalAppSpec:
     system_paths: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class TerminalSessionHints:
+    provider: str
+    session_id: str
+    cwd: str
+    title: str
+    match_title: str = ""
+
+
 STATE_IDLE = StatusBarState("Idle", "circle", 4)
 STATE_WORKING = StatusBarState("Working", "arrow.triangle.2.circlepath", 2)
 STATE_DONE = StatusBarState("Done", "checkmark.circle", 3)
@@ -198,6 +211,7 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 )
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
+STATUS_BAR_RECENT_COMPLETED_SECONDS = 20 * 60.0
 SCREEN_BAR_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
 STATUS_BAR_STARTUP_REPLAY_LINES = 200
@@ -478,7 +492,8 @@ class StatusBarController(NSObject):
             self.refresh_settings_window()
             return
         self.set_settings_message(
-            f"{provider.title()} sessions: {provider_open_action_label(provider, action)}."
+            f"{provider.title()} sessions: "
+            f"{provider_open_action_label(provider, action, self.settings)}."
         )
 
     @objc.IBAction
@@ -904,10 +919,12 @@ class StatusBarController(NSObject):
         for provider in ("codex", "claude", "grok"):
             popup = self.settings_fields.get(f"{provider}_session_opener")
             if popup is not None:
-                select_popup_action(
+                refresh_provider_opener_popup(
                     popup,
+                    provider,
                     self.settings.session_open_action(provider)
                     or default_provider_open_action(provider),
+                    self.settings,
                 )
         terminal_popup = self.settings_fields.get("session_terminal")
         if terminal_popup is not None:
@@ -1318,6 +1335,7 @@ class StatusBarController(NSObject):
                 value,
                 terminal_app=self.settings.session_terminal_app,
                 custom_terminal_path=self.settings.custom_terminal_path,
+                session_hints=terminal_session_hints(status),
             )
         else:
             self.set_settings_message(f"Unknown open action for {status.display_name}.")
@@ -1958,8 +1976,16 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     if not statuses:
         menu.addItem_(disabled_menu_item("No recent sessions"))
     else:
+        collision_keys = session_title_collision_keys(statuses)
         for status in statuses:
-            menu.addItem_(build_session_menu_item(status, snapshot.collected_at, target))
+            menu.addItem_(
+                build_session_menu_item(
+                    status,
+                    snapshot.collected_at,
+                    target,
+                    disambiguate_title=session_title_collision_key(status) in collision_keys,
+                )
+            )
 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Devices"))
@@ -2060,9 +2086,10 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     custom.setState_(1 if device.display == LED_DISPLAY_CUSTOM else 0)
     submenu.addItem_(custom)
 
-    submenu.addItem_(NSMenuItem.separatorItem())
-    submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
-    submenu.addItem_(build_brightness_slider_item(device, target))
+    if device.device_id != VIRTUAL_DEVICE_ID:
+        submenu.addItem_(NSMenuItem.separatorItem())
+        submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
+        submenu.addItem_(build_brightness_slider_item(device, target))
 
     if device.device_id == VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
@@ -2244,7 +2271,7 @@ def format_byte_count(size: int) -> str:
 
 def build_settings_window(target: StatusBarController) -> NSWindow:
     width = 680
-    height = 1060
+    height = 560
     style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
@@ -2256,109 +2283,138 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         NSBackingStoreBuffered,
         False,
     )
-    window.setTitle_("SidePulse Agent Monitor Settings")
+    window.setTitle_("SidePulse Settings")
     window.setReleasedWhenClosed_(False)
     window.center()
     content = window.contentView()
 
-    add_label(content, "Agent Hooks", 24, 1012, 200, 24)
-    add_label(content, "Codex", 32, 970, 80, 22)
-    codex_status = add_label(content, "", 112, 970, 270, 22)
-    add_button(content, "Install", 432, 966, 90, 28, target, "installCodexHooks:")
-    add_button(content, "Uninstall", 532, 966, 100, 28, target, "uninstallCodexHooks:")
+    tab_width = width - 40
+    tab_height = height - 84
+    tab_view = NSTabView.alloc().initWithFrame_(((20, 54), (tab_width, tab_height)))
+    agents_tab = add_settings_tab(tab_view, "agents", "Agents", tab_width, tab_height)
+    devices_tab = add_settings_tab(
+        tab_view,
+        "devices",
+        "Devices & LEDs",
+        tab_width,
+        tab_height,
+    )
+    sleep_tab = add_settings_tab(
+        tab_view,
+        "lid",
+        "Lid & Sleep",
+        tab_width,
+        tab_height,
+    )
+    diagnostics_tab = add_settings_tab(
+        tab_view,
+        "diagnostics",
+        "Diagnostics",
+        tab_width,
+        tab_height,
+    )
+    content.addSubview_(tab_view)
 
-    add_label(content, "Claude", 32, 928, 80, 22)
-    claude_status = add_label(content, "", 112, 928, 270, 22)
-    add_button(content, "Install", 432, 924, 90, 28, target, "installClaudeHooks:")
-    add_button(content, "Uninstall", 532, 924, 100, 28, target, "uninstallClaudeHooks:")
+    add_label(agents_tab, "Agent Hooks", 24, 398, 200, 24)
+    add_label(agents_tab, "Codex", 32, 360, 80, 22)
+    codex_status = add_label(agents_tab, "", 130, 360, 240, 22)
+    add_button(agents_tab, "Install", 400, 356, 90, 28, target, "installCodexHooks:")
+    add_button(agents_tab, "Uninstall", 500, 356, 100, 28, target, "uninstallCodexHooks:")
 
-    add_label(content, "Grok", 32, 886, 80, 22)
-    grok_status = add_label(content, "", 112, 886, 270, 22)
-    add_button(content, "Install", 432, 882, 90, 28, target, "installGrokHooks:")
-    add_button(content, "Uninstall", 532, 882, 100, 28, target, "uninstallGrokHooks:")
+    add_label(agents_tab, "Claude", 32, 326, 80, 22)
+    claude_status = add_label(agents_tab, "", 130, 326, 240, 22)
+    add_button(agents_tab, "Install", 400, 322, 90, 28, target, "installClaudeHooks:")
+    add_button(agents_tab, "Uninstall", 500, 322, 100, 28, target, "uninstallClaudeHooks:")
 
-    add_separator(content, 24, 856, width - 48)
-    add_label(content, "Transcript Monitoring", 24, 822, 240, 24)
-    add_label(content, "Open Sessions With", 352, 822, 240, 24)
+    add_label(agents_tab, "Grok", 32, 292, 80, 22)
+    grok_status = add_label(agents_tab, "", 130, 292, 240, 22)
+    add_button(agents_tab, "Install", 400, 288, 90, 28, target, "installGrokHooks:")
+    add_button(agents_tab, "Uninstall", 500, 288, 100, 28, target, "uninstallGrokHooks:")
+
+    add_separator(agents_tab, 24, 258, tab_width - 48)
+    add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
+    add_label(agents_tab, "Codex", 32, 188, 100, 22)
+    codex_opener = add_provider_opener_popup(agents_tab, "codex", 160, 186, target)
+    add_label(agents_tab, "Claude", 32, 154, 100, 22)
+    claude_opener = add_provider_opener_popup(agents_tab, "claude", 160, 152, target)
+    add_label(agents_tab, "Grok Sessions", 32, 120, 120, 22)
+    grok_opener = add_provider_opener_popup(agents_tab, "grok", 160, 118, target)
+
+    add_label(agents_tab, "Terminal App", 376, 188, 120, 22)
+    terminal_popup = add_terminal_popup(agents_tab, 376, 156, target)
+    custom_terminal_path = add_label(agents_tab, "", 376, 128, 170, 22)
+    add_button(agents_tab, "Choose...", 500, 92, 100, 28, target, "chooseSessionTerminal:")
+
+    add_separator(agents_tab, 24, 80, tab_width - 48)
+    add_label(agents_tab, "Transcript Monitoring", 24, 46, 240, 24)
     codex_transcripts = add_checkbox(
-        content,
+        agents_tab,
         "CLI fallback: Codex transcripts",
         32,
-        788,
+        14,
         260,
         24,
         target,
         "toggleCodexTranscripts:",
     )
     claude_transcripts = add_checkbox(
-        content,
+        agents_tab,
         "CLI fallback: Claude transcripts",
-        32,
-        756,
+        312,
+        14,
         260,
         24,
         target,
         "toggleClaudeTranscripts:",
     )
-    add_label(content, "Codex", 360, 794, 62, 22)
-    codex_opener = add_provider_opener_popup(content, "codex", 424, 792, target)
-    add_label(content, "Claude", 360, 766, 62, 22)
-    claude_opener = add_provider_opener_popup(content, "claude", 424, 764, target)
-    add_label(content, "Grok", 360, 738, 62, 22)
-    grok_opener = add_provider_opener_popup(content, "grok", 424, 736, target)
-    add_label(content, "Resume Terminal", 360, 710, 100, 22)
-    terminal_popup = add_terminal_popup(content, 464, 708, target)
-    custom_terminal_path = add_label(content, "", 360, 682, 170, 22)
-    add_button(content, "Choose...", 542, 678, 90, 28, target, "chooseSessionTerminal:")
 
-    add_separator(content, 24, 656, width - 48)
-    add_label(content, "Debug Log", 24, 622, 240, 24)
-    debug_log_status = add_label(content, "", 32, 592, 606, 22)
-    add_button(content, "Export CSV", 32, 554, 110, 28, target, "exportDebugCsv:")
-    add_button(content, "Export HTML", 152, 554, 120, 28, target, "exportDebugHtml:")
-
-    add_separator(content, 24, 534, width - 48)
-    add_label(content, "LED Display", 24, 500, 240, 24)
+    add_label(devices_tab, "LED Display", 24, 398, 240, 24)
     battery_leds = add_checkbox(
-        content,
+        devices_tab,
         "Show battery on LEDs",
         32,
-        466,
+        356,
         260,
         24,
         target,
         "setBatteryLedDisplayFromCheckbox:",
     )
     battery_power_preview = add_checkbox(
-        content,
+        devices_tab,
         "Show battery for 7s on plug/unplug",
         32,
-        434,
+        318,
         320,
         24,
         target,
         "setBatteryPowerPreviewFromCheckbox:",
     )
 
-    add_separator(content, 24, 414, width - 48)
-    add_label(content, "Lid & Sleep", 24, 380, 240, 24)
-    add_label(content, "Lid Closed", 32, 346, 120, 22)
-    add_label(content, "Duration", 520, 346, 70, 22)
-    closed_duration = add_editable_field(content, "", 590, 344, 48, 24)
-    closed_program = add_text_view(content, "", 32, 254, 606, 82)
-    add_button(content, "Preview", 32, 216, 90, 28, target, "previewLidClosedAnimation:")
-    add_button(content, "Reset", 132, 216, 90, 28, target, "resetLidClosedAnimation:")
+    add_label(sleep_tab, "Lid Closed", 24, 398, 120, 22)
+    add_label(sleep_tab, "Duration", 516, 398, 70, 22)
+    closed_duration = add_editable_field(sleep_tab, "", 588, 396, 48, 24)
+    closed_program = add_text_view(sleep_tab, "", 24, 276, 612, 110)
+    add_button(sleep_tab, "Preview", 24, 236, 90, 28, target, "previewLidClosedAnimation:")
+    add_button(sleep_tab, "Reset", 124, 236, 90, 28, target, "resetLidClosedAnimation:")
 
-    add_label(content, "Lid Open", 32, 180, 120, 22)
-    add_label(content, "Duration", 520, 180, 70, 22)
-    open_duration = add_editable_field(content, "", 590, 178, 48, 24)
-    open_program = add_text_view(content, "", 32, 88, 606, 82)
-    add_button(content, "Preview", 32, 50, 90, 28, target, "previewLidOpenAnimation:")
-    add_button(content, "Reset", 132, 50, 90, 28, target, "resetLidOpenAnimation:")
-    add_button(content, "Save Animations", 492, 50, 146, 28, target, "saveLidAnimations:")
+    add_separator(sleep_tab, 24, 210, tab_width - 48)
+    add_label(sleep_tab, "Lid Open", 24, 176, 120, 22)
+    add_label(sleep_tab, "Duration", 516, 176, 70, 22)
+    open_duration = add_editable_field(sleep_tab, "", 588, 174, 48, 24)
+    open_program = add_text_view(sleep_tab, "", 24, 54, 612, 110)
+    add_button(sleep_tab, "Preview", 24, 14, 90, 28, target, "previewLidOpenAnimation:")
+    add_button(sleep_tab, "Reset", 124, 14, 90, 28, target, "resetLidOpenAnimation:")
+    add_button(sleep_tab, "Save Animations", 490, 14, 146, 28, target, "saveLidAnimations:")
+
+    add_label(diagnostics_tab, "Debug Log", 24, 398, 240, 24)
+    debug_log_status = add_label(diagnostics_tab, "", 32, 360, 588, 22)
+    add_button(diagnostics_tab, "Export CSV", 32, 318, 110, 28, target, "exportDebugCsv:")
+    add_button(diagnostics_tab, "Export HTML", 152, 318, 120, 28, target, "exportDebugHtml:")
+    add_separator(diagnostics_tab, 24, 280, tab_width - 48)
+    add_label(diagnostics_tab, "Settings File", 24, 246, 240, 24)
+    settings_path = add_label(diagnostics_tab, "", 32, 208, 588, 22)
 
     message = add_label(content, "", 24, 22, width - 48, 22)
-    settings_path = add_label(content, "", 24, 4, width - 48, 18)
 
     target.settings_fields = {
         "codex_hook_status": codex_status,
@@ -2384,6 +2440,15 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "battery_power_preview": battery_power_preview,
     }
     return window
+
+
+def add_settings_tab(tab_view, identifier: str, title: str, width: int, height: int):
+    item = NSTabViewItem.alloc().initWithIdentifier_(identifier)
+    item.setLabel_(title)
+    view = NSView.alloc().initWithFrame_(((0, 0), (width, height - 34)))
+    item.setView_(view)
+    tab_view.addTabViewItem_(item)
+    return view
 
 
 def add_label(parent, text: str, x: int, y: int, width: int, height: int):
@@ -2483,20 +2548,31 @@ def default_provider_open_action(provider: str) -> str:
     return SESSION_OPEN_TERMINAL
 
 
-def provider_open_action_label(provider: str, action: str) -> str:
+def provider_open_action_label(provider: str, action: str, settings=None) -> str:
     if action == SESSION_OPEN_VSCODE:
         return "VS Code"
     if action == SESSION_OPEN_TERMINAL:
-        return "Terminal"
+        return "Resume in Terminal"
     return {"codex": "Codex", "claude": "Claude"}.get(provider, "App")
 
 
-def select_popup_action(popup, action: str) -> None:
+def refresh_provider_opener_popup(popup, provider: str, action: str, settings) -> None:
     for index in range(popup.numberOfItems()):
-        payload = popup.itemAtIndex_(index).representedObject()
+        item = popup.itemAtIndex_(index)
+        payload = item.representedObject()
         if isinstance(payload, dict) and payload.get("action") == action:
+            item.setTitle_(
+                provider_open_action_label(provider, str(payload.get("action")), settings)
+            )
             popup.selectItemAtIndex_(index)
-            return
+        elif isinstance(payload, dict):
+            item.setTitle_(
+                provider_open_action_label(
+                    provider,
+                    str(payload.get("action")),
+                    settings,
+                )
+            )
 
 
 def refresh_terminal_popup(popup, terminal_app: str) -> None:
@@ -2514,6 +2590,29 @@ def refresh_terminal_popup(popup, terminal_app: str) -> None:
 
 def terminal_app_label(terminal_app: str) -> str:
     return TERMINAL_APP_LABELS.get(normalize_terminal_app(terminal_app), "Terminal")
+
+
+def resume_terminal_label(settings=None) -> str:
+    return f"Resume in {resume_terminal_app_label(settings)}"
+
+
+def resume_terminal_app_label(settings=None) -> str:
+    if settings is None:
+        return "Terminal"
+    terminal = normalize_terminal_app(getattr(settings, "session_terminal_app", None))
+    if terminal == TERMINAL_APP_CUSTOM:
+        path = str(getattr(settings, "custom_terminal_path", "") or "").strip()
+        if path:
+            return custom_terminal_app_label(path)
+        return "Custom Terminal"
+    return terminal_app_label(terminal)
+
+
+def custom_terminal_app_label(path: str) -> str:
+    name = Path(path).name
+    if name.endswith(".app"):
+        return name[:-4] or "Custom Terminal"
+    return name or "Custom Terminal"
 
 
 def terminal_app_menu_label(terminal_app: str) -> str:
@@ -2845,9 +2944,10 @@ def build_session_menu_item(
     target: StatusBarController,
     *,
     width: float | None = None,
+    disambiguate_title: bool = False,
 ) -> NSMenuItem:
     item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        native_session_menu_title(status),
+        native_session_menu_title(status, disambiguate=disambiguate_title),
         "openSessionPrimary:",
         "",
     )
@@ -2859,8 +2959,10 @@ def build_session_menu_item(
     return item
 
 
-def native_session_menu_title(status: AgentStatus) -> str:
+def native_session_menu_title(status: AgentStatus, *, disambiguate: bool = False) -> str:
     title, project = session_title_parts(status)
+    if disambiguate and status.session_id:
+        title = f"{title} ({status.session_id[:8]})"
     parts = [title]
     if project:
         parts.append(project)
@@ -2885,7 +2987,7 @@ def build_session_options_menu(
     for action in available_session_open_actions(status):
         add_session_open_action_item(
             menu,
-            session_open_action_label(status, action),
+            session_open_action_title(status, action, getattr(target, "settings", None)),
             status,
             action,
             target,
@@ -2912,6 +3014,12 @@ def add_session_open_action_item(
     item.setRepresentedObject_({"status": status, "action": action})
     item.setState_(1 if selected else 0)
     menu.addItem_(item)
+
+
+def session_open_action_title(status: AgentStatus, action: str, settings=None) -> str:
+    if action == SESSION_OPEN_TERMINAL:
+        return resume_terminal_label(settings)
+    return session_open_action_label(status, action)
 
 
 def session_row_icon_for_status(status: AgentStatus):
@@ -3145,9 +3253,65 @@ def build_error_menu(exc: Exception) -> NSMenu:
 
 
 def recent_statuses(snapshot) -> list[AgentStatus]:
-    statuses = list(snapshot.statuses)
+    statuses = coalesced_menu_statuses(menu_statuses(snapshot))
     statuses.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
     return statuses[:12]
+
+
+def menu_statuses(snapshot) -> tuple[AgentStatus, ...]:
+    statuses = list(snapshot.statuses)
+    now = snapshot.collected_at
+    statuses.extend(
+        status
+        for status in getattr(snapshot, "stale_statuses", ())
+        if status.mode == AgentMode.COMPLETED
+        and status.age_seconds(now) <= STATUS_BAR_RECENT_COMPLETED_SECONDS
+    )
+    return tuple(statuses)
+
+
+def session_title_collision_keys(statuses: list[AgentStatus]) -> set[tuple[str, str]]:
+    counts: dict[tuple[str, str], int] = {}
+    for status in statuses:
+        key = session_title_collision_key(status)
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
+
+
+def session_title_collision_key(status: AgentStatus) -> tuple[str, str]:
+    return (
+        status.provider.lower(),
+        normalized_menu_part(native_session_menu_title(status)),
+    )
+
+
+def coalesced_menu_statuses(statuses) -> list[AgentStatus]:
+    return coalesce_statuses_by_key(statuses, menu_session_coalesce_key)
+
+
+def coalesce_statuses_by_key(statuses, key_fn) -> list[AgentStatus]:
+    by_key: dict[tuple[str, ...], AgentStatus] = {}
+    passthrough: list[AgentStatus] = []
+    for status in statuses:
+        key = key_fn(status)
+        if key is None:
+            passthrough.append(status)
+            continue
+        previous = by_key.get(key)
+        if previous is None or menu_status_sort_key(status) < menu_status_sort_key(previous):
+            by_key[key] = status
+    return [*by_key.values(), *passthrough]
+
+
+def menu_session_coalesce_key(status: AgentStatus) -> tuple[str, ...] | None:
+    if not status.session_id:
+        return None
+    return ("session", status.provider.lower(), status.session_id)
+
+
+def menu_status_sort_key(status: AgentStatus) -> tuple[int, int, float]:
+    subagent_penalty = 1 if ":agent:" in status.agent_id else 0
+    return (status.priority, subagent_penalty, -status.updated_at.timestamp())
 
 
 def menu_title_for_status(status: AgentStatus, now: datetime) -> str:
@@ -3276,36 +3440,303 @@ def open_terminal_command(
     *,
     terminal_app: str = TERMINAL_APP_TERMINAL,
     custom_terminal_path: str = "",
+    session_hints: TerminalSessionHints | None = None,
 ) -> None:
     terminal = normalize_terminal_app(terminal_app)
+    if session_hints is not None and focus_existing_terminal_session(
+        terminal,
+        custom_terminal_path,
+        session_hints,
+    ):
+        return
+
+    launch_command = command_for_terminal_session(command, session_hints)
     if (
         terminal not in {TERMINAL_APP_TERMINAL, TERMINAL_APP_CUSTOM}
         and not terminal_app_installed(terminal)
     ):
-        open_macos_terminal_command(command)
+        open_macos_terminal_command(launch_command)
         return
     if terminal == TERMINAL_APP_ITERM:
-        open_iterm_command(command)
+        open_iterm_command(launch_command)
         return
     if terminal == TERMINAL_APP_GHOSTTY:
-        open_exec_terminal_command(command, terminal_open_target(terminal))
+        open_ghostty_command(launch_command, session_hints)
         return
     if terminal == TERMINAL_APP_WARP:
-        open_command_script_in_terminal_app(command, terminal_open_target(terminal))
+        open_command_script_in_terminal_app(launch_command, terminal_open_target(terminal))
         return
     if terminal == TERMINAL_APP_KITTY:
-        open_exec_terminal_command(command, terminal_open_target(terminal))
+        open_exec_terminal_command(launch_command, terminal_open_target(terminal))
         return
     if terminal == TERMINAL_APP_WEZTERM:
-        open_wezterm_command(command, terminal_open_target(terminal))
+        open_wezterm_command(launch_command, terminal_open_target(terminal))
         return
     if terminal == TERMINAL_APP_ALACRITTY:
-        open_exec_terminal_command(command, terminal_open_target(terminal))
+        open_exec_terminal_command(launch_command, terminal_open_target(terminal))
         return
     if terminal == TERMINAL_APP_CUSTOM:
-        open_custom_terminal_command(command, custom_terminal_path)
+        open_custom_terminal_command(launch_command, custom_terminal_path)
         return
-    open_macos_terminal_command(command)
+    open_macos_terminal_command(launch_command)
+
+
+def terminal_session_hints(status: AgentStatus) -> TerminalSessionHints:
+    title, project = session_title_parts(status)
+    label_parts = [provider_label(status.provider)]
+    if title:
+        label_parts.append(title)
+    if project:
+        label_parts.append(project)
+    return TerminalSessionHints(
+        provider=status.provider.lower(),
+        session_id=status.session_id or "",
+        cwd=status.cwd or "",
+        title=" ".join(part for part in label_parts if part).strip(),
+        match_title=title,
+    )
+
+
+def command_for_terminal_session(
+    command: str,
+    hints: TerminalSessionHints | None,
+) -> str:
+    if hints is None:
+        return command
+    title = terminal_session_title(hints)
+    if not title:
+        return command
+    return f"{terminal_title_command(title)}; {command}"
+
+
+def terminal_session_title(hints: TerminalSessionHints) -> str:
+    parts = ["SidePulse"]
+    if hints.title:
+        parts.append(hints.title)
+    if hints.session_id:
+        parts.append(f"({hints.session_id[:8]})")
+    return " ".join(parts)
+
+
+def terminal_title_command(title: str) -> str:
+    return "printf '\\033]0;%s\\007' " + shlex.quote(title)
+
+
+def terminal_session_match_terms(hints: TerminalSessionHints) -> tuple[str, ...]:
+    terms: list[str] = []
+    for term in (
+        hints.session_id,
+        hints.cwd,
+        hints.title,
+        terminal_session_title(hints),
+    ):
+        term = str(term or "").strip()
+        if term and term not in terms:
+            terms.append(term)
+    return tuple(terms)
+
+
+def focus_existing_terminal_session(
+    terminal_app: str,
+    custom_terminal_path: str,
+    hints: TerminalSessionHints,
+) -> bool:
+    terminal = normalize_terminal_app(terminal_app)
+    if terminal == TERMINAL_APP_CUSTOM:
+        terminal = terminal_app_from_custom_path(custom_terminal_path)
+    terms = terminal_session_match_terms(hints)
+    if not terms:
+        return False
+    if terminal == TERMINAL_APP_TERMINAL:
+        return focus_macos_terminal_session(terms)
+    if terminal == TERMINAL_APP_ITERM:
+        return focus_iterm_session(terms)
+    if terminal == TERMINAL_APP_GHOSTTY:
+        return focus_ghostty_session(hints)
+    return False
+
+
+def terminal_app_from_custom_path(path: str) -> str:
+    app_name = Path(path.strip()).name.casefold()
+    if app_name == "terminal.app":
+        return TERMINAL_APP_TERMINAL
+    if app_name in {"iterm.app", "iterm2.app"} or "iterm" in app_name:
+        return TERMINAL_APP_ITERM
+    if "ghost" in app_name:
+        return TERMINAL_APP_GHOSTTY
+    if "warp" in app_name:
+        return TERMINAL_APP_WARP
+    if "kitty" in app_name:
+        return TERMINAL_APP_KITTY
+    if "wezterm" in app_name:
+        return TERMINAL_APP_WEZTERM
+    if "alacritty" in app_name:
+        return TERMINAL_APP_ALACRITTY
+    return TERMINAL_APP_CUSTOM
+
+
+def focus_macos_terminal_session(terms: tuple[str, ...]) -> bool:
+    condition = applescript_contains_any(("tabTitle", "tabText"), terms)
+    script = "\n".join(
+        [
+            'tell application "Terminal"',
+            "  repeat with windowRef in windows",
+            "    repeat with tabRef in tabs of windowRef",
+            '      set tabTitle to ""',
+            '      set tabText to ""',
+            "      try",
+            "        set tabTitle to custom title of tabRef",
+            "      end try",
+            "      try",
+            "        set tabText to contents of tabRef",
+            "      end try",
+            f"      if {condition} then",
+            "        set selected tab of windowRef to tabRef",
+            "        set index of windowRef to 1",
+            "        activate",
+            '        return "1"',
+            "      end if",
+            "    end repeat",
+            "  end repeat",
+            "end tell",
+            'return "0"',
+        ]
+    )
+    return run_osascript_bool(script)
+
+
+def focus_iterm_session(terms: tuple[str, ...]) -> bool:
+    condition = applescript_contains_any(("sessionName", "sessionText"), terms)
+    script = "\n".join(
+        [
+            'tell application "iTerm"',
+            "  repeat with windowRef in windows",
+            "    repeat with tabRef in tabs of windowRef",
+            "      repeat with sessionRef in sessions of tabRef",
+            '        set sessionName to ""',
+            '        set sessionText to ""',
+            "        try",
+            "          set sessionName to name of sessionRef",
+            "        end try",
+            "        try",
+            "          set sessionText to contents of sessionRef",
+            "        end try",
+            f"        if {condition} then",
+            "          tell windowRef to select tabRef",
+            "          select sessionRef",
+            "          set index of windowRef to 1",
+            "          activate",
+            '          return "1"',
+            "        end if",
+            "      end repeat",
+            "    end repeat",
+            "  end repeat",
+            "end tell",
+            'return "0"',
+        ]
+    )
+    return run_osascript_bool(script)
+
+
+def focus_ghostty_session(hints: TerminalSessionHints) -> bool:
+    app = ghostty_application()
+    if app is None or not sb_bool(app, "isRunning"):
+        return False
+    marker_terms = terminal_session_marker_match_terms(hints)
+    if marker_terms and focus_matching_ghostty_terminal(
+        app,
+        marker_terms,
+        include_working_directory=False,
+    ):
+        return True
+    title_terms = terminal_session_title_match_terms(hints)
+    return bool(
+        title_terms
+        and focus_matching_ghostty_terminal(
+            app,
+            title_terms,
+            include_working_directory=False,
+            require_unique=True,
+        )
+    )
+
+
+def terminal_session_marker_match_terms(hints: TerminalSessionHints) -> tuple[str, ...]:
+    terms: list[str] = []
+    for term in (
+        hints.session_id,
+        hints.session_id[:8] if hints.session_id else "",
+        terminal_session_title(hints),
+        hints.title,
+    ):
+        term = str(term or "").strip()
+        if term and term not in terms:
+            terms.append(term)
+    return tuple(terms)
+
+
+def terminal_session_title_match_terms(hints: TerminalSessionHints) -> tuple[str, ...]:
+    title = str(hints.match_title or "").strip()
+    return (title,) if title else ()
+
+
+def focus_matching_ghostty_terminal(
+    app,
+    terms: tuple[str, ...],
+    *,
+    include_working_directory: bool,
+    require_unique: bool = False,
+) -> bool:
+    normalized_terms = tuple(normalize_match_text(term) for term in terms if term)
+    if not normalized_terms:
+        return False
+    matches: list[tuple[object, object, object]] = []
+    for window in sb_elements(sb_call(app, "windows")):
+        window_name = sb_text(window, "name")
+        for tab in sb_elements(sb_call(window, "tabs")):
+            tab_name = sb_text(tab, "name")
+            for terminal in sb_elements(sb_call(tab, "terminals")):
+                values = [window_name, tab_name, sb_text(terminal, "name")]
+                if include_working_directory:
+                    values.append(sb_text(terminal, "workingDirectory"))
+                if values_match_terms(values, normalized_terms):
+                    matches.append((window, tab, terminal))
+    if require_unique and len(matches) != 1:
+        return False
+    if not matches:
+        return False
+    window, tab, terminal = matches[0]
+    focus_ghostty_terminal(window, tab, terminal, app)
+    return True
+
+
+def focus_ghostty_terminal(window, tab, terminal, app) -> None:
+    sb_call(tab, "selectTab")
+    sb_call(terminal, "focus")
+    sb_call(window, "activateWindow")
+    sb_call(app, "activate")
+
+
+def values_match_terms(values: list[str], normalized_terms: tuple[str, ...]) -> bool:
+    normalized_values = [normalize_match_text(value) for value in values if value]
+    return any(
+        term in value
+        for term in normalized_terms
+        for value in normalized_values
+    )
+
+
+def normalize_match_text(value: str) -> str:
+    return str(value or "").strip().casefold()
+
+
+def applescript_contains_any(variable_names: tuple[str, ...], terms: tuple[str, ...]) -> str:
+    clauses = [
+        f"{variable_name} contains {applescript_quote(term)}"
+        for variable_name in variable_names
+        for term in terms
+    ]
+    return " or ".join(clauses) if clauses else "false"
 
 
 def open_macos_terminal_command(command: str) -> None:
@@ -3336,6 +3767,91 @@ def open_iterm_command(command: str) -> None:
         ]
     )
     run_osascript(script)
+
+
+def open_ghostty_command(
+    command: str,
+    hints: TerminalSessionHints | None = None,
+) -> None:
+    if open_ghostty_command_with_scripting_bridge(command, hints):
+        return
+    open_exec_terminal_command(command, terminal_open_target(TERMINAL_APP_GHOSTTY))
+
+
+def open_ghostty_command_with_scripting_bridge(
+    command: str,
+    hints: TerminalSessionHints | None = None,
+) -> bool:
+    app = ghostty_application()
+    if app is None:
+        return False
+    try:
+        config = {
+            "command": f"/bin/zsh -lc {shlex.quote(command)}",
+            "waitAfterCommand": True,
+        }
+        if hints is not None and hints.cwd:
+            config["workingDirectory"] = hints.cwd
+        surface_config = app.newSurfaceConfigurationFrom_(config)
+        if sb_bool(app, "isRunning"):
+            if hints is not None:
+                app.newWindowWithConfiguration_(surface_config)
+            else:
+                window = sb_call(app, "frontWindow")
+                if window is None:
+                    app.newWindowWithConfiguration_(surface_config)
+                else:
+                    app.newTabIn_withConfiguration_(window, surface_config)
+        else:
+            app.newWindowWithConfiguration_(surface_config)
+        sb_call(app, "activate")
+    except Exception:
+        return False
+    return True
+
+
+def ghostty_application():
+    app_path = installed_terminal_app_path(TERMINAL_APP_GHOSTTY)
+    if app_path is not None:
+        try:
+            return SBApplication.applicationWithURL_(
+                NSURL.fileURLWithPath_(str(app_path))
+            )
+        except Exception:
+            pass
+    try:
+        return SBApplication.applicationWithBundleIdentifier_("com.mitchellh.ghostty")
+    except Exception:
+        return None
+
+
+def sb_elements(collection) -> tuple[object, ...]:
+    if collection is None:
+        return ()
+    try:
+        return tuple(collection)
+    except TypeError:
+        pass
+    try:
+        return tuple(collection.objectAtIndex_(index) for index in range(collection.count()))
+    except Exception:
+        return ()
+
+
+def sb_call(obj, method: str):
+    try:
+        return getattr(obj, method)()
+    except Exception:
+        return None
+
+
+def sb_text(obj, method: str) -> str:
+    value = sb_call(obj, method)
+    return str(value or "")
+
+
+def sb_bool(obj, method: str) -> bool:
+    return bool(sb_call(obj, method))
 
 
 def open_custom_terminal_command(command: str, custom_terminal_path: str) -> None:
@@ -3432,6 +3948,21 @@ def run_osascript(script: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def run_osascript_bool(script: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "1"
 
 
 def applescript_quote(value: str) -> str:

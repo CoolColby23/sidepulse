@@ -979,12 +979,18 @@ def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
         metadata.cwd = record.cwd
 
     title = title_from_event(record)
-    if title:
+    if title and (metadata.title is None or is_provider_session_title(record, title)):
         metadata.title = title
 
     origin = record.origin or origin_label_from_payload(record.provider, record.raw)
     if origin:
         metadata.origin = origin
+
+
+def is_provider_session_title(record: HookEvent, title: str) -> bool:
+    if record.provider == "codex":
+        return title == codex_session_title(record.session_id)
+    return False
 
 
 def status_from_event(record: HookEvent, metadata: StatusMetadata | None = None) -> AgentStatus | None:

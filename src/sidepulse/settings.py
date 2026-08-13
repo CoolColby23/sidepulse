@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .battery import DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
-from .session_actions import SESSION_OPEN_CHOICES
+from .session_actions import SESSION_OPEN_CHOICES, SESSION_OPEN_TERMINAL
 
 
 TERMINAL_APP_TERMINAL = "terminal"
@@ -126,6 +126,7 @@ class AgentMonitorSettings:
     battery_show_on_power_change: bool = True
     battery_power_change_preview_seconds: float = DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
     session_open_preferences: dict[str, str] = field(default_factory=dict)
+    grok_session_open_action: str = SESSION_OPEN_TERMINAL
     session_terminal_app: str = TERMINAL_APP_TERMINAL
     custom_terminal_path: str = ""
     setup_screen_completed: bool = False
@@ -258,9 +259,10 @@ class AgentMonitorSettings:
         return replace(self, devices=devices)
 
     def session_open_action(self, provider: str, origin: str | None = None) -> str | None:
+        provider_key = provider.lower()
         if origin:
             action = self.session_open_preferences.get(
-                session_open_preference_key(provider, origin)
+                session_open_preference_key(provider_key, origin)
             )
             if action in SESSION_OPEN_CHOICES:
                 return action
@@ -270,7 +272,12 @@ class AgentMonitorSettings:
             if action in SESSION_OPEN_CHOICES:
                 return action
 
-        action = self.session_open_preferences.get(provider.lower())
+        if provider_key == "grok":
+            action = self.grok_session_open_action
+            if action in SESSION_OPEN_CHOICES:
+                return action
+
+        action = self.session_open_preferences.get(provider_key)
         if action in SESSION_OPEN_CHOICES:
             return action
         return None
@@ -283,6 +290,8 @@ class AgentMonitorSettings:
     ) -> "AgentMonitorSettings":
         if action not in SESSION_OPEN_CHOICES:
             raise ValueError(f"Unknown session open action: {action}")
+        if provider.lower() == "grok" and not origin:
+            return self.with_provider_session_open_action(provider, action)
         key = session_open_preference_key(provider, origin)
         preferences = dict(self.session_open_preferences)
         preferences[key] = action
@@ -299,8 +308,14 @@ class AgentMonitorSettings:
         preferences = {
             key: value
             for key, value in self.session_open_preferences.items()
-            if not key.startswith(prefix)
+            if key != provider_key and not key.startswith(prefix)
         }
+        if provider_key == "grok":
+            return replace(
+                self,
+                session_open_preferences=preferences,
+                grok_session_open_action=action,
+            )
         preferences[provider_key] = action
         return replace(self, session_open_preferences=preferences)
 
@@ -400,6 +415,7 @@ class AgentMonitorSettings:
                 "power_change_preview_seconds": self.battery_power_change_preview_seconds,
             },
             "session_open_preferences": dict(sorted(self.session_open_preferences.items())),
+            "grok_session_open_action": self.grok_session_open_action,
             "session_terminal": {
                 "app": self.session_terminal_app,
                 "custom_path": self.custom_terminal_path,
@@ -448,6 +464,18 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
         terminal = {}
 
     led_display = _led_display_setting(data.get("led_display"), LED_DISPLAY_AGENT)
+    session_open_preferences = _session_open_preferences(
+        data.get("session_open_preferences")
+    )
+    grok_session_open_action = _session_open_action_setting(
+        data.get("grok_session_open_action")
+    )
+    if grok_session_open_action is None:
+        grok_session_open_action = session_open_preferences.get(
+            "grok",
+            SESSION_OPEN_TERMINAL,
+        )
+    session_open_preferences.pop("grok", None)
     return AgentMonitorSettings(
         codex_transcripts_enabled=_bool_setting(transcript.get("codex"), False),
         claude_transcripts_enabled=_bool_setting(transcript.get("claude"), False),
@@ -482,7 +510,8 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             battery.get("power_change_preview_seconds"),
             DEFAULT_POWER_CHANGE_PREVIEW_SECONDS,
         ),
-        session_open_preferences=_session_open_preferences(data.get("session_open_preferences")),
+        session_open_preferences=session_open_preferences,
+        grok_session_open_action=grok_session_open_action,
         session_terminal_app=normalize_terminal_app(terminal.get("app")),
         custom_terminal_path=_string_setting(terminal.get("custom_path")),
         setup_screen_completed=_bool_setting(data.get("setup_screen_completed"), False),
@@ -573,6 +602,12 @@ def _session_open_preferences(value: object) -> dict[str, str]:
             continue
         result[provider.lower()] = action
     return result
+
+
+def _session_open_action_setting(value: object) -> str | None:
+    if isinstance(value, str) and value in SESSION_OPEN_CHOICES:
+        return value
+    return None
 
 
 def session_open_preference_key(provider: str, origin: str | None = None) -> str:

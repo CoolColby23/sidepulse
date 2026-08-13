@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +97,14 @@ def write_hook_status_audit(provider: str, line: dict[str, Any]) -> None:
         pass
 
 
+def hook_event_socket_disabled() -> bool:
+    return os.environ.get("SIDEPULSE_DISABLE_EVENT_SOCKET", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def hook_log_main(provider: str, log_path: Path) -> int:
     try:
         actual_provider, actual_log_path, line = routed_hook_payload(
@@ -103,7 +112,8 @@ def hook_log_main(provider: str, log_path: Path) -> int:
             log_path,
             sys.stdin.read(),
         )
-        send_hook_event(actual_provider, line)
+        if not hook_event_socket_disabled():
+            send_hook_event(actual_provider, line)
         write_hook_line(actual_log_path, line)
         write_hook_status_audit(actual_provider, line)
     except Exception:
