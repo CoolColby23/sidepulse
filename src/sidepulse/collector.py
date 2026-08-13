@@ -504,6 +504,7 @@ def default_sources(settings: AgentMonitorSettings | None = None) -> tuple[Sourc
         sources.append(SourceSpec(CLAUDE_TRANSCRIPT_PROVIDER, Path.home() / ".claude" / "projects"))
     sources.append(SourceSpec("grok", detect_log_path("grok")))
     sources.append(SourceSpec("antigravity", detect_log_path("antigravity")))
+    sources.append(SourceSpec("cursor", detect_log_path("cursor")))
     return unique_sources(sources)
 
 
