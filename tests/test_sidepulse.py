@@ -108,6 +108,15 @@ from sidepulse.settings import (
     CLOSED_LID_AWAKE_NEVER,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
+    LED_DISPLAY_CUSTOM,
+    TERMINAL_APP_ALACRITTY,
+    TERMINAL_APP_CUSTOM,
+    TERMINAL_APP_GHOSTTY,
+    TERMINAL_APP_ITERM,
+    TERMINAL_APP_KITTY,
+    TERMINAL_APP_TERMINAL,
+    TERMINAL_APP_WARP,
+    TERMINAL_APP_WEZTERM,
     AgentMonitorSettings,
     DeviceDisplaySetting,
     default_config_dir,
@@ -964,7 +973,86 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertIn("Brightness 50%", titles)
+        self.assertIn("Agent Status", titles)
+        self.assertIn("Battery Level", titles)
+        self.assertIn("Manual", titles)
         self.assertEqual(custom_view_count, 1)
+
+        custom_device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulseDot",
+            name="SidePulse Dot",
+            root=Path("/Volumes/SidePulseDot"),
+            target=Path("/Volumes/SidePulseDot/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_CUSTOM,
+            brightness=128,
+        )
+        custom_item = status_bar.build_device_menu_item(custom_device, SimpleNamespace())
+        custom_submenu = custom_item.submenu()
+        by_title = {
+            custom_submenu.itemAtIndex_(index).title(): custom_submenu.itemAtIndex_(index)
+            for index in range(custom_submenu.numberOfItems())
+            if custom_submenu.itemAtIndex_(index).title()
+        }
+
+        self.assertEqual(by_title["Manual"].state(), 1)
+
+    def test_status_bar_screen_bar_remove_lives_in_screen_bar_submenu(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.VIRTUAL_DEVICE_ID,
+            name="Screen Bar",
+            root=Path(status_bar.VIRTUAL_DEVICE_ID),
+            target=Path(status_bar.VIRTUAL_DEVICE_ID),
+            connected=True,
+            display="agent",
+            brightness=255,
+        )
+        snapshot = SimpleNamespace(
+            statuses=[],
+            collected_at=datetime.now(timezone.utc),
+        )
+        target = SimpleNamespace(
+            settings=AgentMonitorSettings(virtual_status_device_enabled=True),
+            closed_lid_awake=SimpleNamespace(last_error=None),
+            status_bar_devices=lambda: [device],
+        )
+
+        menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        titles = [
+            menu.itemAtIndex_(index).title()
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title()
+        ]
+        screen_bar_item = next(
+            menu.itemAtIndex_(index)
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title() == "Screen Bar"
+        )
+        submenu = screen_bar_item.submenu()
+        submenu_titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).title()
+        ]
+
+        self.assertNotIn("Remove Screen Bar", titles)
+        self.assertIn("Remove Screen Bar", submenu_titles)
+
+        target.settings = AgentMonitorSettings(virtual_status_device_enabled=False)
+        target.status_bar_devices = lambda: []
+        menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        titles = [
+            menu.itemAtIndex_(index).title()
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title()
+        ]
+
+        self.assertIn("Add Screen Bar", titles)
 
     def test_status_bar_observe_connected_device_resets_on_new_mount(self) -> None:
         try:
@@ -1016,6 +1104,94 @@ class AgentMonitorTests(unittest.TestCase):
         status_bar.StatusBarController.poll_devices_once(target)
 
         self.assertEqual(calls, [None])
+
+    def test_status_bar_sync_skips_custom_device_display(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulseDot",
+            name="SidePulse Dot",
+            root=Path("/Volumes/SidePulseDot"),
+            target=Path("/Volumes/SidePulseDot/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_CUSTOM,
+            brightness=128,
+        )
+        fake = SimpleNamespace(
+            status_bar_devices=lambda remember=True: [device],
+            ensure_device_selection=lambda: None,
+            last_led_error="old",
+            device_errors={device.device_id: "old"},
+            last_led_display_kind_by_device={},
+            reset_led_controllers_for_device=lambda device_id: None,
+            active_led_display_kind_for_device=lambda _device, _battery: LED_DISPLAY_CUSTOM,
+            agent_controller_for_device=lambda _device: self.fail("agent LEDs should not sync"),
+            battery_controller_for_device=lambda _device: self.fail("battery LEDs should not sync"),
+        )
+
+        status_bar.StatusBarController.sync_leds_now(
+            fake,
+            AgentMode.WORKING,
+            None,
+            LED_DISPLAY_CUSTOM,
+        )
+
+        self.assertIsNone(fake.last_led_error)
+        self.assertNotIn(device.device_id, fake.device_errors)
+        self.assertEqual(
+            fake.last_led_display_kind_by_device[device.device_id],
+            LED_DISPLAY_CUSTOM,
+        )
+
+    def test_status_bar_manual_device_display_clears_leds(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulseDot",
+            name="SidePulse Dot",
+            root=Path("/Volumes/SidePulseDot"),
+            target=Path("/Volumes/SidePulseDot/LEDS.LED"),
+            connected=True,
+            display="agent",
+            brightness=128,
+        )
+        messages: list[str] = []
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            status_bar_devices=lambda remember=False: [device],
+            reset_led_controllers_for_device=lambda device_id: None,
+            set_settings_message=messages.append,
+            refresh_settings_window=lambda: None,
+            refresh_=lambda sender: None,
+            device_errors={},
+            last_led_error=None,
+        )
+        fake.clear_manual_device_display = lambda item: (
+            status_bar.StatusBarController.clear_manual_device_display(fake, item)
+        )
+
+        with (
+            patch("sidepulse.status_bar.save_settings"),
+            patch(
+                "sidepulse.status_bar.write_led_program",
+                return_value=device.target,
+            ) as write,
+        ):
+            status_bar.StatusBarController.set_device_display(
+                fake,
+                device.device_id,
+                LED_DISPLAY_CUSTOM,
+            )
+
+        write.assert_called_once_with("off", device_path=device.target)
+        self.assertEqual(fake.settings.display_for_device(device.device_id), LED_DISPLAY_CUSTOM)
+        self.assertEqual(messages[-1], "SidePulse Dot: Manual, LEDs cleared.")
 
     def test_status_bar_menu_has_closed_lid_awake_policy_choices(self) -> None:
         try:
@@ -1105,6 +1281,8 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(window.title(), "SidePulse Agent Monitor Settings")
         self.assertIn("debug_log_status", target.settings_fields)
+        self.assertIn("session_terminal", target.settings_fields)
+        self.assertIn("custom_terminal_path", target.settings_fields)
         self.assertIn("closed_animation_program", target.settings_fields)
         self.assertIn("closed_animation_duration", target.settings_fields)
         self.assertIn("open_animation_program", target.settings_fields)
@@ -1163,6 +1341,232 @@ class AgentMonitorTests(unittest.TestCase):
             popen.assert_called_once()
             self.assertEqual(popen.call_args.args[0][0], "/usr/bin/open")
 
+    def test_status_bar_open_terminal_command_uses_selected_terminal(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with patch("sidepulse.status_bar.subprocess.Popen") as popen:
+            status_bar.open_terminal_command("echo hello")
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "Terminal"', args[2])
+
+        with (
+            patch("sidepulse.status_bar.terminal_app_installed", return_value=True),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_ITERM,
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "iTerm"', args[2])
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/Ghostty.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_GHOSTTY,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/Ghostty.app",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with (
+            patch("sidepulse.status_bar.terminal_app_installed", return_value=False),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_GHOSTTY,
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "Terminal"', args[2])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            with (
+                patch("sidepulse.status_bar.default_state_dir", return_value=state_dir),
+                patch(
+                    "sidepulse.status_bar.installed_terminal_app_path",
+                    return_value=Path("/Applications/Warp.app"),
+                ),
+                patch("sidepulse.status_bar.subprocess.Popen") as popen,
+            ):
+                status_bar.open_terminal_command(
+                    "echo hello",
+                    terminal_app=TERMINAL_APP_WARP,
+                )
+            script = state_dir / "resume-session.command"
+            self.assertIn("echo hello", script.read_text())
+            self.assertEqual(
+                popen.call_args.args[0],
+                ["/usr/bin/open", "-a", "/Applications/Warp.app", str(script)],
+            )
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/Kitty.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_KITTY,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/Kitty.app",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/WezTerm.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_WEZTERM,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/WezTerm.app",
+                "--args",
+                "start",
+                "--new-tab",
+                "--",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/Alacritty.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_ALACRITTY,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/Alacritty.app",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_app = Path(tmp) / "WezTerm.app"
+            custom_app.mkdir()
+            with patch("sidepulse.status_bar.subprocess.Popen") as popen:
+                status_bar.open_terminal_command(
+                    "echo hello",
+                    terminal_app=TERMINAL_APP_CUSTOM,
+                    custom_terminal_path=str(custom_app),
+                )
+            call_args = popen.call_args.args[0]
+        self.assertEqual(
+            call_args,
+            [
+                "/usr/bin/open",
+                "-n",
+                str(custom_app),
+                "--args",
+                "start",
+                "--new-tab",
+                "--",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with patch("sidepulse.status_bar.subprocess.Popen") as popen:
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_CUSTOM,
+                custom_terminal_path="/Applications/Missing.app",
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "Terminal"', args[2])
+
+    def test_status_bar_detects_installed_terminal_apps(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            (app_dir / "Warp.app").mkdir()
+            (app_dir / "iTerm.app").mkdir()
+
+            self.assertEqual(
+                status_bar.installed_terminal_app_path(
+                    TERMINAL_APP_WARP,
+                    app_dirs=(app_dir,),
+                ),
+                app_dir / "Warp.app",
+            )
+            self.assertTrue(
+                status_bar.terminal_app_installed(
+                    TERMINAL_APP_ITERM,
+                    app_dirs=(app_dir,),
+                )
+            )
+            self.assertIsNone(
+                status_bar.installed_terminal_app_path(
+                    TERMINAL_APP_KITTY,
+                    app_dirs=(app_dir,),
+                )
+            )
+
     def test_status_bar_open_session_remembers_action_by_origin(self) -> None:
         try:
             from sidepulse import status_bar
@@ -1181,7 +1585,7 @@ class AgentMonitorTests(unittest.TestCase):
             origin="Claude in VS Code",
         )
         fake = SimpleNamespace(
-            settings=AgentMonitorSettings(),
+            settings=AgentMonitorSettings().with_session_terminal(TERMINAL_APP_ITERM),
             messages=[],
             set_settings_message=lambda message: None,
         )
@@ -1198,7 +1602,9 @@ class AgentMonitorTests(unittest.TestCase):
             )
 
         open_terminal.assert_called_once_with(
-            "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257"
+            "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257",
+            terminal_app=TERMINAL_APP_ITERM,
+            custom_terminal_path="",
         )
         self.assertEqual(
             fake.settings.session_open_action("claude", "Claude in VS Code"),
@@ -2473,6 +2879,12 @@ class AgentMonitorTests(unittest.TestCase):
                         led_display="battery",
                         brightness=128,
                     ),
+                    DeviceDisplaySetting(
+                        device_id="/Volumes/SidePulseCustom",
+                        name="SidePulse Custom",
+                        path="/Volumes/SidePulseCustom",
+                        led_display=LED_DISPLAY_CUSTOM,
+                    ),
                 )
             )
 
@@ -2482,6 +2894,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(loaded.devices, settings.devices)
             self.assertEqual(loaded.display_for_device("/Volumes/SidePulsePro"), "agent")
             self.assertEqual(loaded.display_for_device("/Volumes/SidePulseDot"), "battery")
+            self.assertEqual(
+                loaded.display_for_device("/Volumes/SidePulseCustom"),
+                LED_DISPLAY_CUSTOM,
+            )
             self.assertEqual(loaded.brightness_for_device("/Volumes/SidePulseDot"), 128)
 
     def test_settings_round_trip_remembered_device_brightness(self) -> None:
@@ -2516,6 +2932,27 @@ class AgentMonitorTests(unittest.TestCase):
                 SESSION_OPEN_TERMINAL,
             )
             self.assertIsNone(loaded.session_open_action("claude"))
+
+    def test_settings_round_trip_session_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_session_terminal(
+                TERMINAL_APP_CUSTOM,
+                "/Applications/WezTerm.app",
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.session_terminal_app, TERMINAL_APP_CUSTOM)
+            self.assertEqual(loaded.custom_terminal_path, "/Applications/WezTerm.app")
+
+            switched = loaded.with_session_terminal(TERMINAL_APP_ITERM)
+            save_settings(switched, settings_path)
+            reloaded = load_settings(settings_path)
+
+            self.assertEqual(reloaded.session_terminal_app, TERMINAL_APP_ITERM)
+            self.assertEqual(reloaded.custom_terminal_path, "/Applications/WezTerm.app")
 
     def test_settings_round_trip_closed_lid_policy_and_animations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

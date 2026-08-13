@@ -11,9 +11,28 @@ from .battery import DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
 from .session_actions import SESSION_OPEN_CHOICES
 
 
+TERMINAL_APP_TERMINAL = "terminal"
+TERMINAL_APP_ITERM = "iterm"
+TERMINAL_APP_GHOSTTY = "ghostty"
+TERMINAL_APP_WARP = "warp"
+TERMINAL_APP_KITTY = "kitty"
+TERMINAL_APP_WEZTERM = "wezterm"
+TERMINAL_APP_ALACRITTY = "alacritty"
+TERMINAL_APP_CUSTOM = "custom"
+TERMINAL_APP_CHOICES = (
+    TERMINAL_APP_TERMINAL,
+    TERMINAL_APP_ITERM,
+    TERMINAL_APP_GHOSTTY,
+    TERMINAL_APP_WARP,
+    TERMINAL_APP_KITTY,
+    TERMINAL_APP_WEZTERM,
+    TERMINAL_APP_ALACRITTY,
+    TERMINAL_APP_CUSTOM,
+)
 LED_DISPLAY_AGENT = "agent"
 LED_DISPLAY_BATTERY = "battery"
-LED_DISPLAY_CHOICES = (LED_DISPLAY_AGENT, LED_DISPLAY_BATTERY)
+LED_DISPLAY_CUSTOM = "custom"
+LED_DISPLAY_CHOICES = (LED_DISPLAY_AGENT, LED_DISPLAY_BATTERY, LED_DISPLAY_CUSTOM)
 CLOSED_LID_AWAKE_NEVER = "never"
 CLOSED_LID_AWAKE_AGENTS = "agents"
 CLOSED_LID_AWAKE_ALWAYS = "always"
@@ -107,6 +126,8 @@ class AgentMonitorSettings:
     battery_show_on_power_change: bool = True
     battery_power_change_preview_seconds: float = DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
     session_open_preferences: dict[str, str] = field(default_factory=dict)
+    session_terminal_app: str = TERMINAL_APP_TERMINAL
+    custom_terminal_path: str = ""
     setup_screen_completed: bool = False
 
     def transcript_enabled(self, provider: str) -> bool:
@@ -283,6 +304,23 @@ class AgentMonitorSettings:
         preferences[provider_key] = action
         return replace(self, session_open_preferences=preferences)
 
+    def with_session_terminal(
+        self,
+        terminal_app: str,
+        custom_path: str | None = None,
+    ) -> "AgentMonitorSettings":
+        terminal = normalize_terminal_app(terminal_app)
+        path = self.custom_terminal_path
+        if custom_path is not None:
+            path = str(custom_path)
+        if terminal != TERMINAL_APP_CUSTOM:
+            path = self.custom_terminal_path
+        return replace(
+            self,
+            session_terminal_app=terminal,
+            custom_terminal_path=path,
+        )
+
     def with_battery_full_charge_watts(self, watts: float | None) -> "AgentMonitorSettings":
         if watts is not None and watts <= 0:
             watts = None
@@ -362,6 +400,10 @@ class AgentMonitorSettings:
                 "power_change_preview_seconds": self.battery_power_change_preview_seconds,
             },
             "session_open_preferences": dict(sorted(self.session_open_preferences.items())),
+            "session_terminal": {
+                "app": self.session_terminal_app,
+                "custom_path": self.custom_terminal_path,
+            },
             "setup_screen_completed": self.setup_screen_completed,
         }
 
@@ -401,6 +443,10 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
     if not isinstance(battery, dict):
         battery = {}
 
+    terminal = data.get("session_terminal")
+    if not isinstance(terminal, dict):
+        terminal = {}
+
     led_display = _led_display_setting(data.get("led_display"), LED_DISPLAY_AGENT)
     return AgentMonitorSettings(
         codex_transcripts_enabled=_bool_setting(transcript.get("codex"), False),
@@ -437,6 +483,8 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             DEFAULT_POWER_CHANGE_PREVIEW_SECONDS,
         ),
         session_open_preferences=_session_open_preferences(data.get("session_open_preferences")),
+        session_terminal_app=normalize_terminal_app(terminal.get("app")),
+        custom_terminal_path=_string_setting(terminal.get("custom_path")),
         setup_screen_completed=_bool_setting(data.get("setup_screen_completed"), False),
     )
 
@@ -461,6 +509,16 @@ def _led_display_setting(value: object, default: str) -> str:
     if isinstance(value, str) and value in LED_DISPLAY_CHOICES:
         return value
     return default
+
+
+def normalize_terminal_app(value: object) -> str:
+    if isinstance(value, str) and value in TERMINAL_APP_CHOICES:
+        return value
+    return TERMINAL_APP_TERMINAL
+
+
+def _string_setting(value: object) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _closed_lid_awake_policy(value: object) -> str:

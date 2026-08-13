@@ -45,6 +45,7 @@ from .providers import (
 )
 from .settings import (
     LED_DISPLAY_BATTERY,
+    LED_DISPLAY_CUSTOM,
     LED_DISPLAY_CHOICES,
     load_settings,
     save_settings,
@@ -359,6 +360,8 @@ def cmd_sidepulse_battery_configure(args: argparse.Namespace) -> int:
     )
     if settings.led_display == LED_DISPLAY_BATTERY:
         print("  status bar LEDs will show battery.")
+    elif settings.led_display == LED_DISPLAY_CUSTOM:
+        print("  status bar LEDs will leave devices on manual output.")
     return 0
 
 
