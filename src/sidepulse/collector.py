@@ -32,7 +32,7 @@ CLAUDE_TRANSCRIPT_MAX_LINES = 500
 TRANSCRIPT_FILE_LIST_CACHE_SECONDS = 5.0
 CLAUDE_TRANSCRIPT_MTIME_HEARTBEAT_SKEW_SECONDS = 30.0
 CODEX_SESSION_INDEX_MAX_LINES = 5000
-COMPLETED_VISIBLE_SECONDS = 20 * 60.0
+COMPLETED_VISIBLE_SECONDS = 15.0
 IDLE_VISIBLE_SECONDS = 0.0
 POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
 
@@ -181,6 +181,10 @@ class AgentMonitor:
             sources=self.sources,
             collected_at=now,
         )
+
+    def latest_statuses(self) -> tuple[AgentStatus, ...]:
+        """Return the newest parsed status for each agent, including stale ones."""
+        return tuple(self._latest_statuses().values())
 
     def _latest_statuses(self) -> dict[str, AgentStatus]:
         signature = self._input_signature()
@@ -422,6 +426,20 @@ class LiveAgentMonitor:
             self.statuses_by_key[status.agent_id] = status
             self.write_latest_state()
 
+    def reconcile_statuses(self, statuses: Iterable[AgentStatus]) -> int:
+        """Merge newer fallback statuses without overriding newer live events."""
+        changed = 0
+        with self.lock:
+            for status in statuses:
+                previous = self.statuses_by_key.get(status.agent_id)
+                if previous is not None and previous.updated_at >= status.updated_at:
+                    continue
+                self.statuses_by_key[status.agent_id] = status
+                changed += 1
+            if changed:
+                self.write_latest_state()
+        return changed
+
     def snapshot(self, include_stale: bool = False) -> MonitorSnapshot:
         now = datetime.now(timezone.utc)
         with self.lock:
@@ -485,6 +503,7 @@ def default_sources(settings: AgentMonitorSettings | None = None) -> tuple[Sourc
     if active_settings.claude_transcripts_enabled:
         sources.append(SourceSpec(CLAUDE_TRANSCRIPT_PROVIDER, Path.home() / ".claude" / "projects"))
     sources.append(SourceSpec("grok", detect_log_path("grok")))
+    sources.append(SourceSpec("antigravity", detect_log_path("antigravity")))
     return unique_sources(sources)
 
 
@@ -685,7 +704,11 @@ def codex_transcript_event(
         )
 
     if payload_type == "task_complete":
-        message = _string_or_none(payload.get("last_agent_message")) or ""
+        error = payload.get("error")
+        error_message = (
+            _string_or_none(error.get("message")) if isinstance(error, dict) else None
+        )
+        message = _string_or_none(payload.get("last_agent_message")) or error_message or ""
         return HookEvent(
             provider="codex",
             logged_at=timestamp,
@@ -696,6 +719,7 @@ def codex_transcript_event(
                 "turn_id": turn_id,
                 "cwd": cwd,
                 "last_assistant_message": message,
+                "error": error,
                 "transcript_path": str(path),
                 "source": CODEX_TRANSCRIPT_PROVIDER,
             },

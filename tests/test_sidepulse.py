@@ -21,10 +21,13 @@ from sidepulse.audit import (
 )
 from sidepulse.battery import (
     BATTERY_CHARGING_MINT,
+    BATTERY_HIGH_GREEN,
+    BATTERY_MID_AMBER,
     BatteryLedController,
     BatterySnapshot,
     parse_ioreg_battery_plist,
     program_for_battery,
+    scale_hex_color,
 )
 from sidepulse import collector as collector_module
 from sidepulse import cli as cli_module
@@ -2103,8 +2106,8 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         self.assertEqual(len(program.splitlines()), 1)
-        self.assertIn("0:#FFB000 360ms ease", program)
-        self.assertIn("3:#FFB000 360ms ease", program)
+        self.assertIn(f"0:{BATTERY_MID_AMBER} 360ms ease", program)
+        self.assertIn(f"3:{BATTERY_MID_AMBER} 360ms ease", program)
         self.assertIn("4:#000000 360ms ease", program)
         self.assertNotIn("repeat", program)
 
@@ -2115,9 +2118,12 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         segments = program.split(";")
-        self.assertEqual(segments[0], "0:#00FF66 360ms ease")
-        self.assertEqual(segments[3], "3:#00FF66 360ms ease")
-        self.assertEqual(segments[4], "4:#008F39 360ms ease")
+        self.assertEqual(segments[0], f"0:{BATTERY_HIGH_GREEN} 360ms ease")
+        self.assertEqual(segments[3], f"3:{BATTERY_HIGH_GREEN} 360ms ease")
+        self.assertEqual(
+            segments[4],
+            f"4:{scale_hex_color(BATTERY_HIGH_GREEN, 0.56)} 360ms ease",
+        )
         self.assertEqual(segments[5], "5:#000000 360ms ease")
 
     def test_battery_program_uses_brightness_command(self) -> None:
@@ -3166,10 +3172,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(len(snapshot.stale_statuses), 1)
             self.assertEqual(snapshot.stale_statuses[0].mode, AgentMode.COMPLETED)
 
-    def test_completed_status_stays_visible_for_twenty_minutes_by_default(self) -> None:
+    def test_completed_status_stays_visible_for_fifteen_seconds_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            recent_done = datetime.now(timezone.utc) - timedelta(minutes=19)
+            recent_done = datetime.now(timezone.utc) - timedelta(seconds=10)
             log.write_text(
                 json.dumps(
                     {

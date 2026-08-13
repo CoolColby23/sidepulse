@@ -58,12 +58,24 @@ from .battery import (
     program_for_battery,
     read_battery_snapshot,
 )
+from .ambient import (
+    BatteryThresholdAlert,
+    SystemAudioMeter,
+    battery_warning_program,
+    music_visualizer_program,
+)
 from .audit import (
     default_status_audit_log_path,
     export_status_audit_csv,
     export_status_audit_html,
 )
-from .collector import LiveAgentMonitor, SourceSpec, read_recent_lines
+from .collector import (
+    CODEX_TRANSCRIPT_PROVIDER,
+    AgentMonitor,
+    LiveAgentMonitor,
+    SourceSpec,
+    read_recent_lines,
+)
 from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
@@ -92,6 +104,7 @@ from .led_status import (
     brightness_percent,
     normalize_brightness,
     normalized_device_name,
+    led_count_for_target,
     program_for_display_state,
     write_mode_to_leds,
     display_state_for_mode,
@@ -178,6 +191,10 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 )
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
+AMBIENT_REFRESH_SECONDS = 0.20
+SYSTEM_AUDIO_HELPER_PATH = (
+    Path.home() / ".local" / "share" / "sidepulse" / "system-audio-meter"
+)
 SCREEN_BAR_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
 STATUS_BAR_STARTUP_REPLAY_LINES = 200
@@ -231,6 +248,19 @@ def replay_recent_debug_logs(
     return replayed
 
 
+def reconcile_codex_terminal_transcripts(
+    monitor: LiveAgentMonitor,
+    transcript_monitor: AgentMonitor,
+) -> int:
+    """Recover terminal Codex states that can be omitted from live hooks."""
+    terminal = (
+        status
+        for status in transcript_monitor.latest_statuses()
+        if status.provider == "codex" and status.event_name == "Stop"
+    )
+    return monitor.reconcile_statuses(terminal)
+
+
 class StatusBarController(NSObject):
     def init(self):
         self = objc.super(StatusBarController, self).init()
@@ -239,11 +269,13 @@ class StatusBarController(NSObject):
 
         self.settings = load_settings()
         self.monitor = self.build_monitor()
+        self.codex_terminal_monitor = self.build_codex_terminal_monitor()
         self.event_server = None
         self.status_item = None
         self.timer = None
         self.lid_timer = None
         self.device_timer = None
+        self.ambient_timer = None
         self.settings_window = None
         self.setup_window = None
         self.settings_fields = {}
@@ -255,12 +287,14 @@ class StatusBarController(NSObject):
         self.last_battery_error = None
         self.last_power_connected = None
         self.battery_preview_until = 0.0
+        self.battery_threshold_alert = BatteryThresholdAlert()
         self.current_state = STATE_IDLE
         self.led_controller = AgentLedController()
         self.battery_led_controller = BatteryLedController()
         self.agent_led_controllers_by_device = {}
         self.battery_led_controllers_by_device = {}
         self.last_led_display_kind_by_device = {}
+        self.last_custom_program_by_device = {}
         self.device_errors = {}
         self.leds_enabled = True
         self.led_sync_in_flight = False
@@ -280,6 +314,10 @@ class StatusBarController(NSObject):
         self.led_animation_until_monotonic = 0.0
         self.led_animation_token = 0
         self.virtual_status_device = VirtualStatusDevice.alloc().init()
+        self.system_audio_meter = SystemAudioMeter(
+            SYSTEM_AUDIO_HELPER_PATH,
+            logger=lambda message: log_status_bar(f"system audio: {message}"),
+        )
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
@@ -319,6 +357,14 @@ class StatusBarController(NSObject):
             None,
             True,
         )
+        self.system_audio_meter.start()
+        self.ambient_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            AMBIENT_REFRESH_SECONDS,
+            self,
+            "refreshAmbient:",
+            None,
+            True,
+        )
         self.show_setup_window_if_needed()
         if SCREEN_BAR_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
             self.virtual_status_device.show()
@@ -328,6 +374,10 @@ class StatusBarController(NSObject):
     @objc.IBAction
     def refresh_(self, _sender):
         try:
+            reconcile_codex_terminal_transcripts(
+                self.monitor,
+                self.codex_terminal_monitor,
+            )
             snapshot = self.monitor.snapshot(include_stale=False)
         except Exception as exc:
             log_status_bar(f"refresh error: {exc}")
@@ -339,6 +389,15 @@ class StatusBarController(NSObject):
 
         self.last_snapshot = snapshot
         battery_snapshot = self.read_battery_snapshot()
+        if battery_snapshot is not None:
+            threshold = self.battery_threshold_alert.update(
+                battery_snapshot.percent,
+                snapshot.aggregate.mode,
+            )
+            if threshold is not None:
+                log_status_bar(f"battery low warning threshold={threshold}%")
+                self.reset_led_controllers_for_display_change()
+        self.battery_threshold_alert.adjust_for_mode(snapshot.aggregate.mode)
         state = state_for_mode(snapshot.aggregate.mode)
         self.observe_connected_devices()
         self.set_status(state)
@@ -349,6 +408,19 @@ class StatusBarController(NSObject):
             self.active_led_display_kind(battery_snapshot),
         )
         self.status_item.setMenu_(build_menu(snapshot, state, self))
+
+    @objc.IBAction
+    def refreshAmbient_(self, _sender):
+        if self.last_snapshot is None:
+            return
+        mode = self.last_snapshot.aggregate.mode
+        self.battery_threshold_alert.adjust_for_mode(mode)
+        if self.battery_threshold_alert.active() or mode == AgentMode.IDLE_READY:
+            self.sync_leds(
+                mode,
+                self.last_battery_snapshot,
+                self.active_led_display_kind(self.last_battery_snapshot),
+            )
 
     @objc.IBAction
     def forceRefresh_(self, _sender):
@@ -569,6 +641,7 @@ class StatusBarController(NSObject):
 
     def applicationWillTerminate_(self, _notification):
         self.stop_event_server()
+        self.system_audio_meter.stop()
         self.closed_lid_awake.release()
         self.keep_awake.release()
 
@@ -594,8 +667,19 @@ class StatusBarController(NSObject):
             latest_state_path=default_latest_state_path(),
         )
 
+    def build_codex_terminal_monitor(self) -> AgentMonitor:
+        return AgentMonitor(
+            sources=(
+                SourceSpec(
+                    CODEX_TRANSCRIPT_PROVIDER,
+                    Path.home() / ".codex" / "sessions",
+                ),
+            ),
+        )
+
     def reload_monitor(self) -> None:
         self.monitor = self.build_monitor()
+        self.codex_terminal_monitor = self.build_codex_terminal_monitor()
 
     def start_event_server(self) -> None:
         self.stop_event_server()
@@ -1251,6 +1335,7 @@ class StatusBarController(NSObject):
         for controller in self.battery_led_controllers_by_device.values():
             controller.reset()
         self.last_led_display_kind_by_device.clear()
+        self.last_custom_program_by_device.clear()
         self.last_led_error = None
 
     def reset_led_controllers_for_device(self, device_id: str) -> None:
@@ -1261,6 +1346,7 @@ class StatusBarController(NSObject):
         if battery_controller is not None:
             battery_controller.reset()
         self.last_led_display_kind_by_device.pop(device_id, None)
+        self.last_custom_program_by_device.pop(device_id, None)
         self.device_errors.pop(device_id, None)
         self.last_led_error = None
 
@@ -1403,6 +1489,31 @@ class StatusBarController(NSObject):
             return LED_DISPLAY_BATTERY
         return LED_DISPLAY_AGENT
 
+    def custom_led_program_for_device(
+        self,
+        device: StatusBarDevice,
+        mode: AgentMode,
+        battery_snapshot: BatterySnapshot | None,
+    ) -> tuple[str, str] | None:
+        if self.battery_threshold_alert.active():
+            return "battery-warning", battery_warning_program(brightness=device.brightness)
+
+        display = self.active_led_display_kind_for_device(device, battery_snapshot)
+        if display != LED_DISPLAY_AGENT or mode != AgentMode.IDLE_READY:
+            return None
+        level = self.system_audio_meter.level()
+        if level is None:
+            return None
+        led_count = 8 if device.device_id == VIRTUAL_DEVICE_ID else led_count_for_target(device.target)
+        return (
+            "music",
+            music_visualizer_program(
+                level,
+                led_count=led_count,
+                brightness=device.brightness,
+            ),
+        )
+
     def sync_leds(
         self,
         mode: AgentMode,
@@ -1445,6 +1556,11 @@ class StatusBarController(NSObject):
             None,
         )
         if device is None:
+            return
+        custom = self.custom_led_program_for_device(device, mode, battery_snapshot)
+        if custom is not None:
+            _kind, program = custom
+            self.virtual_status_device.set_program(program)
             return
         display = self.active_led_display_kind_for_device(device, battery_snapshot)
         if display == LED_DISPLAY_BATTERY and battery_snapshot is not None:
@@ -1498,14 +1614,32 @@ class StatusBarController(NSObject):
 
         active_errors: dict[str, str] = {}
         for device in devices:
-            device_display_kind = self.active_led_display_kind_for_device(
-                device,
-                battery_snapshot,
+            custom = self.custom_led_program_for_device(device, mode, battery_snapshot)
+            device_display_kind = (
+                custom[0]
+                if custom is not None
+                else self.active_led_display_kind_for_device(device, battery_snapshot)
             )
             if self.last_led_display_kind_by_device.get(device.device_id) != device_display_kind:
                 self.reset_led_controllers_for_device(device.device_id)
                 self.last_led_display_kind_by_device[device.device_id] = device_display_kind
 
+            if custom is not None:
+                _kind, program = custom
+                if self.last_custom_program_by_device.get(device.device_id) == program:
+                    continue
+                try:
+                    write_led_program(program, device_path=device.target)
+                    self.last_custom_program_by_device[device.device_id] = program
+                    self.device_errors.pop(device.device_id, None)
+                except Exception as exc:
+                    error = str(exc)
+                    active_errors[device.device_id] = error
+                    if self.device_errors.get(device.device_id) != error:
+                        log_status_bar(f"led error {device.name}: {error}")
+                continue
+
+            self.last_custom_program_by_device.pop(device.device_id, None)
             if device_display_kind == LED_DISPLAY_BATTERY and battery_snapshot is not None:
                 result = self.battery_controller_for_device(device).sync_snapshot(battery_snapshot)
                 label = (
