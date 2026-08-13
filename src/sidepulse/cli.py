@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 from .battery import (
@@ -19,6 +20,7 @@ from .battery import (
 from .collector import AgentMonitor, SourceSpec, default_sources
 from .device_writer import DEFAULT_FILE_NAME, DeviceWriteError, write_led_program
 from .hook import hook_log_main
+from .ipc import default_event_socket_path, default_latest_state_path
 from .install import (
     install_claude_hooks,
     install_codex_hooks,
@@ -594,6 +596,8 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="Show detected agent hook config.")
     doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    doctor.add_argument("--verbose", action="store_true", help="Check runtime files and recent errors.")
+    doctor.add_argument("--bundle", type=Path, help="Write a redacted diagnostics ZIP archive.")
     doctor.set_defaults(func=cmd_doctor)
 
     status = subparsers.add_parser("status", help="Show current aggregate status once.")
@@ -699,6 +703,11 @@ def add_status_args(parser: argparse.ArgumentParser, include_json: bool = True) 
 def cmd_doctor(args: argparse.Namespace) -> int:
     configs = [detect_codex_config(), detect_claude_config(), detect_grok_config()]
     payload = {"providers": [config.to_dict() for config in configs]}
+    if args.verbose or args.bundle:
+        payload["runtime"] = runtime_diagnostics(configs)
+    if args.bundle:
+        bundle_path = write_diagnostics_bundle(args.bundle.expanduser(), payload)
+        payload["bundle"] = str(bundle_path)
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
@@ -709,7 +718,63 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  hooks enabled: {config.hooks_enabled}")
         print(f"  events: {', '.join(config.hook_events) if config.hook_events else '-'}")
         print(f"  logs: {', '.join(str(path) for path in config.log_paths) if config.log_paths else '-'}")
+    if args.verbose or args.bundle:
+        runtime = payload["runtime"]
+        print("runtime:")
+        print(f"  event socket: {runtime['event_socket']['state']}")
+        print(f"  latest state: {runtime['latest_state']['state']}")
+        print(f"  status-bar errors: {runtime['status_bar_error']['state']}")
+        print(f"  devices: {', '.join(runtime['devices']) if runtime['devices'] else '-'}")
+    if args.bundle:
+        print(f"diagnostics bundle: {payload['bundle']}")
     return 0
+
+
+def runtime_diagnostics(configs) -> dict:
+    state_dir = default_log_path("codex").parent
+    error_log = state_dir / "status-bar.err.log"
+    return {
+        "event_socket": path_diagnostic(default_event_socket_path()),
+        "latest_state": path_diagnostic(default_latest_state_path()),
+        "status_bar_error": path_diagnostic(error_log),
+        "provider_logs": {
+            config.provider: [path_diagnostic(path) for path in config.log_paths]
+            for config in configs
+        },
+        "devices": sorted(
+            path.name
+            for path in Path("/Volumes").glob("SidePulse*")
+            if path.is_dir()
+        ),
+    }
+
+
+def path_diagnostic(path: Path) -> dict:
+    if not path.exists():
+        return {"path": str(path), "state": "missing"}
+    stat = path.stat()
+    age = max(0.0, time.time() - stat.st_mtime)
+    state = "empty" if path.is_file() and stat.st_size == 0 else "present"
+    return {
+        "path": str(path),
+        "state": state,
+        "size": stat.st_size,
+        "age_seconds": round(age, 1),
+    }
+
+
+def write_diagnostics_bundle(path: Path, payload: dict) -> Path:
+    target = path if path.suffix.lower() == ".zip" else path.with_suffix(".zip")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    state_dir = default_log_path("codex").parent
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("doctor.json", json.dumps(payload, indent=2, default=str))
+        for name in ("status-bar.out.log", "status-bar.err.log"):
+            source = state_dir / name
+            if source.exists():
+                lines = source.read_text(errors="replace").splitlines()[-200:]
+                archive.writestr(f"logs/{name}", "\n".join(lines) + "\n")
+    return target
 
 
 def cmd_status(args: argparse.Namespace) -> int:
