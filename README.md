@@ -203,6 +203,17 @@ Install locally for the `sidepulse` CLI:
 python3 -m pip install -e .
 ```
 
+For an isolated user installation that does not modify system Python packages:
+
+```sh
+./scripts/install-user.sh
+~/.local/bin/sidepulse setup
+```
+
+The installer creates `~/.local/share/sidepulse/venv` and links the CLI into
+`~/.local/bin`. Override `PYTHON_BIN`, `SIDEPULSE_INSTALL_ROOT`, or
+`SIDEPULSE_BIN_DIR` when a different location is needed.
+
 This also installs the Cocoa dependencies for the macOS status-bar app.
 
 Set up this Mac explicitly after package install:
