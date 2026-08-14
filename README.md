@@ -579,3 +579,18 @@ to turn that skip into a failure, which is how CI runs them.
 The clean-room install tests take ~15s because they build a virtualenv and
 install into it. Set `SIDEPULSE_SKIP_CLEAN_INSTALL=1` to skip them while
 iterating; CI always runs them.
+
+### Releasing
+
+`git tag v0.1.0 && git push --tags` runs the full suite, checks the tag against
+the version in `pyproject.toml`, builds, publishes, and then reinstalls the
+release **from PyPI** on clean macOS and Linux runners to re-run the clean-room
+tests against the artifact users actually download.
+
+Bump the version in both `pyproject.toml` and `src/sidepulse/__init__.py` — a
+test fails if they disagree, and the tag guard fails if the tag disagrees with
+either. To point the clean-room tests at any other build:
+
+```sh
+SIDEPULSE_INSTALL_SPEC='sidepulse==0.1.0' python3 -m pytest tests/test_environment.py -v
+```

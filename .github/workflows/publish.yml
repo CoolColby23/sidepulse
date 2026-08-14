@@ -21,6 +21,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Publishing v0.2.0 from a tree that still says 0.1.0 produces a release
+      # nobody can reference correctly, and PyPI uploads cannot be replaced.
+      - name: Verify tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(python -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME implies version $tag, but pyproject.toml declares $pkg"
+            exit 1
+          fi
+          echo "tag and package version agree: $pkg"
       - name: Build sdist and wheel
         run: |
           python -m pip install --upgrade build
@@ -49,3 +60,46 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Everything above tests the artifact built here. This installs what PyPI
+  # actually serves, on a clean runner, and runs the real commands against it.
+  smoke-test:
+    name: Smoke test PyPI release / ${{ matrix.os }}
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test runner
+        run: python -m pip install --upgrade pip pytest
+
+      # PyPI takes a little while to serve a fresh upload from every CDN edge.
+      - name: Wait for the release to become installable
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          for attempt in $(seq 1 30); do
+            if python -m pip download --no-deps --no-cache-dir \
+                 --dest "$RUNNER_TEMP/probe" "sidepulse==$version" >/dev/null 2>&1; then
+              echo "sidepulse==$version installable after $attempt attempt(s)"
+              exit 0
+            fi
+            echo "not on PyPI yet (attempt $attempt/30); waiting 20s"
+            sleep 20
+          done
+          echo "::error::sidepulse==$version never became installable"
+          exit 1
+
+      # Installs from PyPI instead of the checkout. The checkout is still
+      # present, and is what the resource and module lists are compared
+      # against -- it is the same commit the release was built from.
+      - name: Smoke test the published artifact
+        run: |
+          export SIDEPULSE_INSTALL_SPEC="sidepulse==${GITHUB_REF_NAME#v}"
+          echo "installing $SIDEPULSE_INSTALL_SPEC"
+          python -m pytest tests/test_environment.py -v

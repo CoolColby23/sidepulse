@@ -371,6 +371,40 @@ class EntryPointTests(unittest.TestCase):
                 )
 
 
+class VersionTests(unittest.TestCase):
+    """The version is declared twice and must not drift.
+
+    A published wheel whose metadata disagrees with ``sidepulse.__version__``
+    makes bug reports impossible to place.
+    """
+
+    def test_pyproject_and_dunder_version_agree(self):
+        import sidepulse
+
+        declared = load_pyproject()["project"]["version"]
+        self.assertEqual(
+            declared,
+            sidepulse.__version__,
+            "pyproject.toml version and sidepulse.__version__ disagree; "
+            "update both when releasing",
+        )
+
+    def test_installed_metadata_matches_source(self):
+        """Guards against testing a stale install of the package."""
+        from importlib.metadata import version
+
+        try:
+            installed = version("sidepulse")
+        except PackageNotFoundError:
+            self.skipTest("sidepulse is not installed in this environment")
+        self.assertEqual(
+            load_pyproject()["project"]["version"],
+            installed,
+            "the installed sidepulse is a different version than this "
+            "source tree; reinstall with `pip install -e .`",
+        )
+
+
 class PackageDataTests(unittest.TestCase):
     def test_declared_package_data_exists(self):
         data = load_pyproject()
