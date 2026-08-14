@@ -49,12 +49,16 @@ try:
         NSVariableStatusItemLength,
     )
     from Foundation import NSObject, NSString, NSTimer, NSURL
-    from ScriptingBridge import SBApplication
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
-        "The status-bar app requires PyObjC/AppKit:\n"
+        f"The status-bar app requires PyObjC/AppKit ({exc}):\n"
         "  python3 -m pip install pyobjc-framework-Cocoa"
     ) from exc
+
+try:
+    from ScriptingBridge import SBApplication
+except ImportError:  # pragma: no cover - only the Ghostty integration needs this.
+    SBApplication = None
 
 from .battery import (
     BatteryLedController,
@@ -3811,6 +3815,8 @@ def open_ghostty_command_with_scripting_bridge(
 
 
 def ghostty_application():
+    if SBApplication is None:
+        return None
     app_path = installed_terminal_app_path(TERMINAL_APP_GHOSTTY)
     if app_path is not None:
         try:
