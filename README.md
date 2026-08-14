@@ -568,9 +568,14 @@ unless it passes. Four files, each guarding a different failure mode:
 | File | Guards against |
 | --- | --- |
 | `tests/test_packaging.py` | Importing a module no dependency declares. Every module-level import must resolve to a declared distribution, so a new `import` without a matching `pyproject.toml` entry fails at commit time rather than on a user's machine. |
+| `tests/test_environment.py` | A working dev machine hiding a broken install. Builds an empty virtualenv, runs `pip install .` against `pyproject.toml` alone, then imports every module and runs the real commands — including `sidepulse status-bar start --foreground` — inside it. An undeclared dependency is simply absent there. |
 | `tests/test_hook_stability.py` | Breaking somebody's agent session. Hooks must exit 0 and stay silent on stdout for every input and internal failure — and must still work with PyObjC entirely unavailable. |
 | `tests/test_status_bar_ui.py` | Menus and windows that build but crash when clicked. Runs headlessly against a real `StatusBarController`; verifies every selector string resolves to a real method. |
 | `tests/test_sidepulse.py` | Collector, settings, install, and provider logic. |
 
 The UI tests skip if AppKit is unavailable. Set `SIDEPULSE_REQUIRE_UI_TESTS=1`
 to turn that skip into a failure, which is how CI runs them.
+
+The clean-room install tests take ~15s because they build a virtualenv and
+install into it. Set `SIDEPULSE_SKIP_CLEAN_INSTALL=1` to skip them while
+iterating; CI always runs them.

@@ -407,6 +407,9 @@ class EntryPointSubprocessTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertTrue(log_path.exists())
+        # Catches stray debug prints at module scope, which would corrupt the
+        # hook protocol for anyone routing hooks through the CLI.
+        self.assertEqual("", result.stdout, f"CLI printed to stdout: {result.stdout!r}")
 
 
 class InstalledCommandTests(unittest.TestCase):
