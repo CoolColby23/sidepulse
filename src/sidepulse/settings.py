@@ -75,6 +75,8 @@ DEFAULT_LID_OPEN_ANIMATION_PROGRAM = "\n".join(
 )
 DEFAULT_LID_CLOSED_ANIMATION_SECONDS = 0.9
 DEFAULT_LID_OPEN_ANIMATION_SECONDS = 1.0
+DEFAULT_RECENT_SESSION_RETENTION_SECONDS = 48 * 60 * 60
+DEFAULT_IDLE_TIMEOUT_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,8 @@ class AgentMonitorSettings:
     grok_session_open_action: str = SESSION_OPEN_TERMINAL
     session_terminal_app: str = TERMINAL_APP_TERMINAL
     custom_terminal_path: str = ""
+    recent_session_retention_seconds: float = DEFAULT_RECENT_SESSION_RETENTION_SECONDS
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
     setup_screen_completed: bool = False
 
     def transcript_enabled(self, provider: str) -> bool:
@@ -396,6 +400,24 @@ class AgentMonitorSettings:
     def with_virtual_status_device(self, enabled: bool) -> "AgentMonitorSettings":
         return replace(self, virtual_status_device_enabled=bool(enabled))
 
+    def with_agent_list_timing(
+        self,
+        *,
+        recent_session_retention_seconds: float | None = None,
+        idle_timeout_seconds: float | None = None,
+    ) -> "AgentMonitorSettings":
+        retention = self.recent_session_retention_seconds
+        idle_timeout = self.idle_timeout_seconds
+        if recent_session_retention_seconds is not None:
+            retention = normalize_seconds_setting(recent_session_retention_seconds)
+        if idle_timeout_seconds is not None:
+            idle_timeout = normalize_seconds_setting(idle_timeout_seconds)
+        return replace(
+            self,
+            recent_session_retention_seconds=retention,
+            idle_timeout_seconds=idle_timeout,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "led_display": self.led_display,
@@ -419,6 +441,10 @@ class AgentMonitorSettings:
             "session_terminal": {
                 "app": self.session_terminal_app,
                 "custom_path": self.custom_terminal_path,
+            },
+            "agent_list": {
+                "recent_session_retention_seconds": self.recent_session_retention_seconds,
+                "idle_timeout_seconds": self.idle_timeout_seconds,
             },
             "setup_screen_completed": self.setup_screen_completed,
         }
@@ -462,6 +488,10 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
     terminal = data.get("session_terminal")
     if not isinstance(terminal, dict):
         terminal = {}
+
+    agent_list = data.get("agent_list")
+    if not isinstance(agent_list, dict):
+        agent_list = {}
 
     led_display = _led_display_setting(data.get("led_display"), LED_DISPLAY_AGENT)
     session_open_preferences = _session_open_preferences(
@@ -514,6 +544,17 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
         grok_session_open_action=grok_session_open_action,
         session_terminal_app=normalize_terminal_app(terminal.get("app")),
         custom_terminal_path=_string_setting(terminal.get("custom_path")),
+        recent_session_retention_seconds=_nonnegative_float_setting(
+            agent_list.get(
+                "recent_session_retention_seconds",
+                data.get("recent_session_retention_seconds"),
+            ),
+            DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+        ),
+        idle_timeout_seconds=_nonnegative_float_setting(
+            agent_list.get("idle_timeout_seconds", data.get("idle_timeout_seconds")),
+            DEFAULT_IDLE_TIMEOUT_SECONDS,
+        ),
         setup_screen_completed=_bool_setting(data.get("setup_screen_completed"), False),
     )
 
@@ -633,6 +674,18 @@ def _float_setting(value: object, default: float) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
+
+
+def _nonnegative_float_setting(value: object, default: float) -> float:
+    if isinstance(value, (int, float)):
+        return normalize_seconds_setting(value)
+    return default
+
+
+def normalize_seconds_setting(value: object) -> float:
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    return 0.0
 
 
 def normalize_brightness(value: object) -> int:

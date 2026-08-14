@@ -106,6 +106,8 @@ from sidepulse.settings import (
     CLOSED_LID_AWAKE_AGENTS,
     CLOSED_LID_AWAKE_ALWAYS,
     CLOSED_LID_AWAKE_NEVER,
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
     LED_DISPLAY_CUSTOM,
@@ -127,7 +129,9 @@ from sidepulse.settings import (
 )
 from sidepulse.status_bar_launch import (
     LAUNCH_AGENT_LABEL,
+    STATUS_BAR_DISPLAY_NAME,
     build_launch_agent_plist,
+    build_status_bar_launcher_script,
     install_launch_agent,
     launch_agent_installed,
 )
@@ -1093,7 +1097,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="claude:session:old-done",
             display_name="old: Old done (old-done)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(minutes=25),
+            updated_at=now - timedelta(hours=49),
             event_name="Stop",
             session_id="old-done",
             cwd="/Users/pero/pgit/old",
@@ -1113,6 +1117,62 @@ class AgentMonitorTests(unittest.TestCase):
             [status.session_id for status in statuses],
             ["working", "recent-done"],
         )
+
+    def test_status_bar_recent_statuses_keeps_last_ten_within_retention(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        stale_done = tuple(
+            AgentStatus(
+                provider="codex",
+                agent_id=f"codex:session:done-{index}",
+                display_name=f"project: Done {index} (done-{index})",
+                mode=AgentMode.COMPLETED,
+                updated_at=now - timedelta(hours=index),
+                event_name="Stop",
+                session_id=f"done-{index}",
+                cwd="/Users/pero/pgit/project",
+                stale=True,
+            )
+            for index in range(1, 13)
+        )
+        too_old = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:too-old",
+            display_name="old: Too old (too-old)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(hours=50),
+            event_name="Stop",
+            session_id="too-old",
+            cwd="/Users/pero/pgit/old",
+            stale=True,
+        )
+        snapshot = MonitorSnapshot(
+            aggregate=AggregateStatus(AgentMode.IDLE_READY, 0, 13, None),
+            statuses=(),
+            stale_statuses=(*stale_done, too_old),
+            sources=(),
+            collected_at=now,
+        )
+
+        statuses = status_bar.recent_statuses(
+            snapshot,
+            AgentMonitorSettings(recent_session_retention_seconds=48 * 60 * 60),
+        )
+
+        self.assertEqual(len(statuses), 10)
+        self.assertEqual(statuses[0].session_id, "done-1")
+        self.assertEqual(statuses[-1].session_id, "done-10")
+        self.assertNotIn("too-old", [status.session_id for status in statuses])
+
+        shorter = status_bar.recent_statuses(
+            snapshot,
+            AgentMonitorSettings(recent_session_retention_seconds=2.5 * 60 * 60),
+        )
+        self.assertEqual([status.session_id for status in shorter], ["done-1", "done-2"])
 
     def test_codex_session_options_are_codex_specific(self) -> None:
         try:
@@ -1556,15 +1616,41 @@ class AgentMonitorTests(unittest.TestCase):
             if hasattr(view, "numberOfTabViewItems")
         ]
         self.assertEqual(len(tab_views), 1)
-        self.assertEqual(tab_views[0].numberOfTabViewItems(), 4)
+        self.assertEqual(tab_views[0].numberOfTabViewItems(), 5)
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("session_terminal", target.settings_fields)
         self.assertIn("custom_terminal_path", target.settings_fields)
+        self.assertIn("recent_session_retention_hours", target.settings_fields)
+        self.assertIn("idle_timeout_minutes", target.settings_fields)
         self.assertIn("closed_animation_program", target.settings_fields)
         self.assertIn("closed_animation_duration", target.settings_fields)
         self.assertIn("open_animation_program", target.settings_fields)
         self.assertIn("open_animation_duration", target.settings_fields)
         self.assertNotIn("closed_lid_system_override", target.settings_buttons)
+
+    def test_status_bar_monitor_uses_idle_timeout_setting(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = SimpleNamespace(
+                settings=AgentMonitorSettings(idle_timeout_seconds=1234)
+            )
+            with (
+                patch(
+                    "sidepulse.status_bar.default_event_socket_path",
+                    return_value=Path(tmp) / "events.sock",
+                ),
+                patch(
+                    "sidepulse.status_bar.default_latest_state_path",
+                    return_value=Path(tmp) / "latest.json",
+                ),
+            ):
+                monitor = status_bar.StatusBarController.build_monitor(fake)
+
+        self.assertEqual(monitor.stale_after_seconds, 1234)
 
     def test_status_bar_setup_window_has_first_launch_controls(self) -> None:
         try:
@@ -2830,6 +2916,26 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(helper.status_bar_command, "install-sleep-helper")
         self.assertTrue(helper.dry_run)
 
+    def test_python_module_entrypoint_uses_sidepulse_cli(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(root / "src"),
+        }
+        result = subprocess.run(
+            [sys.executable, "-m", "sidepulse", "status-bar", "--help"],
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Helo World", result.stdout)
+        self.assertIn("Start/stop the menu-bar app", result.stdout)
+
     def test_sidepulse_sdejectguard_command_shape(self) -> None:
         parser = cli_module.build_sidepulse_parser()
 
@@ -3653,6 +3759,41 @@ class AgentMonitorTests(unittest.TestCase):
                 self.assertEqual(save_settings(saved), settings_path)
                 self.assertEqual(load_settings(), saved)
 
+    def test_settings_round_trip_agent_list_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_agent_list_timing(
+                recent_session_retention_seconds=36 * 60 * 60,
+                idle_timeout_seconds=15 * 60,
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(
+                AgentMonitorSettings().recent_session_retention_seconds,
+                DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+            )
+            self.assertEqual(
+                AgentMonitorSettings().idle_timeout_seconds,
+                DEFAULT_IDLE_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(loaded.recent_session_retention_seconds, 36 * 60 * 60)
+            self.assertEqual(loaded.idle_timeout_seconds, 15 * 60)
+
+    def test_settings_migrates_missing_agent_list_timing_to_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(json.dumps({"led_display": "agent"}))
+
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(
+                loaded.recent_session_retention_seconds,
+                DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+            )
+            self.assertEqual(loaded.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS)
+
     def test_default_sources_respect_transcript_settings(self) -> None:
         settings = AgentMonitorSettings(
             codex_transcripts_enabled=False,
@@ -3922,8 +4063,10 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("Remove", titles)
 
     def test_status_bar_launch_agent_plist_runs_foreground_command(self) -> None:
+        launcher = Path("/tmp/SidePulse Status Bar")
         plist = build_launch_agent_plist(
             python_executable="/usr/bin/python3",
+            launcher_path=launcher,
             stdout_path=Path("/tmp/sidepulse.out.log"),
             stderr_path=Path("/tmp/sidepulse.err.log"),
         )
@@ -3931,18 +4074,18 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(plist["Label"], LAUNCH_AGENT_LABEL)
         self.assertEqual(
             plist["ProgramArguments"],
-            [
-                "/usr/bin/python3",
-                "-m",
-                "sidepulse",
-                "status-bar",
-                "--foreground",
-            ],
+            [str(launcher)],
         )
         self.assertTrue(plist["RunAtLoad"])
         self.assertEqual(plist["StandardOutPath"], "/tmp/sidepulse.out.log")
         self.assertEqual(plist["StandardErrorPath"], "/tmp/sidepulse.err.log")
         self.assertNotIn("KeepAlive", plist)
+
+    def test_status_bar_launcher_uses_background_item_name(self) -> None:
+        script = build_status_bar_launcher_script(python_executable="/usr/bin/python3")
+
+        self.assertEqual(STATUS_BAR_DISPLAY_NAME, "SidePulse Status Bar")
+        self.assertIn("exec /usr/bin/python3 -m sidepulse status-bar --foreground", script)
 
     def test_status_bar_launch_agent_installed_checks_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3954,15 +4097,9 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_frozen_status_bar_launch_agent_uses_sidepulse_executable(self) -> None:
         with patch("sidepulse.status_bar_launch.sys.frozen", True, create=True):
-            plist = build_launch_agent_plist(
-                stdout_path=Path("/tmp/sidepulse.out.log"),
-                stderr_path=Path("/tmp/sidepulse.err.log"),
-            )
+            script = build_status_bar_launcher_script()
 
-        self.assertEqual(
-            plist["ProgramArguments"],
-            [sys.executable, "status-bar", "start", "--foreground"],
-        )
+        self.assertIn("status-bar start --foreground", script)
 
     def test_frozen_hook_command_uses_internal_cli(self) -> None:
         with patch("sidepulse.install.sys.frozen", True, create=True):
@@ -4015,7 +4152,10 @@ class AgentMonitorTests(unittest.TestCase):
             base = Path(tmp)
             target = base / "io.sidepulse.agentstatus.plist"
             legacy = base / "com.sidepulse.agentstatus.plist"
+            pixiepulse_legacy = base / "com.pixiepulse.agentstatus.plist"
+            launcher = base / "SidePulse Status Bar"
             legacy.write_bytes(b"old")
+            pixiepulse_legacy.write_bytes(b"old")
 
             with (
                 patch("sidepulse.status_bar_launch.default_state_dir", return_value=base / "state"),
@@ -4025,14 +4165,20 @@ class AgentMonitorTests(unittest.TestCase):
                     start=False,
                     plist_path=target,
                     legacy_plist_path=legacy,
+                    pixiepulse_legacy_plist_path=pixiepulse_legacy,
+                    launcher_path=launcher,
                     python_executable="/usr/bin/python3",
                 )
 
             self.assertTrue(result.changed)
             self.assertTrue(target.exists())
+            self.assertTrue(launcher.exists())
+            self.assertEqual(plistlib.loads(target.read_bytes())["ProgramArguments"], [str(launcher)])
             self.assertFalse(legacy.exists())
-            run.assert_called_once()
-            self.assertEqual(run.call_args.args[0][0:2], ["launchctl", "bootout"])
+            self.assertFalse(pixiepulse_legacy.exists())
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][0:2], ["launchctl", "bootout"])
+            self.assertEqual(run.call_args_list[1].args[0][0:2], ["launchctl", "bootout"])
 
     def test_sd_eject_guard_plist_shapes_for_user_and_system_scopes(self) -> None:
         for scope in ("user", "system"):

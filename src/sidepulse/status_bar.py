@@ -143,6 +143,8 @@ from .settings import (
     CLOSED_LID_AWAKE_ALWAYS,
     CLOSED_LID_AWAKE_CHOICES,
     CLOSED_LID_AWAKE_NEVER,
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
     LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
     LED_DISPLAY_CUSTOM,
@@ -215,7 +217,7 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 )
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
-STATUS_BAR_RECENT_COMPLETED_SECONDS = 20 * 60.0
+STATUS_BAR_SESSION_HISTORY_LIMIT = 10
 SCREEN_BAR_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
 STATUS_BAR_STARTUP_REPLAY_LINES = 200
@@ -607,6 +609,10 @@ class StatusBarController(NSObject):
         self.set_battery_power_preview(sender.state() == NSOnState)
 
     @objc.IBAction
+    def saveAgentListTiming_(self, _sender):
+        self.save_agent_list_timing_from_fields()
+
+    @objc.IBAction
     def setDeviceDisplayAgent_(self, sender):
         self.set_device_display(sender.representedObject(), LED_DISPLAY_AGENT)
 
@@ -689,7 +695,7 @@ class StatusBarController(NSObject):
         socket_path = default_event_socket_path()
         return LiveAgentMonitor(
             sources=(SourceSpec("event-bus", socket_path),),
-            stale_after_seconds=3600,
+            stale_after_seconds=self.settings.idle_timeout_seconds,
             latest_state_path=default_latest_state_path(),
         )
 
@@ -958,6 +964,14 @@ class StatusBarController(NSObject):
             self.settings_fields.get("open_animation_duration"),
             f"{opened.duration_seconds:g}",
         )
+        set_text_control_value(
+            self.settings_fields.get("recent_session_retention_hours"),
+            f"{self.settings.recent_session_retention_seconds / 3600:g}",
+        )
+        set_text_control_value(
+            self.settings_fields.get("idle_timeout_minutes"),
+            f"{self.settings.idle_timeout_seconds / 60:g}",
+        )
 
     def set_settings_message(self, message: str) -> None:
         set_field_value(self.settings_fields.get("message"), message)
@@ -1057,6 +1071,39 @@ class StatusBarController(NSObject):
         self.set_settings_message(
             f"{provider.title()} transcript CLI fallback {'enabled' if enabled else 'disabled'}."
         )
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def save_agent_list_timing_from_fields(self) -> None:
+        retention_text = text_control_value(
+            self.settings_fields.get("recent_session_retention_hours")
+        )
+        idle_text = text_control_value(self.settings_fields.get("idle_timeout_minutes"))
+        try:
+            retention_hours = float(retention_text) if retention_text else (
+                DEFAULT_RECENT_SESSION_RETENTION_SECONDS / 3600
+            )
+            idle_minutes = float(idle_text) if idle_text else (
+                DEFAULT_IDLE_TIMEOUT_SECONDS / 60
+            )
+        except ValueError:
+            self.set_settings_message("Agent list timing must be numeric.")
+            return
+
+        try:
+            self.settings = self.settings.with_agent_list_timing(
+                recent_session_retention_seconds=retention_hours * 3600,
+                idle_timeout_seconds=idle_minutes * 60,
+            )
+            save_settings(self.settings)
+        except Exception as exc:
+            self.set_settings_message(f"Could not save agent list timing: {exc}")
+            self.settings = load_settings()
+            self.refresh_settings_window()
+            return
+
+        self.reload_monitor()
+        self.set_settings_message("Agent list timing saved.")
         self.refresh_settings_window()
         self.refresh_(None)
 
@@ -1976,7 +2023,7 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
 
     menu.addItem_(disabled_menu_item("Agents"))
 
-    statuses = recent_statuses(snapshot)
+    statuses = recent_statuses(snapshot, target.settings)
     if not statuses:
         menu.addItem_(disabled_menu_item("No recent sessions"))
     else:
@@ -2310,6 +2357,13 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         tab_width,
         tab_height,
     )
+    behavior_tab = add_settings_tab(
+        tab_view,
+        "behavior",
+        "Behavior",
+        tab_width,
+        tab_height,
+    )
     diagnostics_tab = add_settings_tab(
         tab_view,
         "diagnostics",
@@ -2410,6 +2464,15 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     add_button(sleep_tab, "Reset", 124, 14, 90, 28, target, "resetLidOpenAnimation:")
     add_button(sleep_tab, "Save Animations", 490, 14, 146, 28, target, "saveLidAnimations:")
 
+    add_label(behavior_tab, "Agent List", 24, 398, 240, 24)
+    add_label(behavior_tab, "Keep last 10 sessions for", 32, 356, 180, 22)
+    retention_hours = add_editable_field(behavior_tab, "", 224, 354, 58, 24)
+    add_label(behavior_tab, "hours", 292, 356, 60, 22)
+    add_label(behavior_tab, "Idle timeout", 32, 316, 120, 22)
+    idle_minutes = add_editable_field(behavior_tab, "", 224, 314, 58, 24)
+    add_label(behavior_tab, "minutes", 292, 316, 80, 22)
+    add_button(behavior_tab, "Save", 32, 266, 90, 28, target, "saveAgentListTiming:")
+
     add_label(diagnostics_tab, "Debug Log", 24, 398, 240, 24)
     debug_log_status = add_label(diagnostics_tab, "", 32, 360, 588, 22)
     add_button(diagnostics_tab, "Export CSV", 32, 318, 110, 28, target, "exportDebugCsv:")
@@ -2434,6 +2497,8 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "closed_animation_duration": closed_duration,
         "open_animation_program": open_program,
         "open_animation_duration": open_duration,
+        "recent_session_retention_hours": retention_hours,
+        "idle_timeout_minutes": idle_minutes,
         "message": message,
         "settings_path": settings_path,
     }
@@ -3256,20 +3321,30 @@ def build_error_menu(exc: Exception) -> NSMenu:
     return menu
 
 
-def recent_statuses(snapshot) -> list[AgentStatus]:
-    statuses = coalesced_menu_statuses(menu_statuses(snapshot))
+def recent_statuses(
+    snapshot,
+    settings=None,
+    *,
+    limit: int = STATUS_BAR_SESSION_HISTORY_LIMIT,
+) -> list[AgentStatus]:
+    statuses = coalesced_menu_statuses(menu_statuses(snapshot, settings))
     statuses.sort(key=lambda status: (status.priority, -status.updated_at.timestamp()))
-    return statuses[:12]
+    return statuses[:limit]
 
 
-def menu_statuses(snapshot) -> tuple[AgentStatus, ...]:
+def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
     statuses = list(snapshot.statuses)
     now = snapshot.collected_at
+    retention_seconds = (
+        settings.recent_session_retention_seconds
+        if settings is not None
+        else DEFAULT_RECENT_SESSION_RETENTION_SECONDS
+    )
     statuses.extend(
         status
         for status in getattr(snapshot, "stale_statuses", ())
         if status.mode == AgentMode.COMPLETED
-        and status.age_seconds(now) <= STATUS_BAR_RECENT_COMPLETED_SECONDS
+        and status.age_seconds(now) <= retention_seconds
     )
     return tuple(statuses)
 
