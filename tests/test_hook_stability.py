@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sidepulse import hook as hook_module
+from sidepulse.cli import build_parser, build_sidepulse_parser, cmd_hook_log
 from sidepulse.hook import format_hook_payload, hook_log_main, routed_hook_payload
 from sidepulse.install import fail_open_command, hook_command
 
@@ -386,30 +387,61 @@ class EntryPointSubprocessTests(unittest.TestCase):
         record = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual("Stop", record["hook_event_name"])
 
+    # A hook config in the wild can name any of these. `sidepulse hook-log`
+    # is what older installs wrote; `agent-monitor hook-log` is what the
+    # frozen-app command writes; `python -m sidepulse` reaches whichever of
+    # the two CLIs __main__ dispatches to. All of them must log.
+    CLI_ROUTES = (
+        ["hook-log"],
+        ["agent-monitor", "hook-log"],
+    )
+
     def test_cli_hook_log_subcommand_matches_entry_point(self):
-        log_path = self.home / "cli.jsonl"
-        env = {
-            **os.environ,
-            "HOME": str(self.home),
-            "SIDEPULSE_DISABLE_EVENT_SOCKET": "1",
-        }
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "sidepulse", "hook-log",
-                "--provider", "claude", "--log", str(log_path),
-            ],
-            input=json.dumps({"hook_event_name": "Stop"}),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=env,
-            cwd=str(REPO_ROOT),
-        )
-        self.assertEqual(0, result.returncode, result.stderr)
-        self.assertTrue(log_path.exists())
-        # Catches stray debug prints at module scope, which would corrupt the
-        # hook protocol for anyone routing hooks through the CLI.
-        self.assertEqual("", result.stdout, f"CLI printed to stdout: {result.stdout!r}")
+        for index, route in enumerate(self.CLI_ROUTES):
+            with self.subTest(route=" ".join(route)):
+                log_path = self.home / f"cli-{index}.jsonl"
+                env = {
+                    **os.environ,
+                    "HOME": str(self.home),
+                    "SIDEPULSE_DISABLE_EVENT_SOCKET": "1",
+                }
+                result = subprocess.run(
+                    [
+                        sys.executable, "-m", "sidepulse", *route,
+                        "--provider", "claude", "--log", str(log_path),
+                    ],
+                    input=json.dumps({"hook_event_name": "Stop"}),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=env,
+                    cwd=str(REPO_ROOT),
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertTrue(log_path.exists())
+                # Catches stray debug prints at module scope, which would
+                # corrupt the hook protocol for anyone routing hooks through
+                # the CLI.
+                self.assertEqual(
+                    "", result.stdout, f"CLI printed to stdout: {result.stdout!r}"
+                )
+
+    def test_both_cli_parsers_accept_hook_log(self):
+        """`sidepulse` and `agent-monitor` are separate parsers.
+
+        They drifted apart once already: hook-log existed only on
+        `agent-monitor`, so `sidepulse hook-log` -- the command older installs
+        wrote into agent configs -- died with argparse exit code 2.
+        """
+        for build in (build_parser, build_sidepulse_parser):
+            for provider in PROVIDERS:
+                with self.subTest(parser=build.__name__, provider=provider):
+                    args = build().parse_args(
+                        ["hook-log", "--provider", provider, "--log", "/tmp/x.jsonl"]
+                    )
+                    self.assertEqual(provider, args.provider)
+                    self.assertEqual(Path("/tmp/x.jsonl"), args.log)
+                    self.assertIs(cmd_hook_log, args.func)
 
 
 class InstalledCommandTests(unittest.TestCase):

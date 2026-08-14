@@ -132,7 +132,18 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     add_sidepulse_status_bar_parser(subparsers)
     add_sidepulse_sdejectguard_parser(subparsers)
     add_sidepulse_battery_parser(subparsers)
+    # Agent configs written by older installs invoke `sidepulse hook-log`
+    # directly, and `python -m sidepulse` lands here too, so both CLIs must
+    # accept it.
+    add_hook_log_parser(subparsers)
     return parser
+
+
+def add_hook_log_parser(subparsers: argparse._SubParsersAction) -> None:
+    hook_log = subparsers.add_parser("hook-log", help="Internal hook logging entry point.")
+    hook_log.add_argument("--provider", choices=HOOK_PROVIDERS, required=True)
+    hook_log.add_argument("--log", type=Path, required=True)
+    hook_log.set_defaults(func=cmd_hook_log)
 
 
 def add_sidepulse_status_bar_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -645,10 +656,7 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
     uninstall.add_argument("--dry-run", action="store_true", help="Show what would change.")
     uninstall.set_defaults(func=cmd_uninstall)
 
-    hook_log = subparsers.add_parser("hook-log", help="Internal hook logging entry point.")
-    hook_log.add_argument("--provider", choices=HOOK_PROVIDERS, required=True)
-    hook_log.add_argument("--log", type=Path, required=True)
-    hook_log.set_defaults(func=cmd_hook_log)
+    add_hook_log_parser(subparsers)
 
     return parser
 
