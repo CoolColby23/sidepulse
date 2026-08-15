@@ -524,12 +524,14 @@ def cursor_hook_command(
     )
 
 
-def remove_cursor_hook_entries(entries: list[Any]) -> list[dict[str, Any]]:
+def remove_cursor_hook_entries(entries: list[Any]) -> list[Any]:
     return [
         entry
         for entry in entries
-        if isinstance(entry, dict)
-        and "sidepulse.cursor_hook" not in str(entry.get("command") or "")
+        if not (
+            isinstance(entry, dict)
+            and "sidepulse.cursor_hook" in str(entry.get("command") or "")
+        )
     ]
 
 

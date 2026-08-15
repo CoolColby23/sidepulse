@@ -70,6 +70,19 @@ class CursorProviderTests(unittest.TestCase):
                 )
             )
 
+    def test_installer_preserves_unknown_hook_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "hooks.json"
+            log = root / "cursor.jsonl"
+            config.write_text(
+                json.dumps({"version": 1, "hooks": {"stop": ["future-hook"]}})
+            )
+
+            install_cursor_hooks(config_path=config, log_path=log)
+
+            self.assertIn("future-hook", json.loads(config.read_text())["hooks"]["stop"])
+
     def test_prompt_and_stop_map_to_working_then_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "cursor.jsonl"
@@ -105,6 +118,29 @@ class CursorProviderTests(unittest.TestCase):
         )
         self.assertEqual(normalized["hook_event_name"], "PreToolUse")
         self.assertEqual(normalized["tool_name"], "shell")
+
+    def test_generic_tool_hooks_map_to_activity_and_failure(self) -> None:
+        before = normalize_payload(
+            "preToolUse",
+            {
+                "conversation_id": "cursor-conversation",
+                "tool_name": "read_file",
+                "tool_input": {"path": "README.md"},
+            },
+        )
+        failed = normalize_payload(
+            "postToolUseFailure",
+            {
+                "conversation_id": "cursor-conversation",
+                "tool_name": "read_file",
+                "error_message": "permission denied",
+            },
+        )
+
+        self.assertEqual(before["hook_event_name"], "PreToolUse")
+        self.assertEqual(before["tool_name"], "read_file")
+        self.assertEqual(failed["hook_event_name"], "StopFailure")
+        self.assertEqual(failed["message"], "permission denied")
 
 
 if __name__ == "__main__":

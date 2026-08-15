@@ -14,11 +14,14 @@ from .ipc import send_hook_event
 
 EVENT_ALIASES = {
     "sessionStart": "SessionStart",
+    "sessionEnd": "SessionEnd",
     "beforeSubmitPrompt": "UserPromptSubmit",
+    "preToolUse": "PreToolUse",
     "beforeShellExecution": "PreToolUse",
     "afterShellExecution": "PostToolUse",
     "afterFileEdit": "PostToolUse",
     "postToolUse": "PostToolUse",
+    "postToolUseFailure": "StopFailure",
     "stop": "Stop",
 }
 
@@ -44,15 +47,26 @@ def normalize_payload(event_name: str, payload: dict[str, Any]) -> dict[str, Any
     if isinstance(prompt, str):
         normalized["prompt"] = prompt
 
-    if event_name == "beforeShellExecution":
-        normalized["tool_name"] = "shell"
-        normalized["tool_input"] = {"command": payload.get("command")}
-    elif event_name in {"afterShellExecution", "afterFileEdit", "postToolUse"}:
+    if event_name in {"beforeShellExecution", "preToolUse"}:
+        normalized["tool_name"] = str(payload.get("tool_name") or "shell")
+        normalized["tool_input"] = payload.get("tool_input") or {
+            "command": payload.get("command")
+        }
+    elif event_name in {
+        "afterShellExecution",
+        "afterFileEdit",
+        "postToolUse",
+        "postToolUseFailure",
+    }:
         normalized["tool_name"] = str(payload.get("tool_name") or event_name)
         normalized["tool_response"] = {
             "status": payload.get("status"),
             "exit_code": payload.get("exit_code"),
+            "error": payload.get("error_message"),
         }
+
+    if event_name == "postToolUseFailure" and payload.get("error_message"):
+        normalized["message"] = str(payload["error_message"])
 
     status = payload.get("status")
     if event_name == "stop" and isinstance(status, str):

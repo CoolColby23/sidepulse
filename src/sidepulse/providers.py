@@ -63,11 +63,14 @@ GROK_EVENTS = (
 
 CURSOR_EVENTS = (
     "sessionStart",
+    "sessionEnd",
     "beforeSubmitPrompt",
+    "preToolUse",
     "beforeShellExecution",
     "afterShellExecution",
     "afterFileEdit",
     "postToolUse",
+    "postToolUseFailure",
     "stop",
 )
 
