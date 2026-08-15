@@ -31,6 +31,7 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
     "pyobjc-framework-WebKit>=10; sys_platform == 'darwin'",
+    "pyobjc-framework-ScriptingBridge>=10; sys_platform == 'darwin'",
 ]
 
 [project.urls]
@@ -43,6 +44,11 @@ Issues = "https://github.com/inteliwear/sidepulse/issues"
 # default now, so this extra is a no-op alias.
 status-bar = []
 reply-classifier = ["mlx-lm>=0.24,<1"]
+test = [
+    "pytest>=7",
+    # tests/test_packaging.py reads pyproject.toml; tomllib is 3.11+.
+    "tomli>=2; python_version < '3.11'",
+]
 
 [project.scripts]
 sidepulse = "sidepulse.cli:sidepulse_main"
@@ -52,7 +58,7 @@ sidepulse-reply = "sidepulse.reply_classifier:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["sidepulse*"]
+include = ["sidepulse*", "agent_monitor*", "sidepulse_cli*"]
 
 [tool.setuptools.package-data]
 "sidepulse.resources" = ["sd_eject_guard.c", "sdled.wasm"]

@@ -106,8 +106,19 @@ from sidepulse.settings import (
     CLOSED_LID_AWAKE_AGENTS,
     CLOSED_LID_AWAKE_ALWAYS,
     CLOSED_LID_AWAKE_NEVER,
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
+    LED_DISPLAY_CUSTOM,
+    TERMINAL_APP_ALACRITTY,
+    TERMINAL_APP_CUSTOM,
+    TERMINAL_APP_GHOSTTY,
+    TERMINAL_APP_ITERM,
+    TERMINAL_APP_KITTY,
+    TERMINAL_APP_TERMINAL,
+    TERMINAL_APP_WARP,
+    TERMINAL_APP_WEZTERM,
     AgentMonitorSettings,
     DeviceDisplaySetting,
     default_config_dir,
@@ -118,7 +129,9 @@ from sidepulse.settings import (
 )
 from sidepulse.status_bar_launch import (
     LAUNCH_AGENT_LABEL,
+    STATUS_BAR_DISPLAY_NAME,
     build_launch_agent_plist,
+    build_status_bar_launcher_script,
     install_launch_agent,
     launch_agent_installed,
 )
@@ -898,6 +911,269 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(by_title["Resume in Terminal"].state(), 1)
         self.assertEqual(by_title["Open in VS Code"].state(), 0)
 
+    def test_status_bar_recent_statuses_keeps_distinct_sessions_with_same_title(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        older = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:019ffd2e-2060-7ff2-842f-761cb458ccf4",
+            display_name="msdosfs: What is here (019ffd2e)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=20),
+            event_name="Stop",
+            session_id="019ffd2e-2060-7ff2-842f-761cb458ccf4",
+            cwd="/Users/pero/temp/msdosfs",
+            origin="Grok CLI",
+        )
+        newer = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:019ffd37-1458-7d92-b077-3d0f92aedde4",
+            display_name="msdosfs: What is here (019ffd37)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=4),
+            event_name="Stop",
+            session_id="019ffd37-1458-7d92-b077-3d0f92aedde4",
+            cwd="/Users/pero/temp/msdosfs",
+            origin="Grok CLI",
+        )
+        different_folder = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:other",
+            display_name="other: What is here (019ffd99)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=2),
+            event_name="Stop",
+            session_id="019ffd99-0000-0000-0000-000000000000",
+            cwd="/Users/pero/temp/other",
+            origin="Grok CLI",
+        )
+        snapshot = MonitorSnapshot(
+            aggregate=AggregateStatus(AgentMode.COMPLETED, 0, 0, newer),
+            statuses=(older, newer, different_folder),
+            stale_statuses=(),
+            sources=(),
+            collected_at=now,
+        )
+
+        statuses = status_bar.recent_statuses(snapshot)
+
+        self.assertEqual(
+            [status.agent_id for status in statuses],
+            [
+                "grok:session:other",
+                "grok:session:019ffd37-1458-7d92-b077-3d0f92aedde4",
+                "grok:session:019ffd2e-2060-7ff2-842f-761cb458ccf4",
+            ],
+        )
+
+    def test_status_bar_disambiguates_same_visible_session_titles(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        older = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:019ffd2e-2060-7ff2-842f-761cb458ccf4",
+            display_name="msdosfs: What is here (019ffd2e)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=20),
+            event_name="Stop",
+            session_id="019ffd2e-2060-7ff2-842f-761cb458ccf4",
+            cwd="/Users/pero/temp/msdosfs",
+            origin="Grok CLI",
+        )
+        newer = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:019ffd37-1458-7d92-b077-3d0f92aedde4",
+            display_name="msdosfs: What is here (019ffd37)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=4),
+            event_name="Stop",
+            session_id="019ffd37-1458-7d92-b077-3d0f92aedde4",
+            cwd="/Users/pero/temp/msdosfs",
+            origin="Grok CLI",
+        )
+        snapshot = MonitorSnapshot(
+            aggregate=AggregateStatus(AgentMode.COMPLETED, 0, 0, newer),
+            statuses=(older, newer),
+            stale_statuses=(),
+            sources=(),
+            collected_at=now,
+        )
+        target = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            closed_lid_awake=SimpleNamespace(last_error=None),
+            status_bar_devices=lambda: [],
+        )
+
+        menu = status_bar.build_menu(snapshot, status_bar.STATE_DONE, target)
+        titles = [
+            menu.itemAtIndex_(index).title()
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title()
+        ]
+
+        self.assertIn("What is here (019ffd37)  msdosfs", titles)
+        self.assertIn("What is here (019ffd2e)  msdosfs", titles)
+
+    def test_status_bar_recent_statuses_coalesce_subagents_by_session(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        session_id = "f9ccc24e-3dad-4607-95e6-4142428a93cc"
+        main = AgentStatus(
+            provider="claude",
+            agent_id=f"claude:session:{session_id}",
+            display_name=f"peterkuhar.com: so all good? ({session_id[:8]})",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=40),
+            event_name="SessionEnd",
+            session_id=session_id,
+            cwd="/Users/pero/pgit/peterkuhar.com",
+            origin="Claude Code CLI",
+        )
+        subagent = AgentStatus(
+            provider="claude",
+            agent_id="claude:agent:ac7f1721ec697b403",
+            display_name="peterkuhar.com: what is this repo about? (agent ac7f1721)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=4),
+            event_name="SubagentStop",
+            session_id=session_id,
+            cwd="/Users/pero/pgit/peterkuhar.com",
+            origin="Claude Code CLI",
+        )
+        snapshot = MonitorSnapshot(
+            aggregate=AggregateStatus(AgentMode.COMPLETED, 0, 0, subagent),
+            statuses=(main, subagent),
+            stale_statuses=(),
+            sources=(),
+            collected_at=now,
+        )
+
+        statuses = status_bar.recent_statuses(snapshot)
+
+        self.assertEqual([status.agent_id for status in statuses], [main.agent_id])
+
+    def test_status_bar_recent_statuses_include_recent_done_while_active(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        working = AgentStatus(
+            provider="codex",
+            agent_id="codex:session:working",
+            display_name="project: Working session (working)",
+            mode=AgentMode.TOOL_RUNNING,
+            updated_at=now,
+            event_name="PreToolUse",
+            session_id="working",
+            cwd="/Users/pero/pgit/project",
+        )
+        recent_done = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:recent-done",
+            display_name="other: Recent done (recent-d)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(minutes=8),
+            event_name="Stop",
+            session_id="recent-done",
+            cwd="/Users/pero/pgit/other",
+            stale=True,
+        )
+        old_done = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:old-done",
+            display_name="old: Old done (old-done)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(hours=49),
+            event_name="Stop",
+            session_id="old-done",
+            cwd="/Users/pero/pgit/old",
+            stale=True,
+        )
+        snapshot = MonitorSnapshot(
+            aggregate=AggregateStatus(AgentMode.TOOL_RUNNING, 1, 2, working),
+            statuses=(working,),
+            stale_statuses=(recent_done, old_done),
+            sources=(),
+            collected_at=now,
+        )
+
+        statuses = status_bar.recent_statuses(snapshot)
+
+        self.assertEqual(
+            [status.session_id for status in statuses],
+            ["working", "recent-done"],
+        )
+
+    def test_status_bar_recent_statuses_keeps_last_ten_within_retention(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        stale_done = tuple(
+            AgentStatus(
+                provider="codex",
+                agent_id=f"codex:session:done-{index}",
+                display_name=f"project: Done {index} (done-{index})",
+                mode=AgentMode.COMPLETED,
+                updated_at=now - timedelta(hours=index),
+                event_name="Stop",
+                session_id=f"done-{index}",
+                cwd="/Users/pero/pgit/project",
+                stale=True,
+            )
+            for index in range(1, 13)
+        )
+        too_old = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:too-old",
+            display_name="old: Too old (too-old)",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(hours=50),
+            event_name="Stop",
+            session_id="too-old",
+            cwd="/Users/pero/pgit/old",
+            stale=True,
+        )
+        snapshot = MonitorSnapshot(
+            aggregate=AggregateStatus(AgentMode.IDLE_READY, 0, 13, None),
+            statuses=(),
+            stale_statuses=(*stale_done, too_old),
+            sources=(),
+            collected_at=now,
+        )
+
+        statuses = status_bar.recent_statuses(
+            snapshot,
+            AgentMonitorSettings(recent_session_retention_seconds=48 * 60 * 60),
+        )
+
+        self.assertEqual(len(statuses), 10)
+        self.assertEqual(statuses[0].session_id, "done-1")
+        self.assertEqual(statuses[-1].session_id, "done-10")
+        self.assertNotIn("too-old", [status.session_id for status in statuses])
+
+        shorter = status_bar.recent_statuses(
+            snapshot,
+            AgentMonitorSettings(recent_session_retention_seconds=2.5 * 60 * 60),
+        )
+        self.assertEqual([status.session_id for status in shorter], ["done-1", "done-2"])
+
     def test_codex_session_options_are_codex_specific(self) -> None:
         try:
             from sidepulse import status_bar
@@ -934,6 +1210,62 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertNotIn("Open in VS Code", titles)
         self.assertNotIn("Open Claude App", titles)
 
+    def test_grok_default_terminal_opener_uses_resume_terminal_setting(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        status = AgentStatus(
+            provider="grok",
+            agent_id="grok:session:abc",
+            display_name="Grok abc",
+            mode=AgentMode.WORKING,
+            updated_at=now,
+            event_name="PreToolUse",
+            session_id="grok-session",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+        )
+        settings = AgentMonitorSettings().with_session_terminal(TERMINAL_APP_GHOSTTY)
+        target = SimpleNamespace(settings=settings)
+
+        self.assertEqual(
+            status_bar.provider_open_action_label("grok", SESSION_OPEN_TERMINAL, settings),
+            "Resume in Terminal",
+        )
+        self.assertEqual(
+            status_bar.session_open_action_title(status, SESSION_OPEN_TERMINAL, settings),
+            "Resume in Ghostty",
+        )
+        options = status_bar.build_session_options_menu(status, now, target)
+        titles = [
+            options.itemAtIndex_(index).title()
+            for index in range(options.numberOfItems())
+            if options.itemAtIndex_(index).title()
+        ]
+
+        self.assertIn("Resume in Ghostty", titles)
+
+        fake = SimpleNamespace(
+            settings=settings,
+            set_settings_message=lambda message: None,
+        )
+        with patch("sidepulse.status_bar.open_terminal_command") as open_terminal:
+            status_bar.StatusBarController.open_session(
+                fake,
+                status,
+                None,
+                remember=False,
+            )
+
+        open_terminal.assert_called_once_with(
+            "cd /Users/pero/pgit/sdstatus_bitbang && grok --resume grok-session",
+            terminal_app=TERMINAL_APP_GHOSTTY,
+            custom_terminal_path="",
+            session_hints=status_bar.terminal_session_hints(status),
+        )
+
     def test_status_bar_device_submenu_has_brightness_slider(self) -> None:
         try:
             from sidepulse import status_bar
@@ -964,7 +1296,93 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         self.assertIn("Brightness 50%", titles)
+        self.assertIn("Agent Status", titles)
+        self.assertIn("Battery Level", titles)
+        self.assertIn("Manual", titles)
         self.assertEqual(custom_view_count, 1)
+
+        custom_device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulseDot",
+            name="SidePulse Dot",
+            root=Path("/Volumes/SidePulseDot"),
+            target=Path("/Volumes/SidePulseDot/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_CUSTOM,
+            brightness=128,
+        )
+        custom_item = status_bar.build_device_menu_item(custom_device, SimpleNamespace())
+        custom_submenu = custom_item.submenu()
+        by_title = {
+            custom_submenu.itemAtIndex_(index).title(): custom_submenu.itemAtIndex_(index)
+            for index in range(custom_submenu.numberOfItems())
+            if custom_submenu.itemAtIndex_(index).title()
+        }
+
+        self.assertEqual(by_title["Manual"].state(), 1)
+
+    def test_status_bar_screen_bar_remove_lives_in_screen_bar_submenu(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.VIRTUAL_DEVICE_ID,
+            name="Screen Bar",
+            root=Path(status_bar.VIRTUAL_DEVICE_ID),
+            target=Path(status_bar.VIRTUAL_DEVICE_ID),
+            connected=True,
+            display="agent",
+            brightness=255,
+        )
+        snapshot = SimpleNamespace(
+            statuses=[],
+            collected_at=datetime.now(timezone.utc),
+        )
+        target = SimpleNamespace(
+            settings=AgentMonitorSettings(virtual_status_device_enabled=True),
+            closed_lid_awake=SimpleNamespace(last_error=None),
+            status_bar_devices=lambda: [device],
+        )
+
+        menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        titles = [
+            menu.itemAtIndex_(index).title()
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title()
+        ]
+        screen_bar_item = next(
+            menu.itemAtIndex_(index)
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title() == "Screen Bar"
+        )
+        submenu = screen_bar_item.submenu()
+        submenu_titles = [
+            submenu.itemAtIndex_(index).title()
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).title()
+        ]
+        submenu_view_count = sum(
+            1
+            for index in range(submenu.numberOfItems())
+            if submenu.itemAtIndex_(index).view() is not None
+        )
+
+        self.assertNotIn("Remove Screen Bar", titles)
+        self.assertIn("Remove Screen Bar", submenu_titles)
+        self.assertNotIn("Brightness 100%", submenu_titles)
+        self.assertEqual(submenu_view_count, 0)
+
+        target.settings = AgentMonitorSettings(virtual_status_device_enabled=False)
+        target.status_bar_devices = lambda: []
+        menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        titles = [
+            menu.itemAtIndex_(index).title()
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title()
+        ]
+
+        self.assertIn("Add Screen Bar", titles)
 
     def test_status_bar_observe_connected_device_resets_on_new_mount(self) -> None:
         try:
@@ -1016,6 +1434,94 @@ class AgentMonitorTests(unittest.TestCase):
         status_bar.StatusBarController.poll_devices_once(target)
 
         self.assertEqual(calls, [None])
+
+    def test_status_bar_sync_skips_custom_device_display(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulseDot",
+            name="SidePulse Dot",
+            root=Path("/Volumes/SidePulseDot"),
+            target=Path("/Volumes/SidePulseDot/LEDS.LED"),
+            connected=True,
+            display=LED_DISPLAY_CUSTOM,
+            brightness=128,
+        )
+        fake = SimpleNamespace(
+            status_bar_devices=lambda remember=True: [device],
+            ensure_device_selection=lambda: None,
+            last_led_error="old",
+            device_errors={device.device_id: "old"},
+            last_led_display_kind_by_device={},
+            reset_led_controllers_for_device=lambda device_id: None,
+            active_led_display_kind_for_device=lambda _device, _battery: LED_DISPLAY_CUSTOM,
+            agent_controller_for_device=lambda _device: self.fail("agent LEDs should not sync"),
+            battery_controller_for_device=lambda _device: self.fail("battery LEDs should not sync"),
+        )
+
+        status_bar.StatusBarController.sync_leds_now(
+            fake,
+            AgentMode.WORKING,
+            None,
+            LED_DISPLAY_CUSTOM,
+        )
+
+        self.assertIsNone(fake.last_led_error)
+        self.assertNotIn(device.device_id, fake.device_errors)
+        self.assertEqual(
+            fake.last_led_display_kind_by_device[device.device_id],
+            LED_DISPLAY_CUSTOM,
+        )
+
+    def test_status_bar_manual_device_display_clears_leds(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        device = status_bar.StatusBarDevice(
+            device_id="/Volumes/SidePulseDot",
+            name="SidePulse Dot",
+            root=Path("/Volumes/SidePulseDot"),
+            target=Path("/Volumes/SidePulseDot/LEDS.LED"),
+            connected=True,
+            display="agent",
+            brightness=128,
+        )
+        messages: list[str] = []
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            status_bar_devices=lambda remember=False: [device],
+            reset_led_controllers_for_device=lambda device_id: None,
+            set_settings_message=messages.append,
+            refresh_settings_window=lambda: None,
+            refresh_=lambda sender: None,
+            device_errors={},
+            last_led_error=None,
+        )
+        fake.clear_manual_device_display = lambda item: (
+            status_bar.StatusBarController.clear_manual_device_display(fake, item)
+        )
+
+        with (
+            patch("sidepulse.status_bar.save_settings"),
+            patch(
+                "sidepulse.status_bar.write_led_program",
+                return_value=device.target,
+            ) as write,
+        ):
+            status_bar.StatusBarController.set_device_display(
+                fake,
+                device.device_id,
+                LED_DISPLAY_CUSTOM,
+            )
+
+        write.assert_called_once_with("off", device_path=device.target)
+        self.assertEqual(fake.settings.display_for_device(device.device_id), LED_DISPLAY_CUSTOM)
+        self.assertEqual(messages[-1], "SidePulse Dot: Manual, LEDs cleared.")
 
     def test_status_bar_menu_has_closed_lid_awake_policy_choices(self) -> None:
         try:
@@ -1103,13 +1609,48 @@ class AgentMonitorTests(unittest.TestCase):
 
         window = status_bar.build_settings_window(target)
 
-        self.assertEqual(window.title(), "SidePulse Agent Monitor Settings")
+        self.assertEqual(window.title(), "SidePulse Settings")
+        tab_views = [
+            view
+            for view in window.contentView().subviews()
+            if hasattr(view, "numberOfTabViewItems")
+        ]
+        self.assertEqual(len(tab_views), 1)
+        self.assertEqual(tab_views[0].numberOfTabViewItems(), 5)
         self.assertIn("debug_log_status", target.settings_fields)
+        self.assertIn("session_terminal", target.settings_fields)
+        self.assertIn("custom_terminal_path", target.settings_fields)
+        self.assertIn("recent_session_retention_hours", target.settings_fields)
+        self.assertIn("idle_timeout_minutes", target.settings_fields)
         self.assertIn("closed_animation_program", target.settings_fields)
         self.assertIn("closed_animation_duration", target.settings_fields)
         self.assertIn("open_animation_program", target.settings_fields)
         self.assertIn("open_animation_duration", target.settings_fields)
         self.assertNotIn("closed_lid_system_override", target.settings_buttons)
+
+    def test_status_bar_monitor_uses_idle_timeout_setting(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = SimpleNamespace(
+                settings=AgentMonitorSettings(idle_timeout_seconds=1234)
+            )
+            with (
+                patch(
+                    "sidepulse.status_bar.default_event_socket_path",
+                    return_value=Path(tmp) / "events.sock",
+                ),
+                patch(
+                    "sidepulse.status_bar.default_latest_state_path",
+                    return_value=Path(tmp) / "latest.json",
+                ),
+            ):
+                monitor = status_bar.StatusBarController.build_monitor(fake)
+
+        self.assertEqual(monitor.stale_after_seconds, 1234)
 
     def test_status_bar_setup_window_has_first_launch_controls(self) -> None:
         try:
@@ -1163,6 +1704,655 @@ class AgentMonitorTests(unittest.TestCase):
             popen.assert_called_once()
             self.assertEqual(popen.call_args.args[0][0], "/usr/bin/open")
 
+    def test_status_bar_open_terminal_command_uses_selected_terminal(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with patch("sidepulse.status_bar.subprocess.Popen") as popen:
+            status_bar.open_terminal_command("echo hello")
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "Terminal"', args[2])
+
+        with (
+            patch("sidepulse.status_bar.terminal_app_installed", return_value=True),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_ITERM,
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "iTerm"', args[2])
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/Ghostty.app"),
+            ),
+            patch("sidepulse.status_bar.open_ghostty_command") as open_ghostty,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_GHOSTTY,
+            )
+        open_ghostty.assert_called_once_with("echo hello", None)
+
+        with (
+            patch("sidepulse.status_bar.terminal_app_installed", return_value=False),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_GHOSTTY,
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "Terminal"', args[2])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            with (
+                patch("sidepulse.status_bar.default_state_dir", return_value=state_dir),
+                patch(
+                    "sidepulse.status_bar.installed_terminal_app_path",
+                    return_value=Path("/Applications/Warp.app"),
+                ),
+                patch("sidepulse.status_bar.subprocess.Popen") as popen,
+            ):
+                status_bar.open_terminal_command(
+                    "echo hello",
+                    terminal_app=TERMINAL_APP_WARP,
+                )
+            script = state_dir / "resume-session.command"
+            self.assertIn("echo hello", script.read_text())
+            self.assertEqual(
+                popen.call_args.args[0],
+                ["/usr/bin/open", "-a", "/Applications/Warp.app", str(script)],
+            )
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/Kitty.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_KITTY,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/Kitty.app",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/WezTerm.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_WEZTERM,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/WezTerm.app",
+                "--args",
+                "start",
+                "--new-tab",
+                "--",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.installed_terminal_app_path",
+                return_value=Path("/Applications/Alacritty.app"),
+            ),
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_ALACRITTY,
+            )
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "/usr/bin/open",
+                "-n",
+                "/Applications/Alacritty.app",
+                "--args",
+                "-e",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_app = Path(tmp) / "WezTerm.app"
+            custom_app.mkdir()
+            with patch("sidepulse.status_bar.subprocess.Popen") as popen:
+                status_bar.open_terminal_command(
+                    "echo hello",
+                    terminal_app=TERMINAL_APP_CUSTOM,
+                    custom_terminal_path=str(custom_app),
+                )
+            call_args = popen.call_args.args[0]
+        self.assertEqual(
+            call_args,
+            [
+                "/usr/bin/open",
+                "-n",
+                str(custom_app),
+                "--args",
+                "start",
+                "--new-tab",
+                "--",
+                "/bin/zsh",
+                "-lc",
+                "echo hello",
+            ],
+        )
+
+        with patch("sidepulse.status_bar.subprocess.Popen") as popen:
+            status_bar.open_terminal_command(
+                "echo hello",
+                terminal_app=TERMINAL_APP_CUSTOM,
+                custom_terminal_path="/Applications/Missing.app",
+            )
+        args = popen.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn('tell application "Terminal"', args[2])
+
+    def test_status_bar_resume_terminal_focuses_existing_terminal_session(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        hints = status_bar.TerminalSessionHints(
+            provider="codex",
+            session_id="019ee395-2f64-7cc3-b566-afcc1d626160",
+            cwd="/Users/pero/pgit/pixiepulse-bridge",
+            title="Codex Refine README agent status modes pixiepulse-bridge",
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["/usr/bin/osascript"],
+                    0,
+                    stdout="1\n",
+                ),
+            ) as run,
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "cd /Users/pero/pgit/pixiepulse-bridge && codex resume 019ee395-2f64-7cc3-b566-afcc1d626160",
+                session_hints=hints,
+            )
+
+        script = run.call_args.args[0][2]
+        self.assertIn('tell application "Terminal"', script)
+        self.assertIn("019ee395-2f64-7cc3-b566-afcc1d626160", script)
+        self.assertIn("selected tab of windowRef", script)
+        popen.assert_not_called()
+
+    def test_status_bar_resume_terminal_falls_back_with_session_title(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        hints = status_bar.TerminalSessionHints(
+            provider="grok",
+            session_id="grok-session",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+            title="Grok all good sdstatus_bitbang",
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["/usr/bin/osascript"],
+                    0,
+                    stdout="0\n",
+                ),
+            ) as run,
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "cd /Users/pero/pgit/sdstatus_bitbang && grok --resume grok-session",
+                session_hints=hints,
+            )
+
+        script = run.call_args.args[0][2]
+        self.assertIn("grok-session", script)
+        launch_script = popen.call_args.args[0][2]
+        self.assertIn("SidePulse Grok all good sdstatus_bitbang (grok-ses)", launch_script)
+        self.assertIn("grok --resume grok-session", launch_script)
+
+    def test_status_bar_resume_iterm_focuses_existing_session(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        hints = status_bar.TerminalSessionHints(
+            provider="claude",
+            session_id="claude-session",
+            cwd="/Users/pero/pgit/app",
+            title="Claude app",
+        )
+
+        with (
+            patch(
+                "sidepulse.status_bar.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    ["/usr/bin/osascript"],
+                    0,
+                    stdout="1\n",
+                ),
+            ) as run,
+            patch("sidepulse.status_bar.subprocess.Popen") as popen,
+        ):
+            status_bar.open_terminal_command(
+                "cd /Users/pero/pgit/app && claude --resume claude-session",
+                terminal_app=TERMINAL_APP_ITERM,
+                session_hints=hints,
+            )
+
+        script = run.call_args.args[0][2]
+        self.assertIn('tell application "iTerm"', script)
+        self.assertIn("select tabRef", script)
+        popen.assert_not_called()
+
+    def test_status_bar_resume_ghostty_focuses_existing_surface(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        class FakeTerminal:
+            def __init__(self) -> None:
+                self.focused = False
+
+            def name(self):
+                return "SidePulse Grok all good sdstatus_bitbang (grok-ses)"
+
+            def workingDirectory(self):
+                return "/Users/pero/pgit/sdstatus_bitbang"
+
+            def focus(self):
+                self.focused = True
+
+        class FakeTab:
+            def __init__(self, terminal) -> None:
+                self.terminal = terminal
+                self.selected = False
+
+            def name(self):
+                return "grok"
+
+            def terminals(self):
+                return [self.terminal]
+
+            def selectTab(self):
+                self.selected = True
+
+        class FakeWindow:
+            def __init__(self, tab) -> None:
+                self.tab = tab
+                self.activated = False
+
+            def name(self):
+                return "Ghostty"
+
+            def tabs(self):
+                return [self.tab]
+
+            def activateWindow(self):
+                self.activated = True
+
+        class FakeGhostty:
+            def __init__(self, window) -> None:
+                self.window = window
+                self.activated = False
+
+            def isRunning(self):
+                return True
+
+            def windows(self):
+                return [self.window]
+
+            def activate(self):
+                self.activated = True
+
+        terminal = FakeTerminal()
+        tab = FakeTab(terminal)
+        window = FakeWindow(tab)
+        app = FakeGhostty(window)
+        hints = status_bar.TerminalSessionHints(
+            provider="grok",
+            session_id="grok-session",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+            title="Grok all good sdstatus_bitbang",
+        )
+
+        with patch("sidepulse.status_bar.ghostty_application", return_value=app):
+            self.assertTrue(status_bar.focus_ghostty_session(hints))
+
+        self.assertTrue(tab.selected)
+        self.assertTrue(terminal.focused)
+        self.assertTrue(window.activated)
+        self.assertTrue(app.activated)
+
+    def test_status_bar_resume_ghostty_focuses_unique_bare_grok_title(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        class FakeTerminal:
+            def __init__(self, name: str) -> None:
+                self._name = name
+                self.focused = False
+
+            def name(self):
+                return self._name
+
+            def workingDirectory(self):
+                return "/Users/pero/temp/msdosfs"
+
+            def focus(self):
+                self.focused = True
+
+        class FakeTab:
+            def __init__(self, terminal) -> None:
+                self.terminal = terminal
+                self.selected = False
+
+            def name(self):
+                return self.terminal.name()
+
+            def terminals(self):
+                return [self.terminal]
+
+            def selectTab(self):
+                self.selected = True
+
+        class FakeWindow:
+            def __init__(self, tab) -> None:
+                self.tab = tab
+                self.activated = False
+
+            def name(self):
+                return "Ghostty"
+
+            def tabs(self):
+                return [self.tab]
+
+            def activateWindow(self):
+                self.activated = True
+
+        class FakeGhostty:
+            def __init__(self, windows) -> None:
+                self._windows = windows
+                self.activated = False
+
+            def isRunning(self):
+                return True
+
+            def windows(self):
+                return self._windows
+
+            def activate(self):
+                self.activated = True
+
+        wrong_terminal = FakeTerminal("plain shell")
+        right_terminal = FakeTerminal("✳ Identify unknown code or concept")
+        wrong_window = FakeWindow(FakeTab(wrong_terminal))
+        right_window = FakeWindow(FakeTab(right_terminal))
+        app = FakeGhostty([wrong_window, right_window])
+        hints = status_bar.TerminalSessionHints(
+            provider="grok",
+            session_id="grok-session",
+            cwd="/Users/pero/temp/msdosfs",
+            title="Grok Identify unknown code or concept msdosfs",
+            match_title="Identify unknown code or concept",
+        )
+
+        with patch("sidepulse.status_bar.ghostty_application", return_value=app):
+            self.assertTrue(status_bar.focus_ghostty_session(hints))
+
+        self.assertFalse(wrong_terminal.focused)
+        self.assertFalse(wrong_window.activated)
+        self.assertTrue(right_terminal.focused)
+        self.assertTrue(right_window.activated)
+
+    def test_status_bar_resume_ghostty_ignores_same_cwd_without_session_marker(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        class FakeTerminal:
+            def __init__(self, name: str) -> None:
+                self._name = name
+                self.focused = False
+
+            def name(self):
+                return self._name
+
+            def workingDirectory(self):
+                return "/Users/pero/pgit/sdstatus_bitbang"
+
+            def focus(self):
+                self.focused = True
+
+        class FakeTab:
+            def __init__(self, terminal) -> None:
+                self.terminal = terminal
+                self.selected = False
+
+            def name(self):
+                return self.terminal.name()
+
+            def terminals(self):
+                return [self.terminal]
+
+            def selectTab(self):
+                self.selected = True
+
+        class FakeWindow:
+            def __init__(self, tab) -> None:
+                self.tab = tab
+                self.activated = False
+
+            def name(self):
+                return "Ghostty"
+
+            def tabs(self):
+                return [self.tab]
+
+            def activateWindow(self):
+                self.activated = True
+
+        class FakeGhostty:
+            def __init__(self, windows) -> None:
+                self._windows = windows
+                self.activated = False
+
+            def isRunning(self):
+                return True
+
+            def windows(self):
+                return self._windows
+
+            def activate(self):
+                self.activated = True
+
+        wrong_terminal = FakeTerminal("plain shell")
+        right_terminal = FakeTerminal("SidePulse Grok all good sdstatus_bitbang (grok-ses)")
+        wrong_window = FakeWindow(FakeTab(wrong_terminal))
+        right_window = FakeWindow(FakeTab(right_terminal))
+        app = FakeGhostty([wrong_window, right_window])
+        hints = status_bar.TerminalSessionHints(
+            provider="grok",
+            session_id="grok-session",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+            title="Grok all good sdstatus_bitbang",
+        )
+
+        with patch("sidepulse.status_bar.ghostty_application", return_value=app):
+            self.assertTrue(status_bar.focus_ghostty_session(hints))
+
+        self.assertFalse(wrong_terminal.focused)
+        self.assertFalse(wrong_window.activated)
+        self.assertTrue(right_terminal.focused)
+        self.assertTrue(right_window.activated)
+
+    def test_status_bar_resume_ghostty_falls_back_to_new_window(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        class FakeWindow:
+            pass
+
+        class FakeGhostty:
+            def __init__(self) -> None:
+                self.window = FakeWindow()
+                self.config = None
+                self.new_tab_window = None
+                self.new_window_config = None
+                self.activated = False
+
+            def isRunning(self):
+                return True
+
+            def frontWindow(self):
+                return self.window
+
+            def newSurfaceConfigurationFrom_(self, config):
+                self.config = config
+                return config
+
+            def newTabIn_withConfiguration_(self, window, config):
+                self.new_tab_window = window
+                self.config = config
+
+            def newWindowWithConfiguration_(self, config):
+                self.new_window_config = config
+                self.config = config
+
+            def activate(self):
+                self.activated = True
+
+        app = FakeGhostty()
+        hints = status_bar.TerminalSessionHints(
+            provider="grok",
+            session_id="grok-session",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+            title="Grok all good sdstatus_bitbang",
+        )
+
+        with patch("sidepulse.status_bar.ghostty_application", return_value=app):
+            self.assertTrue(
+                status_bar.open_ghostty_command_with_scripting_bridge(
+                    "cd /Users/pero/pgit/sdstatus_bitbang && grok --resume grok-session",
+                    hints,
+                )
+            )
+
+        self.assertIsNone(app.new_tab_window)
+        self.assertIs(app.new_window_config, app.config)
+        self.assertTrue(app.activated)
+        self.assertEqual(app.config["workingDirectory"], "/Users/pero/pgit/sdstatus_bitbang")
+        self.assertIn("grok --resume grok-session", app.config["command"])
+
+    def test_status_bar_resume_ghostty_uses_focus_before_new_tab(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        hints = status_bar.TerminalSessionHints(
+            provider="grok",
+            session_id="grok-session",
+            cwd="/Users/pero/pgit/sdstatus_bitbang",
+            title="Grok all good sdstatus_bitbang",
+        )
+
+        with (
+            patch("sidepulse.status_bar.focus_ghostty_session", return_value=True),
+            patch("sidepulse.status_bar.open_ghostty_command") as open_ghostty,
+        ):
+            status_bar.open_terminal_command(
+                "cd /Users/pero/pgit/sdstatus_bitbang && grok --resume grok-session",
+                terminal_app=TERMINAL_APP_GHOSTTY,
+                session_hints=hints,
+            )
+
+        open_ghostty.assert_not_called()
+
+    def test_status_bar_detects_installed_terminal_apps(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp)
+            (app_dir / "Warp.app").mkdir()
+            (app_dir / "iTerm.app").mkdir()
+
+            self.assertEqual(
+                status_bar.installed_terminal_app_path(
+                    TERMINAL_APP_WARP,
+                    app_dirs=(app_dir,),
+                ),
+                app_dir / "Warp.app",
+            )
+            self.assertTrue(
+                status_bar.terminal_app_installed(
+                    TERMINAL_APP_ITERM,
+                    app_dirs=(app_dir,),
+                )
+            )
+            self.assertIsNone(
+                status_bar.installed_terminal_app_path(
+                    TERMINAL_APP_KITTY,
+                    app_dirs=(app_dir,),
+                )
+            )
+
     def test_status_bar_open_session_remembers_action_by_origin(self) -> None:
         try:
             from sidepulse import status_bar
@@ -1181,7 +2371,7 @@ class AgentMonitorTests(unittest.TestCase):
             origin="Claude in VS Code",
         )
         fake = SimpleNamespace(
-            settings=AgentMonitorSettings(),
+            settings=AgentMonitorSettings().with_session_terminal(TERMINAL_APP_ITERM),
             messages=[],
             set_settings_message=lambda message: None,
         )
@@ -1198,7 +2388,10 @@ class AgentMonitorTests(unittest.TestCase):
             )
 
         open_terminal.assert_called_once_with(
-            "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257"
+            "cd /Users/pero/pgit/sdstatus_bitbang && claude --resume 1ca4348e-2aec-4147-9e81-d7d56364d257",
+            terminal_app=TERMINAL_APP_ITERM,
+            custom_terminal_path="",
+            session_hints=status_bar.terminal_session_hints(status),
         )
         self.assertEqual(
             fake.settings.session_open_action("claude", "Claude in VS Code"),
@@ -1422,6 +2615,83 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn("matcher", data["hooks"]["PreToolUse"][-1])
             self.assertNotIn("matcher", data["hooks"]["SessionStart"][-1])
 
+    def test_grok_installer_removes_legacy_sidepulse_hook_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "hooks" / "sidepulse.json"
+            log = base / "grok.jsonl"
+            config.parent.mkdir()
+            old_backup = config.parent / "sidepulse.json.bak.20260813T214318Z"
+            old_backup.write_text('{"hooks": {"Stop": [{"hooks": []}]}}\n')
+            stale = config.parent / "sidepulse-cli.json"
+            stale.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "matcher": "*",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": (
+                                                "python3 /missing/sidepulse_cli/hook_entry.py "
+                                                f"--provider grok --log {log}"
+                                            ),
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+            mixed = config.parent / "sidepulse-agent-monitor.json"
+            mixed.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Notification": [
+                                {
+                                    "matcher": "*",
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": (
+                                                "python3 /missing/agent_monitor/hook_entry.py "
+                                                f"--provider grok --log {log}"
+                                            ),
+                                        },
+                                        {
+                                            "type": "command",
+                                            "command": "echo keep >> /tmp/other.log",
+                                        },
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+
+            result = install_grok_hooks(
+                log_path=log,
+                config_path=config,
+                python_executable="python3",
+            )
+
+            self.assertTrue(result.changed)
+            self.assertFalse(stale.exists())
+            self.assertFalse(old_backup.exists())
+            self.assertTrue((base / "sidepulse-hook-backups" / old_backup.name).exists())
+            data = json.loads(mixed.read_text())
+            commands = [
+                hook["command"]
+                for entry in data["hooks"]["Notification"]
+                for hook in entry["hooks"]
+            ]
+            self.assertEqual(commands, ["echo keep >> /tmp/other.log"])
+
     def test_codex_uninstaller_removes_monitor_hooks_and_preserves_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -1529,6 +2799,40 @@ class AgentMonitorTests(unittest.TestCase):
             ]
             self.assertEqual(commands, ["echo keep >> /tmp/other.log"])
 
+    def test_grok_uninstaller_removes_legacy_sidepulse_hook_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "hooks" / "sidepulse.json"
+            log = base / "grok.jsonl"
+            config.parent.mkdir()
+            stale = config.parent / "sidepulse-cli.json"
+            stale.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": (
+                                                "python3 /missing/sidepulse_cli/hook_entry.py "
+                                                f"--provider grok --log {log}"
+                                            ),
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+
+            result = uninstall_grok_hooks(log_path=log, config_path=config)
+
+            self.assertTrue(result.changed)
+            self.assertFalse(stale.exists())
+
     def test_detect_grok_config_reads_managed_hook_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -1611,6 +2915,26 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(stop.status_bar_command, "stop")
         self.assertEqual(helper.status_bar_command, "install-sleep-helper")
         self.assertTrue(helper.dry_run)
+
+    def test_python_module_entrypoint_uses_sidepulse_cli(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        env = {
+            **os.environ,
+            "PYTHONPATH": str(root / "src"),
+        }
+        result = subprocess.run(
+            [sys.executable, "-m", "sidepulse", "status-bar", "--help"],
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Helo World", result.stdout)
+        self.assertIn("Start/stop the menu-bar app", result.stdout)
 
     def test_sidepulse_sdejectguard_command_shape(self) -> None:
         parser = cli_module.build_sidepulse_parser()
@@ -2448,6 +3772,41 @@ class AgentMonitorTests(unittest.TestCase):
                 self.assertEqual(save_settings(saved), settings_path)
                 self.assertEqual(load_settings(), saved)
 
+    def test_settings_round_trip_agent_list_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_agent_list_timing(
+                recent_session_retention_seconds=36 * 60 * 60,
+                idle_timeout_seconds=15 * 60,
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(
+                AgentMonitorSettings().recent_session_retention_seconds,
+                DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+            )
+            self.assertEqual(
+                AgentMonitorSettings().idle_timeout_seconds,
+                DEFAULT_IDLE_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(loaded.recent_session_retention_seconds, 36 * 60 * 60)
+            self.assertEqual(loaded.idle_timeout_seconds, 15 * 60)
+
+    def test_settings_migrates_missing_agent_list_timing_to_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(json.dumps({"led_display": "agent"}))
+
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(
+                loaded.recent_session_retention_seconds,
+                DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+            )
+            self.assertEqual(loaded.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS)
+
     def test_default_sources_respect_transcript_settings(self) -> None:
         settings = AgentMonitorSettings(
             codex_transcripts_enabled=False,
@@ -2486,6 +3845,12 @@ class AgentMonitorTests(unittest.TestCase):
                         led_display="battery",
                         brightness=128,
                     ),
+                    DeviceDisplaySetting(
+                        device_id="/Volumes/SidePulseCustom",
+                        name="SidePulse Custom",
+                        path="/Volumes/SidePulseCustom",
+                        led_display=LED_DISPLAY_CUSTOM,
+                    ),
                 )
             )
 
@@ -2495,6 +3860,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(loaded.devices, settings.devices)
             self.assertEqual(loaded.display_for_device("/Volumes/SidePulsePro"), "agent")
             self.assertEqual(loaded.display_for_device("/Volumes/SidePulseDot"), "battery")
+            self.assertEqual(
+                loaded.display_for_device("/Volumes/SidePulseCustom"),
+                LED_DISPLAY_CUSTOM,
+            )
             self.assertEqual(loaded.brightness_for_device("/Volumes/SidePulseDot"), 128)
 
     def test_settings_round_trip_remembered_device_brightness(self) -> None:
@@ -2529,6 +3898,62 @@ class AgentMonitorTests(unittest.TestCase):
                 SESSION_OPEN_TERMINAL,
             )
             self.assertIsNone(loaded.session_open_action("claude"))
+
+    def test_settings_round_trip_session_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_session_terminal(
+                TERMINAL_APP_CUSTOM,
+                "/Applications/WezTerm.app",
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.session_terminal_app, TERMINAL_APP_CUSTOM)
+            self.assertEqual(loaded.custom_terminal_path, "/Applications/WezTerm.app")
+
+            switched = loaded.with_session_terminal(TERMINAL_APP_ITERM)
+            save_settings(switched, settings_path)
+            reloaded = load_settings(settings_path)
+
+            self.assertEqual(reloaded.session_terminal_app, TERMINAL_APP_ITERM)
+            self.assertEqual(reloaded.custom_terminal_path, "/Applications/WezTerm.app")
+
+    def test_settings_round_trip_grok_session_opening_is_split_from_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = (
+                AgentMonitorSettings()
+                .with_provider_session_open_action("grok", SESSION_OPEN_TERMINAL)
+                .with_session_terminal(TERMINAL_APP_GHOSTTY)
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.grok_session_open_action, SESSION_OPEN_TERMINAL)
+            self.assertEqual(loaded.session_open_action("grok"), SESSION_OPEN_TERMINAL)
+            self.assertEqual(loaded.session_terminal_app, TERMINAL_APP_GHOSTTY)
+            self.assertNotIn("grok", loaded.session_open_preferences)
+
+    def test_settings_migrates_legacy_grok_session_open_preference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "session_open_preferences": {"grok": SESSION_OPEN_TERMINAL},
+                        "session_terminal": {"app": TERMINAL_APP_ITERM},
+                    }
+                )
+            )
+
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.grok_session_open_action, SESSION_OPEN_TERMINAL)
+            self.assertEqual(loaded.session_terminal_app, TERMINAL_APP_ITERM)
+            self.assertNotIn("grok", loaded.session_open_preferences)
 
     def test_settings_round_trip_closed_lid_policy_and_animations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2651,8 +4076,10 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("Remove", titles)
 
     def test_status_bar_launch_agent_plist_runs_foreground_command(self) -> None:
+        launcher = Path("/tmp/SidePulse Status Bar")
         plist = build_launch_agent_plist(
             python_executable="/usr/bin/python3",
+            launcher_path=launcher,
             stdout_path=Path("/tmp/sidepulse.out.log"),
             stderr_path=Path("/tmp/sidepulse.err.log"),
         )
@@ -2660,18 +4087,18 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(plist["Label"], LAUNCH_AGENT_LABEL)
         self.assertEqual(
             plist["ProgramArguments"],
-            [
-                "/usr/bin/python3",
-                "-m",
-                "sidepulse",
-                "status-bar",
-                "--foreground",
-            ],
+            [str(launcher)],
         )
         self.assertTrue(plist["RunAtLoad"])
         self.assertEqual(plist["StandardOutPath"], "/tmp/sidepulse.out.log")
         self.assertEqual(plist["StandardErrorPath"], "/tmp/sidepulse.err.log")
         self.assertNotIn("KeepAlive", plist)
+
+    def test_status_bar_launcher_uses_background_item_name(self) -> None:
+        script = build_status_bar_launcher_script(python_executable="/usr/bin/python3")
+
+        self.assertEqual(STATUS_BAR_DISPLAY_NAME, "SidePulse Status Bar")
+        self.assertIn("exec /usr/bin/python3 -m sidepulse status-bar --foreground", script)
 
     def test_status_bar_launch_agent_installed_checks_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2683,15 +4110,9 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_frozen_status_bar_launch_agent_uses_sidepulse_executable(self) -> None:
         with patch("sidepulse.status_bar_launch.sys.frozen", True, create=True):
-            plist = build_launch_agent_plist(
-                stdout_path=Path("/tmp/sidepulse.out.log"),
-                stderr_path=Path("/tmp/sidepulse.err.log"),
-            )
+            script = build_status_bar_launcher_script()
 
-        self.assertEqual(
-            plist["ProgramArguments"],
-            [sys.executable, "status-bar", "start", "--foreground"],
-        )
+        self.assertIn("status-bar start --foreground", script)
 
     def test_frozen_hook_command_uses_internal_cli(self) -> None:
         with patch("sidepulse.install.sys.frozen", True, create=True):
@@ -2700,15 +4121,54 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(
             command,
             f"{sys.executable} agent-monitor hook-log --provider codex "
-            "--log '/tmp/codex events.jsonl'",
+            "--log '/tmp/codex events.jsonl' ; true",
         )
+
+    def test_hook_command_is_fail_open(self) -> None:
+        command = hook_command("grok", Path("/tmp/grok.jsonl"), python_executable="python3")
+
+        self.assertTrue(command.endswith("; true"))
+
+    def test_legacy_hook_entry_points_still_log_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            log = base / "grok.jsonl"
+            payload = b'{"hookEventName":"pre_tool_use","sessionId":"legacy"}'
+            root = Path(__file__).resolve().parents[1]
+            for script in (
+                root / "src" / "agent_monitor" / "hook_entry.py",
+                root / "src" / "sidepulse_cli" / "hook_entry.py",
+            ):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(script),
+                        "--provider",
+                        "grok",
+                        "--log",
+                        str(log),
+                    ],
+                    input=payload,
+                    env={**os.environ, "SIDEPULSE_DISABLE_EVENT_SOCKET": "1"},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+            lines = log.read_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(all(json.loads(line)["sessionId"] == "legacy" for line in lines))
 
     def test_status_bar_install_removes_legacy_com_sidepulse_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             target = base / "io.sidepulse.agentstatus.plist"
             legacy = base / "com.sidepulse.agentstatus.plist"
+            pixiepulse_legacy = base / "com.pixiepulse.agentstatus.plist"
+            launcher = base / "SidePulse Status Bar"
             legacy.write_bytes(b"old")
+            pixiepulse_legacy.write_bytes(b"old")
 
             with (
                 patch("sidepulse.status_bar_launch.default_state_dir", return_value=base / "state"),
@@ -2718,14 +4178,20 @@ class AgentMonitorTests(unittest.TestCase):
                     start=False,
                     plist_path=target,
                     legacy_plist_path=legacy,
+                    pixiepulse_legacy_plist_path=pixiepulse_legacy,
+                    launcher_path=launcher,
                     python_executable="/usr/bin/python3",
                 )
 
             self.assertTrue(result.changed)
             self.assertTrue(target.exists())
+            self.assertTrue(launcher.exists())
+            self.assertEqual(plistlib.loads(target.read_bytes())["ProgramArguments"], [str(launcher)])
             self.assertFalse(legacy.exists())
-            run.assert_called_once()
-            self.assertEqual(run.call_args.args[0][0:2], ["launchctl", "bootout"])
+            self.assertFalse(pixiepulse_legacy.exists())
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[0].args[0][0:2], ["launchctl", "bootout"])
+            self.assertEqual(run.call_args_list[1].args[0][0:2], ["launchctl", "bootout"])
 
     def test_sd_eject_guard_plist_shapes_for_user_and_system_scopes(self) -> None:
         for scope in ("user", "system"):
@@ -4312,6 +5778,56 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
             self.assertIn("sidepulse", name)
             self.assertIn("Refine README agent status modes", name)
             self.assertNotIn("Why are we burning", name)
+
+    def test_session_display_name_keeps_initial_prompt_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            log = base / "grok.jsonl"
+            now = datetime.now(timezone.utc)
+            session_id = "019ffd37-1458-7d92-b077-3d0f92aedde4"
+            log.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "logged_at": now.isoformat(),
+                                "hookEventName": "user_prompt_submit",
+                                "sessionId": session_id,
+                                "workspaceRoot": "/Users/pero/temp/msdosfs",
+                                "prompt": "<user_query>\nWhat is here\n</user_query>",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "logged_at": (now + timedelta(seconds=30)).isoformat(),
+                                "hookEventName": "user_prompt_submit",
+                                "sessionId": session_id,
+                                "workspaceRoot": "/Users/pero/temp/msdosfs",
+                                "prompt": "<user_query>\nNow check permissions\n</user_query>",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "logged_at": (now + timedelta(seconds=60)).isoformat(),
+                                "hookEventName": "stop",
+                                "sessionId": session_id,
+                                "workspaceRoot": "/Users/pero/temp/msdosfs",
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("grok", log),),
+                stale_after_seconds=999999999,
+            )
+            snapshot = monitor.snapshot()
+
+            name = snapshot.statuses[0].display_name
+            self.assertIn("What is here", name)
+            self.assertNotIn("Now check permissions", name)
 
     def test_live_monitor_refreshes_loaded_codex_display_name_from_session_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
