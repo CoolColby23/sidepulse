@@ -947,6 +947,10 @@ class StatusBarController(NSObject):
             hook_status_text(opencode),
         )
         set_field_value(
+            self.settings_fields.get("t3code_hook_status"),
+            "Automatic · uses the selected agent's hooks",
+        )
+        set_field_value(
             self.settings_fields.get("settings_path"),
             f"Settings: {default_settings_path()}",
         )
@@ -2457,7 +2461,17 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     add_button(agents_tab, "Install", 400, 294, 90, 28, target, "installOpenCodeHooks:")
     add_button(agents_tab, "Uninstall", 500, 294, 100, 28, target, "uninstallOpenCodeHooks:")
 
-    add_separator(agents_tab, 24, 258, tab_width - 48)
+    add_label(agents_tab, "T3 Code", 32, 264, 80, 22)
+    t3code_status = add_label(
+        agents_tab,
+        "Automatic · uses the selected agent's hooks",
+        130,
+        264,
+        430,
+        22,
+    )
+
+    add_separator(agents_tab, 24, 250, tab_width - 48)
     add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
     add_label(agents_tab, "Codex", 32, 188, 100, 22)
     codex_opener = add_provider_opener_popup(agents_tab, "codex", 160, 186, target)
@@ -2556,6 +2570,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
         "opencode_hook_status": opencode_status,
+        "t3code_hook_status": t3code_status,
         "debug_log_status": debug_log_status,
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,

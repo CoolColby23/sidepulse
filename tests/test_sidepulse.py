@@ -1753,6 +1753,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(len(tab_views), 1)
         self.assertEqual(tab_views[0].numberOfTabViewItems(), 5)
         self.assertIn("debug_log_status", target.settings_fields)
+        self.assertIn("t3code_hook_status", target.settings_fields)
         self.assertIn("session_terminal", target.settings_fields)
         self.assertIn("custom_terminal_path", target.settings_fields)
         self.assertIn("recent_session_retention_hours", target.settings_fields)
