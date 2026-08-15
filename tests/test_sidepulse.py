@@ -5991,6 +5991,31 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
             ),
         )
 
+    def test_kiro_session_action_resumes_in_terminal(self) -> None:
+        status = AgentStatus(
+            provider="kiro",
+            agent_id="kiro:session:abc",
+            display_name="Kiro abc",
+            mode=AgentMode.WAITING_FOR_INPUT,
+            updated_at=datetime.now(timezone.utc),
+            event_name="agentSpawn",
+            session_id="kiro-session-123",
+            cwd="/Users/example/My Project",
+        )
+
+        self.assertEqual(
+            session_resume_command(status),
+            "cd '/Users/example/My Project' && kiro-cli chat --resume-id kiro-session-123",
+        )
+        self.assertEqual(default_session_open_action(status), SESSION_OPEN_TERMINAL)
+        self.assertEqual(
+            session_open_target(status, SESSION_OPEN_TERMINAL),
+            (
+                "terminal",
+                "cd '/Users/example/My Project' && kiro-cli chat --resume-id kiro-session-123",
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
