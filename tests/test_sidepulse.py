@@ -50,9 +50,11 @@ from sidepulse.install import (
     install_claude_hooks,
     install_codex_hooks,
     install_grok_hooks,
+    install_opencode_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
     uninstall_grok_hooks,
+    uninstall_opencode_hooks,
     update_codex_trusted_hashes,
 )
 from sidepulse.keep_awake import KeepAwakeController, status_file_for_target
@@ -73,9 +75,10 @@ from sidepulse.lid_sleep import (
     sleep_helper_sudoers_rule,
 )
 from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
-from sidepulse.origin import ProcessInfo, origin_from_processes
+from sidepulse.origin import ProcessInfo, origin_from_environment, origin_from_processes
 from sidepulse.providers import (
     detect_grok_config,
+    detect_opencode_config,
     default_log_path,
     default_state_dir,
     parse_log_line,
@@ -296,6 +299,91 @@ class AgentMonitorTests(unittest.TestCase):
             ).label,
             "Claude Code CLI",
         )
+
+    def test_t3_code_origin_wins_over_nested_codex_process(self) -> None:
+        origin = origin_from_processes(
+            "codex",
+            (
+                ProcessInfo(pid=10, ppid=20, comm="codex", command="codex app-server"),
+                ProcessInfo(
+                    pid=20,
+                    ppid=1,
+                    comm="/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+                    command="/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+                ),
+            ),
+        )
+        self.assertIsNotNone(origin)
+        self.assertEqual(origin.label, "T3 Code")
+        self.assertEqual(origin.kind, "codex_t3code")
+
+    def test_t3_code_origin_recognizes_mcp_environment(self) -> None:
+        origin = origin_from_environment(
+            "opencode",
+            {"T3_MCP_BEARER_TOKEN": "present"},
+        )
+        self.assertIsNotNone(origin)
+        self.assertEqual(origin.label, "T3 Code")
+        self.assertEqual(origin.kind, "opencode_t3code")
+
+    def test_opencode_event_names_are_normalized(self) -> None:
+        record = parse_log_line(
+            "opencode",
+            json.dumps(
+                {
+                    "event_name": "tool.execute.before",
+                    "session_id": "open-session",
+                    "cwd": "/tmp/project",
+                    "tool_name": "bash",
+                    "timestamp": "2026-08-14T12:00:00Z",
+                }
+            ),
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.provider, "opencode")
+        self.assertEqual(record.event_name, "PreToolUse")
+
+    def test_opencode_session_can_resume_in_terminal(self) -> None:
+        from sidepulse.session_actions import session_resume_command
+
+        status = AgentStatus(
+            provider="opencode",
+            agent_id="opencode:session:open-session",
+            display_name="OpenCode session",
+            mode=AgentMode.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Stop",
+            session_id="open-session",
+            cwd="/tmp/project",
+        )
+        self.assertEqual(
+            session_resume_command(status),
+            "cd /tmp/project && opencode --session open-session",
+        )
+
+    def test_opencode_plugin_install_detect_and_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plugin = base / ".config" / "opencode" / "plugins" / "sidepulse.js"
+            log = base / "state" / "opencode.jsonl"
+
+            installed = install_opencode_hooks(log_path=log, config_path=plugin)
+            self.assertTrue(installed.changed)
+            self.assertTrue(plugin.exists())
+            self.assertIn("sidepulse-opencode-plugin", plugin.read_text())
+            self.assertIn(str(log), plugin.read_text())
+            self.assertIn("T3_MCP_BEARER_TOKEN", plugin.read_text())
+
+            detected = detect_opencode_config(base)
+            self.assertTrue(detected.hooks_enabled)
+            self.assertEqual(detected.log_paths, (log,))
+
+            repeated = install_opencode_hooks(log_path=log, config_path=plugin)
+            self.assertFalse(repeated.changed)
+
+            removed = uninstall_opencode_hooks(log_path=log, config_path=plugin)
+            self.assertTrue(removed.changed)
+            self.assertFalse(plugin.exists())
 
     def test_grok_log_line_normalizes_camel_case_payload(self) -> None:
         record = parse_log_line(
@@ -1617,6 +1705,11 @@ class AgentMonitorTests(unittest.TestCase):
         ]
         self.assertEqual(len(tab_views), 1)
         self.assertEqual(tab_views[0].numberOfTabViewItems(), 5)
+        for index in range(tab_views[0].numberOfTabViewItems()):
+            scroll_view = tab_views[0].tabViewItemAtIndex_(index).view()
+            self.assertTrue(scroll_view.hasVerticalScroller())
+            self.assertFalse(scroll_view.hasHorizontalScroller())
+            self.assertIsNotNone(scroll_view.documentView())
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("session_terminal", target.settings_fields)
         self.assertIn("custom_terminal_path", target.settings_fields)
@@ -1667,9 +1760,11 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("eject_guard", target.setup_buttons)
         self.assertIn("eject_guard_uninstall", target.setup_buttons)
         self.assertIn("sleep_helper", target.setup_buttons)
+        self.assertIn("opencode", target.setup_buttons)
         self.assertIn("launch_status", target.setup_fields)
         self.assertIn("eject_status", target.setup_fields)
         self.assertIn("sleep_status", target.setup_fields)
+        self.assertIn("opencode_status", target.setup_fields)
 
     def test_first_launch_setup_window_only_shows_until_completed(self) -> None:
         try:
@@ -3084,6 +3179,13 @@ class AgentMonitorTests(unittest.TestCase):
             changed=True,
             backup_path=None,
         )
+        opencode_result = SimpleNamespace(
+            provider="opencode",
+            config_path=Path("/tmp/sidepulse.js"),
+            log_path=Path("/tmp/opencode.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
         launch_result = SimpleNamespace(
             plist_path=Path("/tmp/io.sidepulse.agentstatus.plist"),
             changed=True,
@@ -3104,6 +3206,11 @@ class AgentMonitorTests(unittest.TestCase):
             patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
             patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
             patch.object(cli_module, "install_grok_hooks", return_value=grok_result) as grok,
+            patch.object(
+                cli_module,
+                "install_opencode_hooks",
+                return_value=opencode_result,
+            ) as opencode,
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
                 return_value=guard_result,
@@ -3119,6 +3226,7 @@ class AgentMonitorTests(unittest.TestCase):
         codex.assert_called_once()
         claude.assert_called_once()
         grok.assert_called_once()
+        opencode.assert_called_once()
         guard.assert_called_once_with(scope="auto", dry_run=False)
         launch.assert_called_once_with(start=True)
 
