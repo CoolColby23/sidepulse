@@ -1433,6 +1433,8 @@ class StatusBarController(NSObject):
         kind, value = target
         if kind == "url":
             open_url(value)
+        elif kind == "application":
+            open_host_application(value)
         elif kind == "terminal":
             open_terminal_command(
                 value,
@@ -3200,6 +3202,8 @@ def session_origin_icon_for_status(status: AgentStatus):
     host_icon = host_icon_for_origin(status.origin)
     if host_icon is None:
         return provider_icon
+    if normalized_origin_text(status.origin) == "t3 code":
+        return host_icon
     return composite_app_icons(host_icon, provider_icon)
 
 
@@ -3242,6 +3246,7 @@ def host_icon_for_origin(origin: str | None):
             (
                 "/Applications/T3 Code.app",
                 "/Applications/T3 Code (Alpha).app",
+                "/Applications/T3 Code (Nightly).app",
                 "/Applications/t3-code.app",
             )
         ) or image_for_symbol("square.stack.3d.up", "T3 Code")
@@ -3614,6 +3619,22 @@ def open_url(url: str) -> None:
     ns_url = NSURL.URLWithString_(url)
     if ns_url is not None:
         NSWorkspace.sharedWorkspace().openURL_(ns_url)
+
+
+def open_host_application(host: str) -> None:
+    if host != "t3code":
+        return
+    paths = (
+        "/Applications/T3 Code.app",
+        "/Applications/T3 Code (Alpha).app",
+        "/Applications/T3 Code (Nightly).app",
+        "/Applications/t3-code.app",
+    )
+    path = next((candidate for candidate in paths if Path(candidate).exists()), None)
+    if path is None:
+        subprocess.Popen(["open", "-a", "T3 Code"])
+        return
+    NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(path))
 
 
 def open_terminal_command(

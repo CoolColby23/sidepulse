@@ -13,6 +13,7 @@ SESSION_OPEN_CHOICES = (SESSION_OPEN_APP, SESSION_OPEN_TERMINAL, SESSION_OPEN_VS
 SESSION_OPEN_APP_SURFACES = ("app", "ui", "transcript")
 SESSION_OPEN_TERMINAL_SURFACES = ("cli", "terminal", "command line")
 SESSION_OPEN_VSCODE_SURFACES = ("vscode", "vs code", "visual studio code")
+T3_CODE_ORIGINS = ("t3 code", "t3code")
 
 
 def session_deep_link(status: AgentStatus) -> str | None:
@@ -84,6 +85,8 @@ def normalized_origin(origin: str | None) -> str:
 
 def session_open_target(status: AgentStatus, action: str) -> tuple[str, str] | None:
     if action == SESSION_OPEN_APP:
+        if any(origin in normalized_origin(status.origin) for origin in T3_CODE_ORIGINS):
+            return ("application", "t3code")
         url = session_deep_link(status)
         return ("url", url) if url else None
     if action == SESSION_OPEN_VSCODE:
@@ -102,6 +105,8 @@ def available_session_open_actions(status: AgentStatus) -> tuple[str, ...]:
 def session_open_action_label(status: AgentStatus, action: str) -> str:
     provider = status.provider.lower()
     if action == SESSION_OPEN_APP:
+        if any(origin in normalized_origin(status.origin) for origin in T3_CODE_ORIGINS):
+            return "Open T3 Code"
         if provider == "codex":
             return "Open in Codex"
         if provider == "claude":

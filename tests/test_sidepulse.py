@@ -102,6 +102,7 @@ from sidepulse.session_actions import (
     SESSION_OPEN_VSCODE,
     default_session_open_action,
     session_deep_link,
+    session_open_action_label,
     session_open_target,
     session_resume_command,
     session_vscode_link,
@@ -770,6 +771,27 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIsNotNone(image)
         self.assertEqual(image.size().width, 24)
         self.assertEqual(image.size().height, 18)
+
+    def test_status_bar_t3_origin_uses_t3_icon_without_codex_overlay(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        status = AgentStatus(
+            provider="codex",
+            agent_id="codex:session:abc",
+            display_name="T3 task",
+            mode=AgentMode.WORKING,
+            updated_at=datetime.now(timezone.utc),
+            event_name="UserPromptSubmit",
+            origin="T3 Code",
+        )
+        sentinel = object()
+        with patch("sidepulse.status_bar.host_icon_for_origin", return_value=sentinel):
+            image = status_bar.session_origin_icon_for_status(status)
+
+        self.assertIs(image, sentinel)
 
     def test_status_bar_session_row_icon_combines_status_and_origin(self) -> None:
         try:
@@ -6110,6 +6132,16 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
         self.assertEqual(
             default_session_open_action(status_for("codex", "Codex UI")),
             SESSION_OPEN_APP,
+        )
+        t3_status = status_for("codex", "T3 Code")
+        self.assertEqual(default_session_open_action(t3_status), SESSION_OPEN_APP)
+        self.assertEqual(
+            session_open_target(t3_status, SESSION_OPEN_APP),
+            ("application", "t3code"),
+        )
+        self.assertEqual(
+            session_open_action_label(t3_status, SESSION_OPEN_APP),
+            "Open T3 Code",
         )
 
     def test_claude_session_actions_build_app_link_and_resume_command(self) -> None:
