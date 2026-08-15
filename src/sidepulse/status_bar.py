@@ -2443,6 +2443,14 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     content.addSubview_(tab_view)
 
     add_label(agents_tab, "Agent Hooks", 24, 438, 200, 24)
+    t3code_status = add_label(
+        agents_tab,
+        "T3 Code: automatic · uses the selected agent's hooks",
+        220,
+        440,
+        390,
+        20,
+    )
     add_label(agents_tab, "Codex", 32, 400, 80, 22)
     codex_status = add_label(agents_tab, "", 130, 400, 240, 22)
     add_button(agents_tab, "Install", 400, 396, 90, 28, target, "installCodexHooks:")
@@ -2462,16 +2470,6 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     opencode_status = add_label(agents_tab, "", 130, 298, 240, 22)
     add_button(agents_tab, "Install", 400, 294, 90, 28, target, "installOpenCodeHooks:")
     add_button(agents_tab, "Uninstall", 500, 294, 100, 28, target, "uninstallOpenCodeHooks:")
-
-    add_label(agents_tab, "T3 Code", 32, 264, 80, 22)
-    t3code_status = add_label(
-        agents_tab,
-        "Automatic · uses the selected agent's hooks",
-        130,
-        264,
-        430,
-        22,
-    )
 
     add_separator(agents_tab, 24, 250, tab_width - 48)
     add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
