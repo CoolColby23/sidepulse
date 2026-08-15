@@ -19,6 +19,7 @@ class KiroProviderTests(unittest.TestCase):
             self.assertTrue(installed.changed)
             data = json.loads(config.read_text())
             self.assertIn("SidePulse lifecycle monitoring", data["description"])
+            self.assertEqual(data["tools"], ["*"])
             self.assertEqual(set(data["hooks"]), {"agentSpawn", "userPromptSubmit", "preToolUse", "postToolUse", "stop"})
             self.assertEqual(set(detect_kiro_config(home).hook_events), set(KIRO_EVENTS))
             self.assertFalse(install_kiro_hooks(config_path=config, log_path=log, python_executable="python3").changed)

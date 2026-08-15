@@ -194,7 +194,15 @@ def install_kiro_hooks(
         if event in {"PreToolUse", "PostToolUse"}:
             entry["matcher"] = "*"
         hooks[event_names[event]] = [entry]
-    new_text = json.dumps({"name": "sidepulse", "description": KIRO_MANAGED_DESCRIPTION, "hooks": hooks}, indent=2) + "\n"
+    new_text = json.dumps(
+        {
+            "name": "sidepulse",
+            "description": KIRO_MANAGED_DESCRIPTION,
+            "tools": ["*"],
+            "hooks": hooks,
+        },
+        indent=2,
+    ) + "\n"
     changed = new_text != original
     backup = None
     if changed and not dry_run:
