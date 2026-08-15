@@ -144,7 +144,7 @@ from .settings import (
     CLOSED_LID_AWAKE_CHOICES,
     CLOSED_LID_AWAKE_NEVER,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
-    DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+    DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
     LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
     LED_DISPLAY_CUSTOM,
@@ -696,6 +696,7 @@ class StatusBarController(NSObject):
         return LiveAgentMonitor(
             sources=(SourceSpec("event-bus", socket_path),),
             stale_after_seconds=self.settings.idle_timeout_seconds,
+            completed_visible_seconds=self.settings.completed_session_visibility_seconds,
             latest_state_path=default_latest_state_path(),
         )
 
@@ -965,8 +966,8 @@ class StatusBarController(NSObject):
             f"{opened.duration_seconds:g}",
         )
         set_text_control_value(
-            self.settings_fields.get("recent_session_retention_hours"),
-            f"{self.settings.recent_session_retention_seconds / 3600:g}",
+            self.settings_fields.get("completed_session_visibility_seconds"),
+            f"{self.settings.completed_session_visibility_seconds:g}",
         )
         set_text_control_value(
             self.settings_fields.get("idle_timeout_minutes"),
@@ -1075,13 +1076,15 @@ class StatusBarController(NSObject):
         self.refresh_(None)
 
     def save_agent_list_timing_from_fields(self) -> None:
-        retention_text = text_control_value(
-            self.settings_fields.get("recent_session_retention_hours")
+        completed_visibility_text = text_control_value(
+            self.settings_fields.get("completed_session_visibility_seconds")
         )
         idle_text = text_control_value(self.settings_fields.get("idle_timeout_minutes"))
         try:
-            retention_hours = float(retention_text) if retention_text else (
-                DEFAULT_RECENT_SESSION_RETENTION_SECONDS / 3600
+            completed_visibility_seconds = (
+                float(completed_visibility_text)
+                if completed_visibility_text
+                else DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS
             )
             idle_minutes = float(idle_text) if idle_text else (
                 DEFAULT_IDLE_TIMEOUT_SECONDS / 60
@@ -1092,7 +1095,7 @@ class StatusBarController(NSObject):
 
         try:
             self.settings = self.settings.with_agent_list_timing(
-                recent_session_retention_seconds=retention_hours * 3600,
+                completed_session_visibility_seconds=completed_visibility_seconds,
                 idle_timeout_seconds=idle_minutes * 60,
             )
             save_settings(self.settings)
@@ -2464,11 +2467,11 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     add_button(sleep_tab, "Reset", 124, 14, 90, 28, target, "resetLidOpenAnimation:")
     add_button(sleep_tab, "Save Animations", 490, 14, 146, 28, target, "saveLidAnimations:")
 
-    add_label(behavior_tab, "Agent List", 24, 398, 240, 24)
-    add_label(behavior_tab, "Keep last 10 sessions for", 32, 356, 180, 22)
-    retention_hours = add_editable_field(behavior_tab, "", 224, 354, 58, 24)
-    add_label(behavior_tab, "hours", 292, 356, 60, 22)
-    add_label(behavior_tab, "Idle timeout", 32, 316, 120, 22)
+    add_label(behavior_tab, "Session Visibility", 24, 398, 240, 24)
+    add_label(behavior_tab, "Hide completed sessions after", 32, 356, 190, 22)
+    completed_visibility = add_editable_field(behavior_tab, "", 232, 354, 58, 24)
+    add_label(behavior_tab, "seconds", 300, 356, 70, 22)
+    add_label(behavior_tab, "Hide inactive sessions after", 32, 316, 190, 22)
     idle_minutes = add_editable_field(behavior_tab, "", 224, 314, 58, 24)
     add_label(behavior_tab, "minutes", 292, 316, 80, 22)
     add_button(behavior_tab, "Save", 32, 266, 90, 28, target, "saveAgentListTiming:")
@@ -2497,7 +2500,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "closed_animation_duration": closed_duration,
         "open_animation_program": open_program,
         "open_animation_duration": open_duration,
-        "recent_session_retention_hours": retention_hours,
+        "completed_session_visibility_seconds": completed_visibility,
         "idle_timeout_minutes": idle_minutes,
         "message": message,
         "settings_path": settings_path,
@@ -2514,8 +2517,15 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
 def add_settings_tab(tab_view, identifier: str, title: str, width: int, height: int):
     item = NSTabViewItem.alloc().initWithIdentifier_(identifier)
     item.setLabel_(title)
-    view = NSView.alloc().initWithFrame_(((0, 0), (width, height - 34)))
-    item.setView_(view)
+    viewport_height = height - 34
+    scroll = NSScrollView.alloc().initWithFrame_(((0, 0), (width, viewport_height)))
+    scroll.setHasVerticalScroller_(True)
+    scroll.setHasHorizontalScroller_(False)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setBorderType_(0)
+    view = NSView.alloc().initWithFrame_(((0, 0), (width, viewport_height + 80)))
+    scroll.setDocumentView_(view)
+    item.setView_(scroll)
     tab_view.addTabViewItem_(item)
     return view
 
@@ -3335,11 +3345,13 @@ def recent_statuses(
 def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
     statuses = list(snapshot.statuses)
     now = snapshot.collected_at
-    retention_seconds = min(
-        settings.recent_session_retention_seconds
+    retention_seconds = (
+        min(
+            settings.recent_session_retention_seconds,
+            settings.completed_session_visibility_seconds,
+        )
         if settings is not None
-        else DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
-        COMPLETED_VISIBLE_SECONDS,
+        else COMPLETED_VISIBLE_SECONDS
     )
     statuses.extend(
         status

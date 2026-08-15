@@ -107,6 +107,7 @@ from sidepulse.settings import (
     CLOSED_LID_AWAKE_ALWAYS,
     CLOSED_LID_AWAKE_NEVER,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
     DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
@@ -1118,7 +1119,7 @@ class AgentMonitorTests(unittest.TestCase):
             ["working", "recent-done"],
         )
 
-    def test_status_bar_recent_statuses_never_resurrects_done_after_thirty_seconds(self) -> None:
+    def test_status_bar_recent_statuses_respect_completed_visibility_setting(self) -> None:
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1168,9 +1169,16 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(statuses[-1].session_id, "done-10")
         self.assertNotIn("too-old", [status.session_id for status in statuses])
 
+        longer = status_bar.recent_statuses(
+            snapshot,
+            AgentMonitorSettings(completed_session_visibility_seconds=60),
+            limit=20,
+        )
+        self.assertIn("too-old", [status.session_id for status in longer])
+
         shorter = status_bar.recent_statuses(
             snapshot,
-            AgentMonitorSettings(recent_session_retention_seconds=2.5),
+            AgentMonitorSettings(completed_session_visibility_seconds=2.5),
         )
         self.assertEqual([status.session_id for status in shorter], ["done-1", "done-2"])
 
@@ -1620,7 +1628,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("session_terminal", target.settings_fields)
         self.assertIn("custom_terminal_path", target.settings_fields)
-        self.assertIn("recent_session_retention_hours", target.settings_fields)
+        self.assertIn("completed_session_visibility_seconds", target.settings_fields)
         self.assertIn("idle_timeout_minutes", target.settings_fields)
         self.assertIn("closed_animation_program", target.settings_fields)
         self.assertIn("closed_animation_duration", target.settings_fields)
@@ -1636,7 +1644,10 @@ class AgentMonitorTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             fake = SimpleNamespace(
-                settings=AgentMonitorSettings(idle_timeout_seconds=1234)
+                settings=AgentMonitorSettings(
+                    idle_timeout_seconds=1234,
+                    completed_session_visibility_seconds=45,
+                )
             )
             with (
                 patch(
@@ -1651,6 +1662,7 @@ class AgentMonitorTests(unittest.TestCase):
                 monitor = status_bar.StatusBarController.build_monitor(fake)
 
         self.assertEqual(monitor.stale_after_seconds, 1234)
+        self.assertEqual(monitor.completed_visible_seconds, 45)
 
     def test_status_bar_setup_window_has_first_launch_controls(self) -> None:
         try:
@@ -3764,6 +3776,7 @@ class AgentMonitorTests(unittest.TestCase):
             settings_path = Path(tmp) / "settings.json"
             settings = AgentMonitorSettings().with_agent_list_timing(
                 recent_session_retention_seconds=36 * 60 * 60,
+                completed_session_visibility_seconds=75,
                 idle_timeout_seconds=15 * 60,
             )
 
@@ -3775,10 +3788,15 @@ class AgentMonitorTests(unittest.TestCase):
                 DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
             )
             self.assertEqual(
+                AgentMonitorSettings().completed_session_visibility_seconds,
+                DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
+            )
+            self.assertEqual(
                 AgentMonitorSettings().idle_timeout_seconds,
                 DEFAULT_IDLE_TIMEOUT_SECONDS,
             )
             self.assertEqual(loaded.recent_session_retention_seconds, 36 * 60 * 60)
+            self.assertEqual(loaded.completed_session_visibility_seconds, 75)
             self.assertEqual(loaded.idle_timeout_seconds, 15 * 60)
 
     def test_settings_migrates_missing_agent_list_timing_to_defaults(self) -> None:
@@ -3791,6 +3809,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(
                 loaded.recent_session_retention_seconds,
                 DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+            )
+            self.assertEqual(
+                loaded.completed_session_visibility_seconds,
+                DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
             )
             self.assertEqual(loaded.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS)
 

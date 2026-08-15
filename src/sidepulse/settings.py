@@ -76,6 +76,7 @@ DEFAULT_LID_OPEN_ANIMATION_PROGRAM = "\n".join(
 DEFAULT_LID_CLOSED_ANIMATION_SECONDS = 0.9
 DEFAULT_LID_OPEN_ANIMATION_SECONDS = 1.0
 DEFAULT_RECENT_SESSION_RETENTION_SECONDS = 48 * 60 * 60
+DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS = 30.0
 DEFAULT_IDLE_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -132,6 +133,7 @@ class AgentMonitorSettings:
     session_terminal_app: str = TERMINAL_APP_TERMINAL
     custom_terminal_path: str = ""
     recent_session_retention_seconds: float = DEFAULT_RECENT_SESSION_RETENTION_SECONDS
+    completed_session_visibility_seconds: float = DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS
     idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
     setup_screen_completed: bool = False
 
@@ -404,17 +406,24 @@ class AgentMonitorSettings:
         self,
         *,
         recent_session_retention_seconds: float | None = None,
+        completed_session_visibility_seconds: float | None = None,
         idle_timeout_seconds: float | None = None,
     ) -> "AgentMonitorSettings":
         retention = self.recent_session_retention_seconds
+        completed_visibility = self.completed_session_visibility_seconds
         idle_timeout = self.idle_timeout_seconds
         if recent_session_retention_seconds is not None:
             retention = normalize_seconds_setting(recent_session_retention_seconds)
+        if completed_session_visibility_seconds is not None:
+            completed_visibility = normalize_seconds_setting(
+                completed_session_visibility_seconds
+            )
         if idle_timeout_seconds is not None:
             idle_timeout = normalize_seconds_setting(idle_timeout_seconds)
         return replace(
             self,
             recent_session_retention_seconds=retention,
+            completed_session_visibility_seconds=completed_visibility,
             idle_timeout_seconds=idle_timeout,
         )
 
@@ -444,6 +453,7 @@ class AgentMonitorSettings:
             },
             "agent_list": {
                 "recent_session_retention_seconds": self.recent_session_retention_seconds,
+                "completed_session_visibility_seconds": self.completed_session_visibility_seconds,
                 "idle_timeout_seconds": self.idle_timeout_seconds,
             },
             "setup_screen_completed": self.setup_screen_completed,
@@ -550,6 +560,10 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
                 data.get("recent_session_retention_seconds"),
             ),
             DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+        ),
+        completed_session_visibility_seconds=_nonnegative_float_setting(
+            agent_list.get("completed_session_visibility_seconds"),
+            DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
         ),
         idle_timeout_seconds=_nonnegative_float_setting(
             agent_list.get("idle_timeout_seconds", data.get("idle_timeout_seconds")),
