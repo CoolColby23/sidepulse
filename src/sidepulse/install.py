@@ -515,7 +515,7 @@ def antigravity_hook_entry(event_name: str, command: str) -> dict[str, Any]:
         "command": command,
         "timeout": 5,
     }
-    if event_name == "PostToolUse":
+    if event_name in {"PreToolUse", "PostToolUse"}:
         return {"matcher": "*", "hooks": [hook]}
     return hook
 

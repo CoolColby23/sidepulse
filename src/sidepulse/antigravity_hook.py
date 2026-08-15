@@ -15,6 +15,7 @@ from .ipc import send_hook_event
 EVENT_ALIASES = {
     "PreInvocation": "UserPromptSubmit",
     "PostInvocation": "PostToolUse",
+    "PreToolUse": "PreToolUse",
     "PostToolUse": "PostToolUse",
     "Stop": "Stop",
 }
@@ -53,6 +54,8 @@ def normalize_payload(event_name: str, payload: dict[str, Any]) -> dict[str, Any
 
 
 def response_for_event(event_name: str) -> dict[str, Any]:
+    if event_name == "PreToolUse":
+        return {"decision": "allow"}
     if event_name == "PreInvocation":
         return {"injectSteps": []}
     if event_name == "PostInvocation":

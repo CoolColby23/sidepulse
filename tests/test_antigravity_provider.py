@@ -33,7 +33,7 @@ class AntigravityProviderTests(unittest.TestCase):
             self.assertIn("other-integration", data)
             self.assertEqual(
                 set(data["sidepulse-agent-monitor"]),
-                {"PreInvocation", "PostInvocation", "PostToolUse", "Stop"},
+                {"PreInvocation", "PostInvocation", "PreToolUse", "PostToolUse", "Stop"},
             )
             detected = detect_antigravity_config(home)
             self.assertTrue(detected.hooks_enabled)
@@ -93,6 +93,7 @@ class AntigravityProviderTests(unittest.TestCase):
         self.assertEqual(normalized["hook_event_name"], "PostToolUse")
 
     def test_hook_responses_preserve_antigravity_contract(self) -> None:
+        self.assertEqual(response_for_event("PreToolUse"), {"decision": "allow"})
         self.assertEqual(response_for_event("PreInvocation"), {"injectSteps": []})
         self.assertEqual(response_for_event("Stop"), {"decision": ""})
 

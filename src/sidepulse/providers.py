@@ -64,6 +64,7 @@ GROK_EVENTS = (
 ANTIGRAVITY_EVENTS = (
     "PreInvocation",
     "PostInvocation",
+    "PreToolUse",
     "PostToolUse",
     "Stop",
 )
