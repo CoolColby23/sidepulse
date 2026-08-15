@@ -48,7 +48,7 @@ try:
         NSWindowStyleMaskTitled,
         NSVariableStatusItemLength,
     )
-    from Foundation import NSObject, NSString, NSTimer, NSURL
+    from Foundation import NSObject, NSProcessInfo, NSString, NSTimer, NSURL
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
         f"The status-bar app requires PyObjC/AppKit ({exc}):\n"
@@ -357,6 +357,7 @@ class StatusBarController(NSObject):
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
+        NSProcessInfo.processInfo().setProcessName_("SidePulse")
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         self.remove_unavailable_virtual_device()
         log_status_bar("launching status item")
