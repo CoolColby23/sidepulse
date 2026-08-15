@@ -1086,7 +1086,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="grok:session:recent-done",
             display_name="other: Recent done (recent-d)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(minutes=8),
+            updated_at=now - timedelta(seconds=29),
             event_name="Stop",
             session_id="recent-done",
             cwd="/Users/pero/pgit/other",
@@ -1097,7 +1097,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="claude:session:old-done",
             display_name="old: Old done (old-done)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(hours=49),
+            updated_at=now - timedelta(seconds=31),
             event_name="Stop",
             session_id="old-done",
             cwd="/Users/pero/pgit/old",
@@ -1118,7 +1118,7 @@ class AgentMonitorTests(unittest.TestCase):
             ["working", "recent-done"],
         )
 
-    def test_status_bar_recent_statuses_keeps_last_ten_within_retention(self) -> None:
+    def test_status_bar_recent_statuses_never_resurrects_done_after_thirty_seconds(self) -> None:
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1131,7 +1131,7 @@ class AgentMonitorTests(unittest.TestCase):
                 agent_id=f"codex:session:done-{index}",
                 display_name=f"project: Done {index} (done-{index})",
                 mode=AgentMode.COMPLETED,
-                updated_at=now - timedelta(hours=index),
+                updated_at=now - timedelta(seconds=index),
                 event_name="Stop",
                 session_id=f"done-{index}",
                 cwd="/Users/pero/pgit/project",
@@ -1144,7 +1144,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="claude:session:too-old",
             display_name="old: Too old (too-old)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(hours=50),
+            updated_at=now - timedelta(seconds=31),
             event_name="Stop",
             session_id="too-old",
             cwd="/Users/pero/pgit/old",
@@ -1170,7 +1170,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         shorter = status_bar.recent_statuses(
             snapshot,
-            AgentMonitorSettings(recent_session_retention_seconds=2.5 * 60 * 60),
+            AgentMonitorSettings(recent_session_retention_seconds=2.5),
         )
         self.assertEqual([status.session_id for status in shorter], ["done-1", "done-2"])
 
@@ -4632,10 +4632,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(len(snapshot.stale_statuses), 1)
             self.assertEqual(snapshot.stale_statuses[0].mode, AgentMode.COMPLETED)
 
-    def test_completed_status_stays_visible_for_twenty_minutes_by_default(self) -> None:
+    def test_completed_status_clears_after_thirty_seconds_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            recent_done = datetime.now(timezone.utc) - timedelta(minutes=19)
+            recent_done = datetime.now(timezone.utc) - timedelta(seconds=31)
             log.write_text(
                 json.dumps(
                     {
@@ -4656,8 +4656,9 @@ class AgentMonitorTests(unittest.TestCase):
             )
             snapshot = monitor.snapshot()
 
-            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
-            self.assertEqual(len(snapshot.statuses), 1)
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.IDLE_READY)
+            self.assertEqual(snapshot.statuses, ())
+            self.assertEqual(len(snapshot.stale_statuses), 1)
 
     def test_completed_status_is_hidden_when_active_work_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

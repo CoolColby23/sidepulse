@@ -72,7 +72,7 @@ from .audit import (
     export_status_audit_csv,
     export_status_audit_html,
 )
-from .collector import LiveAgentMonitor, SourceSpec, read_recent_lines
+from .collector import COMPLETED_VISIBLE_SECONDS, LiveAgentMonitor, SourceSpec, read_recent_lines
 from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
@@ -3335,10 +3335,11 @@ def recent_statuses(
 def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
     statuses = list(snapshot.statuses)
     now = snapshot.collected_at
-    retention_seconds = (
+    retention_seconds = min(
         settings.recent_session_retention_seconds
         if settings is not None
-        else DEFAULT_RECENT_SESSION_RETENTION_SECONDS
+        else DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+        COMPLETED_VISIBLE_SECONDS,
     )
     statuses.extend(
         status
