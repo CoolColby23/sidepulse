@@ -2583,18 +2583,8 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
 def add_settings_tab(tab_view, identifier: str, title: str, width: int, height: int):
     item = NSTabViewItem.alloc().initWithIdentifier_(identifier)
     item.setLabel_(title)
-    viewport_height = height - 34
-    scroll = NSScrollView.alloc().initWithFrame_(((0, 0), (width, viewport_height)))
-    scroll.setHasVerticalScroller_(True)
-    scroll.setHasHorizontalScroller_(False)
-    scroll.setAutohidesScrollers_(True)
-    scroll.setBorderType_(0)
-
-    # Keep the existing bottom-anchored layout while allowing room for settings
-    # sections to grow beyond the visible tab without increasing the window size.
-    view = NSView.alloc().initWithFrame_(((0, 0), (width, viewport_height + 80)))
-    scroll.setDocumentView_(view)
-    item.setView_(scroll)
+    view = NSView.alloc().initWithFrame_(((0, 0), (width, height - 34)))
+    item.setView_(view)
     tab_view.addTabViewItem_(item)
     return view
 

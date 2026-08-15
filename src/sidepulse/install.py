@@ -178,6 +178,8 @@ def install_opencode_hooks(
     config = config_path or default_opencode_plugin_path()
     target_log = (log_path or detect_log_path("opencode")).expanduser()
     original = config.read_text() if config.exists() else ""
+    if original and "sidepulse-opencode-plugin" not in original:
+        raise ValueError(f"refusing to overwrite unmanaged OpenCode plugin: {config}")
     new_text = opencode_plugin_source(target_log)
     changed = original != new_text
     backup = None
@@ -193,7 +195,8 @@ def install_opencode_hooks(
 def opencode_plugin_source(log_path: Path) -> str:
     encoded_log = json.dumps(str(log_path.expanduser()))
     return f'''// sidepulse-opencode-plugin
-import {{ appendFile }} from "node:fs/promises"
+import {{ appendFile, mkdir }} from "node:fs/promises"
+import {{ dirname }} from "node:path"
 
 const SIDEPULSE_LOG = {encoded_log}
 
@@ -237,6 +240,7 @@ export const SidePulsePlugin = async ({{ directory, worktree }}) => ({{
     }}
     if (!payload.session_id) return
     try {{
+      await mkdir(dirname(SIDEPULSE_LOG), {{ recursive: true }})
       await appendFile(SIDEPULSE_LOG, JSON.stringify(payload) + "\\n", "utf8")
     }} catch {{
       // Monitoring must never interrupt an OpenCode session.

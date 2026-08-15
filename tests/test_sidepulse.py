@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -384,6 +385,52 @@ class AgentMonitorTests(unittest.TestCase):
             removed = uninstall_opencode_hooks(log_path=log, config_path=plugin)
             self.assertTrue(removed.changed)
             self.assertFalse(plugin.exists())
+
+    def test_opencode_plugin_refuses_to_replace_unmanaged_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plugin = base / "sidepulse.js"
+            plugin.write_text("export const ExistingPlugin = true\n")
+
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite unmanaged"):
+                install_opencode_hooks(
+                    log_path=base / "opencode.jsonl",
+                    config_path=plugin,
+                )
+
+            self.assertEqual(plugin.read_text(), "export const ExistingPlugin = true\n")
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required for OpenCode plugin test")
+    def test_opencode_plugin_emits_t3_busy_and_idle_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plugin = base / "sidepulse.mjs"
+            log = base / "deleted-state" / "opencode.jsonl"
+            install_opencode_hooks(log_path=log, config_path=plugin)
+            log.unlink()
+            log.parent.rmdir()
+
+            runner = base / "run-plugin.mjs"
+            runner.write_text(
+                'import { SidePulsePlugin } from "./sidepulse.mjs"\n'
+                'const hooks = await SidePulsePlugin({directory: "/tmp/project", worktree: "/tmp/project"})\n'
+                'await hooks.event({event: {type: "session.status", properties: {sessionID: "open-session", status: {type: "busy"}}}})\n'
+                'await hooks.event({event: {type: "session.idle", properties: {sessionID: "open-session"}}})\n'
+            )
+            env = {**os.environ, "T3CODE_HOME": str(base / "t3")}
+            completed = subprocess.run(
+                [shutil.which("node"), str(runner)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            payloads = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual([item["event_name"] for item in payloads], ["session.status", "session.idle"])
+            self.assertTrue(all(item["agent_origin"] == "T3 Code" for item in payloads))
 
     def test_grok_log_line_normalizes_camel_case_payload(self) -> None:
         record = parse_log_line(
@@ -1705,11 +1752,6 @@ class AgentMonitorTests(unittest.TestCase):
         ]
         self.assertEqual(len(tab_views), 1)
         self.assertEqual(tab_views[0].numberOfTabViewItems(), 5)
-        for index in range(tab_views[0].numberOfTabViewItems()):
-            scroll_view = tab_views[0].tabViewItemAtIndex_(index).view()
-            self.assertTrue(scroll_view.hasVerticalScroller())
-            self.assertFalse(scroll_view.hasHorizontalScroller())
-            self.assertIsNotNone(scroll_view.documentView())
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("session_terminal", target.settings_fields)
         self.assertIn("custom_terminal_path", target.settings_fields)
