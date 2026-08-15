@@ -204,6 +204,17 @@ Install locally for the `sidepulse` CLI:
 python3 -m pip install -e .
 ```
 
+For an isolated user installation that does not modify system Python packages:
+
+```sh
+./scripts/install-user.sh
+~/.local/bin/sidepulse setup
+```
+
+The installer creates `~/.local/share/sidepulse/venv` and links the CLI into
+`~/.local/bin`. Override `PYTHON_BIN`, `SIDEPULSE_INSTALL_ROOT`, or
+`SIDEPULSE_BIN_DIR` when a different location is needed.
+
 This also installs the Cocoa dependencies for the macOS status-bar app.
 
 Set up this Mac explicitly after package install:
@@ -558,3 +569,43 @@ python3 examples/audio_monitor.py --device /Volumes/SidePulsePro --gain-db 8 --r
 ...
 
 #### 
+
+## Tests
+
+```sh
+python3 -m pip install -e '.[test]'
+python3 -m pytest tests -q
+```
+
+CI runs the suite on macOS and Linux, and a tagged release will not publish
+unless it passes. Four files, each guarding a different failure mode:
+
+| File | Guards against |
+| --- | --- |
+| `tests/test_packaging.py` | Importing a module no dependency declares. Every module-level import must resolve to a declared distribution, so a new `import` without a matching `pyproject.toml` entry fails at commit time rather than on a user's machine. |
+| `tests/test_environment.py` | A working dev machine hiding a broken install. Builds an empty virtualenv, runs `pip install .` against `pyproject.toml` alone, then imports every module and runs the real commands — including `sidepulse status-bar start --foreground` — inside it. An undeclared dependency is simply absent there. |
+| `tests/test_hook_stability.py` | Breaking somebody's agent session. Hooks must exit 0 and stay silent on stdout for every input and internal failure — and must still work with PyObjC entirely unavailable. |
+| `tests/test_status_bar_ui.py` | Menus and windows that build but crash when clicked. Runs headlessly against a real `StatusBarController`; verifies every selector string resolves to a real method. |
+| `tests/test_sidepulse.py` | Collector, settings, install, and provider logic. |
+
+The UI tests skip if AppKit is unavailable. Set `SIDEPULSE_REQUIRE_UI_TESTS=1`
+to turn that skip into a failure, which is how CI runs them.
+
+The clean-room install tests take ~15s because they build a virtualenv and
+install into it. Set `SIDEPULSE_SKIP_CLEAN_INSTALL=1` to skip them while
+iterating; CI always runs them.
+
+### Releasing
+
+`git tag v0.1.0 && git push --tags` runs the full suite, checks the tag against
+the version in `pyproject.toml`, builds, publishes, and then reinstalls the
+release **from PyPI** on clean macOS and Linux runners to re-run the clean-room
+tests against the artifact users actually download.
+
+Bump the version in both `pyproject.toml` and `src/sidepulse/__init__.py` — a
+test fails if they disagree, and the tag guard fails if the tag disagrees with
+either. To point the clean-room tests at any other build:
+
+```sh
+SIDEPULSE_INSTALL_SPEC='sidepulse==0.1.0' python3 -m pytest tests/test_environment.py -v
+```

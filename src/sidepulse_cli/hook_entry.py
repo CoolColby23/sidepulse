@@ -1,4 +1,4 @@
-"""Compatibility launcher for installations that predate the SidePulse rename."""
+"""Compatibility launcher for installations that used the old sidepulse_cli name."""
 
 from __future__ import annotations
 
