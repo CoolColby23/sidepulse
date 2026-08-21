@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 from .battery import (
@@ -19,14 +20,23 @@ from .battery import (
 from .collector import AgentMonitor, SourceSpec, default_sources
 from .device_writer import DEFAULT_FILE_NAME, DeviceWriteError, write_led_program
 from .hook import hook_log_main
+from .ipc import default_event_socket_path, default_latest_state_path
 from .install import (
     claude_hook_settings,
+    install_antigravity_hooks,
     install_claude_hooks,
     install_codex_hooks,
+    install_cursor_hooks,
     install_grok_hooks,
+    uninstall_antigravity_hooks,
+    install_kiro_hooks,
+    install_opencode_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_cursor_hooks,
     uninstall_grok_hooks,
+    uninstall_kiro_hooks,
+    uninstall_opencode_hooks,
 )
 from .led_status import AgentLedController, LedStatusWrite
 from .lid_sleep import (
@@ -40,7 +50,12 @@ from .providers import (
     HOOK_PROVIDERS,
     detect_claude_config,
     detect_codex_config,
+    detect_cursor_config,
     detect_grok_config,
+    detect_antigravity_config,
+    detect_kiro_config,
+    detect_opencode_config,
+    detect_provider_configs,
     detect_log_path,
     default_log_path,
 )
@@ -102,6 +117,10 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     setup.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     setup.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     setup.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    setup.add_argument("--antigravity-log", type=Path, help="Antigravity JSONL log path.")
+    setup.add_argument("--cursor-log", type=Path, help="Cursor JSONL log path.")
+    setup.add_argument("--kiro-log", type=Path, help="Kiro JSONL log path.")
+    setup.add_argument("--opencode-log", type=Path, help="OpenCode JSONL log path.")
     setup.add_argument("--dry-run", action="store_true", help="Show what would change.")
     setup.add_argument(
         "--sd-eject-guard-scope",
@@ -171,6 +190,9 @@ def add_uninstall_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     parser.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     parser.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    parser.add_argument("--antigravity-log", type=Path, help="Antigravity JSONL log path.")
+    parser.add_argument("--cursor-log", type=Path, help="Cursor JSONL log path.")
+    parser.add_argument("--opencode-log", type=Path, help="OpenCode JSONL log path.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would change.")
 
 
@@ -647,6 +669,13 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="Show detected agent hook config.")
     doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    doctor.add_argument("--verbose", action="store_true", help="Check runtime files and recent errors.")
+    doctor.add_argument("--bundle", type=Path, help="Write a redacted diagnostics ZIP archive.")
+    doctor.add_argument(
+        "--preview-bundle",
+        action="store_true",
+        help="Show the exact redacted report and files a diagnostics bundle would contain.",
+    )
     doctor.set_defaults(func=cmd_doctor)
 
     status = subparsers.add_parser("status", help="Show current aggregate status once.")
@@ -692,16 +721,20 @@ def build_parser(prog: str = "agent-monitor") -> argparse.ArgumentParser:
     )
     status_bar.set_defaults(func=cmd_status_bar)
 
-    install = subparsers.add_parser("install", help="Install Codex, Claude, and/or Grok monitor hooks.")
+    install = subparsers.add_parser("install", help="Install supported agent monitor hooks.")
     install.add_argument("provider", choices=("all", *HOOK_PROVIDERS), nargs="?", default="all")
     install.add_argument("--log-dir", type=Path, help="Directory for provider JSONL files.")
     install.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     install.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     install.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    install.add_argument("--antigravity-log", type=Path, help="Antigravity JSONL log path.")
+    install.add_argument("--cursor-log", type=Path, help="Cursor JSONL log path.")
+    install.add_argument("--kiro-log", type=Path, help="Kiro JSONL log path.")
+    install.add_argument("--opencode-log", type=Path, help="OpenCode JSONL log path.")
     install.add_argument("--dry-run", action="store_true", help="Show what would change.")
     install.set_defaults(func=cmd_install)
 
-    uninstall = subparsers.add_parser("uninstall", help="Remove Codex, Claude, and/or Grok monitor hooks.")
+    uninstall = subparsers.add_parser("uninstall", help="Remove supported agent monitor hooks.")
     add_uninstall_arguments(uninstall)
     uninstall.set_defaults(func=cmd_uninstall)
 
@@ -743,11 +776,22 @@ def add_status_args(parser: argparse.ArgumentParser, include_json: bool = True) 
     parser.add_argument("--codex-log", type=Path, help="Codex JSONL log path.")
     parser.add_argument("--claude-log", type=Path, help="Claude JSONL log path.")
     parser.add_argument("--grok-log", type=Path, help="Grok JSONL log path.")
+    parser.add_argument("--antigravity-log", type=Path, help="Antigravity JSONL log path.")
+    parser.add_argument("--cursor-log", type=Path, help="Cursor JSONL log path.")
+    parser.add_argument("--kiro-log", type=Path, help="Kiro JSONL log path.")
+    parser.add_argument("--opencode-log", type=Path, help="OpenCode JSONL log path.")
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    configs = [detect_codex_config(), detect_claude_config(), detect_grok_config()]
+    configs = detect_provider_configs()
     payload = {"providers": [config.to_dict() for config in configs]}
+    if args.verbose or args.bundle or args.preview_bundle:
+        payload["runtime"] = runtime_diagnostics(configs)
+    if args.preview_bundle:
+        payload["bundle_preview"] = diagnostics_bundle_preview(payload)
+    if args.bundle:
+        bundle_path = write_diagnostics_bundle(args.bundle.expanduser(), payload)
+        payload["bundle"] = str(bundle_path)
     if args.json:
         print(json.dumps(payload, indent=2))
         return 0
@@ -758,7 +802,114 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"  hooks enabled: {config.hooks_enabled}")
         print(f"  events: {', '.join(config.hook_events) if config.hook_events else '-'}")
         print(f"  logs: {', '.join(str(path) for path in config.log_paths) if config.log_paths else '-'}")
+    if args.verbose or args.bundle or args.preview_bundle:
+        runtime = payload["runtime"]
+        print("runtime:")
+        print(f"  event socket: {runtime['event_socket']['state']}")
+        print(f"  latest state: {runtime['latest_state']['state']}")
+        print(f"  status-bar errors: {runtime['status_bar_error']['state']}")
+        print(f"  devices: {', '.join(runtime['devices']) if runtime['devices'] else '-'}")
+    if args.bundle:
+        print(f"diagnostics bundle: {payload['bundle']}")
+    if args.preview_bundle:
+        preview = payload["bundle_preview"]
+        print("diagnostics bundle preview:")
+        for item in preview["files"]:
+            print(f"  {item['archive_path']}: {item['description']}")
+        print(f"  excluded: {', '.join(preview['excluded'])}")
+        print("doctor.json preview:")
+        print(json.dumps(preview["doctor_json"], indent=2, default=str))
     return 0
+
+
+def runtime_diagnostics(configs) -> dict:
+    state_dir = default_log_path("codex").parent
+    error_log = state_dir / "status-bar.err.log"
+    return {
+        "event_socket": path_diagnostic(default_event_socket_path()),
+        "latest_state": path_diagnostic(default_latest_state_path()),
+        "status_bar_error": path_diagnostic(error_log),
+        "provider_logs": {
+            config.provider: [path_diagnostic(path) for path in config.log_paths]
+            for config in configs
+        },
+        "devices": sorted(
+            path.name
+            for path in Path("/Volumes").glob("SidePulse*")
+            if path.is_dir()
+        ),
+    }
+
+
+def path_diagnostic(path: Path) -> dict:
+    if not path.exists():
+        return {"path": str(path), "state": "missing"}
+    stat = path.stat()
+    age = max(0.0, time.time() - stat.st_mtime)
+    state = "empty" if path.is_file() and stat.st_size == 0 else "present"
+    return {
+        "path": str(path),
+        "state": state,
+        "size": stat.st_size,
+        "age_seconds": round(age, 1),
+    }
+
+
+def write_diagnostics_bundle(path: Path, payload: dict) -> Path:
+    target = path if path.suffix.lower() == ".zip" else path.with_suffix(".zip")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    state_dir = default_log_path("codex").parent
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("doctor.json", json.dumps(payload, indent=2, default=str))
+        for name in ("status-bar.out.log", "status-bar.err.log"):
+            source = state_dir / name
+            if source.exists():
+                lines = source.read_text(errors="replace").splitlines()[-200:]
+                archive.writestr(f"logs/{name}", "\n".join(lines) + "\n")
+    return target
+
+
+def diagnostics_bundle_preview(payload: dict) -> dict:
+    state_dir = default_log_path("codex").parent
+    doctor_json = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"bundle", "bundle_preview"}
+    }
+    files = [
+        {
+            "archive_path": "doctor.json",
+            "source": "generated",
+            "included": True,
+            "description": "Provider hook paths and runtime health metadata; no config contents.",
+        }
+    ]
+    for name in ("status-bar.out.log", "status-bar.err.log"):
+        source = state_dir / name
+        included_lines = 0
+        if source.exists():
+            included_lines = len(source.read_text(errors="replace").splitlines()[-200:])
+        files.append(
+            {
+                "archive_path": f"logs/{name}",
+                "source": str(source),
+                "included": source.exists(),
+                "included_lines": included_lines,
+                "size_bytes": source.stat().st_size if source.exists() else 0,
+                "description": "Last 200 lines of a SidePulse-owned status-bar log.",
+            }
+        )
+    return {
+        "files": files,
+        "excluded": [
+            "provider configuration contents",
+            "provider event logs",
+            "agent transcripts",
+            "prompts and tool payloads",
+        ],
+        "doctor_sections": sorted(key for key in payload if key != "bundle_preview"),
+        "doctor_json": doctor_json,
+    }
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -865,8 +1016,16 @@ def install_hook_results(args: argparse.Namespace):
             results.append(install_codex_hooks(log_path=log_path, dry_run=args.dry_run))
         elif provider == "claude":
             results.append(install_claude_hooks(log_path=log_path, dry_run=args.dry_run))
-        else:
+        elif provider == "grok":
             results.append(install_grok_hooks(log_path=log_path, dry_run=args.dry_run))
+        elif provider == "antigravity":
+            results.append(install_antigravity_hooks(log_path=log_path, dry_run=args.dry_run))
+        elif provider == "cursor":
+            results.append(install_cursor_hooks(log_path=log_path, dry_run=args.dry_run))
+        elif provider == "kiro":
+            results.append(install_kiro_hooks(log_path=log_path, dry_run=args.dry_run))
+        else:
+            results.append(install_opencode_hooks(log_path=log_path, dry_run=args.dry_run))
     return results
 
 
@@ -891,8 +1050,16 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             results.append(uninstall_codex_hooks(log_path=log_path, dry_run=args.dry_run))
         elif provider == "claude":
             results.append(uninstall_claude_hooks(log_path=log_path, dry_run=args.dry_run))
-        else:
+        elif provider == "grok":
             results.append(uninstall_grok_hooks(log_path=log_path, dry_run=args.dry_run))
+        elif provider == "antigravity":
+            results.append(uninstall_antigravity_hooks(log_path=log_path, dry_run=args.dry_run))
+        elif provider == "cursor":
+            results.append(uninstall_cursor_hooks(log_path=log_path, dry_run=args.dry_run))
+        elif provider == "kiro":
+            results.append(uninstall_kiro_hooks(log_path=log_path, dry_run=args.dry_run))
+        else:
+            results.append(uninstall_opencode_hooks(log_path=log_path, dry_run=args.dry_run))
 
     for result in results:
         action = "would remove" if args.dry_run and result.changed else "removed"

@@ -16,10 +16,19 @@ from pathlib import Path
 from typing import Any
 
 from .providers import (
+    ANTIGRAVITY_EVENTS,
     CLAUDE_EVENTS,
     CODEX_EVENTS,
+    CURSOR_EVENTS,
     GROK_EVENTS,
+    default_antigravity_hook_config_path,
+    default_opencode_plugin_path,
     default_grok_hook_config_path,
+    default_cursor_hook_config_path,
+    KIRO_EVENTS,
+    KIRO_MANAGED_DESCRIPTION,
+    default_grok_hook_config_path,
+    default_kiro_agent_config_path,
     detect_log_path,
 )
 
@@ -63,6 +72,17 @@ def install_codex_hooks(
     block = codex_hook_block(target_log, python_executable)
     new_text = _ensure_trailing_newline(text) + "\n" + block
     changed = new_text != original
+    json_config = config.parent / "hooks.json"
+    manage_json_config = config_path is None or config == Path.home() / ".codex" / "config.toml"
+    json_changed = False
+    if manage_json_config:
+        json_changed = install_codex_json_hooks(
+            json_config,
+            target_log,
+            python_executable=python_executable,
+            dry_run=dry_run,
+        )
+        changed = changed or json_changed
 
     backup = None
     if not dry_run:
@@ -73,6 +93,8 @@ def install_codex_hooks(
 
         if should_refresh_codex_hook_trust(config, config_path):
             trusted_hashes = resolve_codex_hook_hashes(config)
+            if manage_json_config:
+                trusted_hashes.update(resolve_codex_hook_hashes(json_config))
             if trusted_hashes:
                 current_text = config.read_text() if config.exists() else ""
                 trusted_text = update_codex_trusted_hashes(current_text, trusted_hashes)
@@ -86,6 +108,40 @@ def install_codex_hooks(
         target_log.touch(exist_ok=True)
 
     return InstallResult("codex", config, target_log, changed, backup, dry_run)
+
+
+def install_codex_json_hooks(
+    config: Path,
+    log_path: Path,
+    *,
+    python_executable: str | None = None,
+    dry_run: bool = False,
+) -> bool:
+    """Install SidePulse alongside other hooks in Codex's JSON hook file."""
+    data = read_json_config(config)
+    original = json.dumps(data, sort_keys=True)
+    hooks = data.setdefault("hooks", {})
+    command = hook_command("codex", log_path, python_executable)
+    for event_name in CODEX_EVENTS:
+        entries = hooks.get(event_name, [])
+        if not isinstance(entries, list):
+            entries = []
+        cleaned = remove_json_command_hooks_for_log(entries, log_path)
+        cleaned.append(
+            {
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": command}],
+            }
+        )
+        hooks[event_name] = cleaned
+
+    changed = json.dumps(data, sort_keys=True) != original
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        if config.exists():
+            backup_file(config)
+        config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    return changed
 
 
 def install_claude_hooks(
@@ -191,6 +247,234 @@ def install_grok_hooks(
     return InstallResult("grok", config, target_log, changed, backup, dry_run)
 
 
+def install_antigravity_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+    python_executable: str | None = None,
+) -> InstallResult:
+    config = config_path or default_antigravity_hook_config_path()
+    target_log = (log_path or detect_log_path("antigravity")).expanduser()
+    data = read_json_config(config)
+    original = json.dumps(data, sort_keys=True)
+    integration: dict[str, Any] = {}
+    for event_name in ANTIGRAVITY_EVENTS:
+        integration[event_name] = [
+            antigravity_hook_entry(
+                event_name,
+                antigravity_hook_command(event_name, target_log, python_executable),
+            )
+        ]
+    data["sidepulse-agent-monitor"] = integration
+
+    changed = json.dumps(data, sort_keys=True) != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config)
+        config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.touch(exist_ok=True)
+
+    return InstallResult("antigravity", config, target_log, changed, backup, dry_run)
+
+
+def install_kiro_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+    python_executable: str | None = None,
+) -> InstallResult:
+    config = config_path or default_kiro_agent_config_path()
+    target_log = (log_path or detect_log_path("kiro")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    if original:
+        try:
+            current = json.loads(original)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"refusing to overwrite invalid Kiro agent config: {config}") from exc
+        if current.get("description") != KIRO_MANAGED_DESCRIPTION:
+            raise ValueError(f"refusing to overwrite unmanaged Kiro agent config: {config}")
+    command = hook_command("kiro", target_log, python_executable)
+    event_names = {"SessionStart": "agentSpawn", "UserPromptSubmit": "userPromptSubmit", "PreToolUse": "preToolUse", "PostToolUse": "postToolUse", "Stop": "stop"}
+    hooks: dict[str, list[dict[str, Any]]] = {}
+    for event in KIRO_EVENTS:
+        entry: dict[str, Any] = {"command": command, "timeout_ms": 5000}
+        if event in {"PreToolUse", "PostToolUse"}:
+            entry["matcher"] = "*"
+        hooks[event_names[event]] = [entry]
+    new_text = json.dumps(
+        {
+            "name": "sidepulse",
+            "description": KIRO_MANAGED_DESCRIPTION,
+            "tools": ["*"],
+            "hooks": hooks,
+        },
+        indent=2,
+    ) + "\n"
+    changed = new_text != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config) if config.exists() else None
+        config.write_text(new_text)
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.touch(exist_ok=True)
+    return InstallResult("kiro", config, target_log, changed, backup, dry_run)
+
+
+def install_opencode_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+    python_executable: str | None = None,
+) -> InstallResult:
+    del python_executable
+    config = config_path or default_opencode_plugin_path()
+    target_log = (log_path or detect_log_path("opencode")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    if original and "sidepulse-opencode-plugin" not in original:
+        raise ValueError(f"refusing to overwrite unmanaged OpenCode plugin: {config}")
+    new_text = opencode_plugin_source(target_log)
+    changed = original != new_text
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config) if config.exists() else None
+        config.write_text(new_text)
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.touch(exist_ok=True)
+    return InstallResult("opencode", config, target_log, changed, backup, dry_run)
+
+
+def install_cursor_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+    python_executable: str | None = None,
+) -> InstallResult:
+    config = config_path or default_cursor_hook_config_path()
+    target_log = (log_path or detect_log_path("cursor")).expanduser()
+    data = read_json_config(config)
+    original = json.dumps(data, sort_keys=True)
+    data.setdefault("version", 1)
+    hooks = data.setdefault("hooks", {})
+
+    for event_name in CURSOR_EVENTS:
+        entries = hooks.get(event_name, [])
+        if not isinstance(entries, list):
+            entries = []
+        cleaned = remove_cursor_hook_entries(entries)
+        cleaned.append(
+            {
+                "command": cursor_hook_command(
+                    event_name,
+                    target_log,
+                    python_executable,
+                )
+            }
+        )
+        hooks[event_name] = cleaned
+
+    changed = json.dumps(data, sort_keys=True) != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config)
+        config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.touch(exist_ok=True)
+
+    return InstallResult("cursor", config, target_log, changed, backup, dry_run)
+    config = config_path or default_kiro_agent_config_path()
+    target_log = (log_path or detect_log_path("kiro")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    if original:
+        try:
+            current = json.loads(original)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"refusing to overwrite invalid Kiro agent config: {config}") from exc
+        if current.get("description") != KIRO_MANAGED_DESCRIPTION:
+            raise ValueError(f"refusing to overwrite unmanaged Kiro agent config: {config}")
+    command = hook_command("kiro", target_log, python_executable)
+    event_names = {"SessionStart": "agentSpawn", "UserPromptSubmit": "userPromptSubmit", "PreToolUse": "preToolUse", "PostToolUse": "postToolUse", "Stop": "stop"}
+    hooks: dict[str, list[dict[str, Any]]] = {}
+    for event in KIRO_EVENTS:
+        entry: dict[str, Any] = {"command": command, "timeout_ms": 5000}
+        if event in {"PreToolUse", "PostToolUse"}:
+            entry["matcher"] = "*"
+        hooks[event_names[event]] = [entry]
+    new_text = json.dumps({"name": "sidepulse", "description": KIRO_MANAGED_DESCRIPTION, "hooks": hooks}, indent=2) + "\n"
+    changed = new_text != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config) if config.exists() else None
+        config.write_text(new_text)
+        target_log.parent.mkdir(parents=True, exist_ok=True)
+        target_log.touch(exist_ok=True)
+    return InstallResult("kiro", config, target_log, changed, backup, dry_run)
+    return InstallResult("opencode", config, target_log, changed, backup, dry_run)
+
+
+def opencode_plugin_source(log_path: Path) -> str:
+    encoded_log = json.dumps(str(log_path.expanduser()))
+    return f'''// sidepulse-opencode-plugin
+import {{ appendFile, mkdir }} from "node:fs/promises"
+import {{ dirname }} from "node:path"
+
+const SIDEPULSE_LOG = {encoded_log}
+
+function firstString(...values) {{
+  return values.find((value) => typeof value === "string" && value.length > 0)
+}}
+
+function sessionId(event) {{
+  const p = event?.properties ?? {{}}
+  return firstString(p.sessionID, p.sessionId, p.session_id, p.id, p.info?.id, p.session?.id)
+}}
+
+function eventName(event) {{
+  if (event?.type === "session.status") {{
+    const status = event.properties?.status?.type ?? event.properties?.status
+    if (status === "idle") return "session.idle"
+  }}
+  return event?.type
+}}
+
+export const SidePulsePlugin = async ({{ directory, worktree }}) => ({{
+  event: async ({{ event }}) => {{
+    const name = eventName(event)
+    if (!name || ![
+      "session.created", "session.status", "session.idle", "session.error",
+      "permission.asked", "permission.replied", "tool.execute.before", "tool.execute.after"
+    ].includes(name)) return
+
+    const properties = event.properties ?? {{}}
+    const payload = {{
+      event_name: name,
+      session_id: sessionId(event),
+      cwd: firstString(properties.cwd, properties.directory, worktree, directory),
+      tool_name: firstString(properties.tool, properties.toolName),
+      message: firstString(properties.message, properties.error?.message),
+      timestamp: new Date().toISOString(),
+      ...(process.env.T3CODE_HOME || process.env.T3_CODE || process.env.T3CODE ||
+          process.env.T3_MCP_BEARER_TOKEN
+        ? {{ agent_origin: "T3 Code", agent_origin_kind: "opencode_t3code" }}
+        : {{ agent_origin: "OpenCode", agent_origin_kind: "opencode_app" }}),
+    }}
+    if (!payload.session_id) return
+    try {{
+      await mkdir(dirname(SIDEPULSE_LOG), {{ recursive: true }})
+      await appendFile(SIDEPULSE_LOG, JSON.stringify(payload) + "\\n", "utf8")
+    }} catch {{
+      // Monitoring must never interrupt an OpenCode session.
+    }}
+  }},
+}})
+'''
+
+
 def uninstall_codex_hooks(
     log_path: Path | None = None,
     config_path: Path | None = None,
@@ -204,6 +488,12 @@ def uninstall_codex_hooks(
     text = remove_codex_hook_blocks_for_log(text, target_log)
     new_text = _normalize_config_text(text) if text != original else original
     changed = new_text != original
+    json_config = config.parent / "hooks.json"
+    manage_json_config = config_path is None or config == Path.home() / ".codex" / "config.toml"
+    json_changed = False
+    if manage_json_config:
+        json_changed = uninstall_codex_json_hooks(json_config, target_log, dry_run=dry_run)
+        changed = changed or json_changed
 
     backup = None
     if changed and not dry_run:
@@ -212,6 +502,32 @@ def uninstall_codex_hooks(
         config.write_text(new_text)
 
     return InstallResult("codex", config, target_log, changed, backup, dry_run)
+
+
+def uninstall_codex_json_hooks(config: Path, log_path: Path, *, dry_run: bool = False) -> bool:
+    data = read_json_config(config)
+    original = json.dumps(data, sort_keys=True)
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event_name in list(hooks):
+            entries = hooks.get(event_name)
+            if not isinstance(entries, list):
+                continue
+            cleaned = remove_json_command_hooks_for_log(entries, log_path)
+            if cleaned:
+                hooks[event_name] = cleaned
+            else:
+                hooks.pop(event_name, None)
+        if not hooks:
+            data.pop("hooks", None)
+
+    changed = json.dumps(data, sort_keys=True) != original
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        if config.exists():
+            backup_file(config)
+        config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+    return changed
 
 
 def uninstall_claude_hooks(
@@ -302,6 +618,128 @@ def uninstall_grok_hooks(
         clean_grok_live_backup_hook_files(config)
 
     return InstallResult("grok", config, target_log, changed, backup, dry_run)
+
+
+def uninstall_antigravity_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+) -> InstallResult:
+    config = config_path or default_antigravity_hook_config_path()
+    target_log = (log_path or detect_log_path("antigravity")).expanduser()
+    data = read_json_config(config)
+    original = json.dumps(data, sort_keys=True)
+    data.pop("sidepulse-agent-monitor", None)
+
+    changed = json.dumps(data, sort_keys=True) != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config)
+        if data:
+            config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        else:
+            try:
+                config.unlink()
+            except FileNotFoundError:
+                pass
+
+    return InstallResult("antigravity", config, target_log, changed, backup, dry_run)
+
+
+def uninstall_opencode_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+) -> InstallResult:
+    config = config_path or default_opencode_plugin_path()
+    target_log = (log_path or detect_log_path("opencode")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    managed = "sidepulse-opencode-plugin" in original
+    backup = None
+    if managed and not dry_run:
+        backup = backup_file(config)
+        config.unlink()
+    return InstallResult("opencode", config, target_log, managed, backup, dry_run)
+
+
+def uninstall_kiro_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+) -> InstallResult:
+    config = config_path or default_kiro_agent_config_path()
+    target_log = (log_path or detect_log_path("kiro")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    managed = False
+    if original:
+        try:
+            managed = json.loads(original).get("description") == KIRO_MANAGED_DESCRIPTION
+        except json.JSONDecodeError:
+            pass
+    backup = None
+    if managed and not dry_run:
+        backup = backup_file(config)
+        config.unlink()
+    return InstallResult("kiro", config, target_log, managed, backup, dry_run)
+
+
+def uninstall_cursor_hooks(
+    log_path: Path | None = None,
+    config_path: Path | None = None,
+    dry_run: bool = False,
+) -> InstallResult:
+    config = config_path or default_cursor_hook_config_path()
+    target_log = (log_path or detect_log_path("cursor")).expanduser()
+    data = read_json_config(config)
+    original = json.dumps(data, sort_keys=True)
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for event_name in list(hooks):
+            entries = hooks.get(event_name)
+            if not isinstance(entries, list):
+                continue
+            cleaned = remove_cursor_hook_entries(entries)
+            if cleaned:
+                hooks[event_name] = cleaned
+            else:
+                hooks.pop(event_name, None)
+        if not hooks:
+            data.pop("hooks", None)
+
+    changed = json.dumps(data, sort_keys=True) != original
+    backup = None
+    if changed and not dry_run:
+        config.parent.mkdir(parents=True, exist_ok=True)
+        backup = backup_file(config)
+        if data:
+            config.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n")
+        else:
+            try:
+                config.unlink()
+            except FileNotFoundError:
+                pass
+
+    return InstallResult("cursor", config, target_log, changed, backup, dry_run)
+    config = config_path or default_kiro_agent_config_path()
+    target_log = (log_path or detect_log_path("kiro")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    managed = False
+    if original:
+        try:
+            managed = json.loads(original).get("description") == KIRO_MANAGED_DESCRIPTION
+        except json.JSONDecodeError:
+            pass
+    config = config_path or default_opencode_plugin_path()
+    target_log = (log_path or detect_log_path("opencode")).expanduser()
+    original = config.read_text() if config.exists() else ""
+    managed = "sidepulse-opencode-plugin" in original
+    backup = None
+    if managed and not dry_run:
+        backup = backup_file(config)
+        config.unlink()
+    return InstallResult("kiro", config, target_log, managed, backup, dry_run)
+    return InstallResult("opencode", config, target_log, managed, backup, dry_run)
 
 
 def hook_command(
@@ -453,6 +891,66 @@ def grok_hook_entry(event_name: str, command: str) -> dict[str, Any]:
     return entry
 
 
+def antigravity_hook_command(
+    event_name: str,
+    log_path: Path,
+    python_executable: str | None = None,
+) -> str:
+    executable = python_executable or sys.executable or "python3"
+    return " ".join(
+        [
+            shlex.quote(executable),
+            "-m",
+            "sidepulse.antigravity_hook",
+            "--event",
+            shlex.quote(event_name),
+            "--log",
+            shlex.quote(str(log_path.expanduser())),
+        ]
+    )
+
+
+def cursor_hook_command(
+    event_name: str,
+    log_path: Path,
+    python_executable: str | None = None,
+) -> str:
+    executable = python_executable or sys.executable or "python3"
+    return " ".join(
+        [
+            shlex.quote(executable),
+            "-m",
+            "sidepulse.cursor_hook",
+            "--event",
+            shlex.quote(event_name),
+            "--log",
+            shlex.quote(str(log_path.expanduser())),
+        ]
+    )
+
+
+def antigravity_hook_entry(event_name: str, command: str) -> dict[str, Any]:
+    hook: dict[str, Any] = {
+        "type": "command",
+        "command": command,
+        "timeout": 5,
+    }
+    if event_name in {"PreToolUse", "PostToolUse"}:
+        return {"matcher": "*", "hooks": [hook]}
+    return hook
+
+
+def remove_cursor_hook_entries(entries: list[Any]) -> list[Any]:
+    return [
+        entry
+        for entry in entries
+        if not (
+            isinstance(entry, dict)
+            and "sidepulse.cursor_hook" in str(entry.get("command") or "")
+        )
+    ]
+
+
 def hook_pythonpath_assignment() -> str:
     package_root = Path(__file__).resolve().parents[1]
     if not package_root.exists():
@@ -600,12 +1098,20 @@ def resolve_codex_hook_hashes(
         key = hook.get("key")
         if hook.get("sourcePath") != source_path:
             continue
-        if not isinstance(command, str) or "hook_entry.py" not in command:
+        if not isinstance(command, str) or not is_sidepulse_hook_command(command):
             continue
         if not isinstance(current_hash, str) or not isinstance(key, str):
             continue
         trusted_hashes[key] = current_hash
     return trusted_hashes
+
+
+def is_sidepulse_hook_command(command: str) -> bool:
+    return (
+        "hook_entry.py" in command
+        or "sidepulse hook-log" in command
+        or "SidePulse agent-monitor hook-log" in command
+    )
 
 
 def codex_cli_path() -> Path | None:

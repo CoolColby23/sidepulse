@@ -61,8 +61,51 @@ GROK_EVENTS = (
     "SessionEnd",
 )
 
-HOOK_PROVIDERS = ("codex", "claude", "grok")
-KNOWN_EVENTS = tuple(dict.fromkeys(CODEX_EVENTS + CLAUDE_EVENTS + GROK_EVENTS))
+ANTIGRAVITY_EVENTS = (
+    "PreInvocation",
+    "PostInvocation",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+)
+
+OPENCODE_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Stop",
+    "StopFailure",
+    "SessionEnd",
+)
+
+KIRO_EVENTS = (
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+)
+
+CURSOR_EVENTS = (
+    "sessionStart",
+    "sessionEnd",
+    "beforeSubmitPrompt",
+    "preToolUse",
+    "beforeShellExecution",
+    "afterShellExecution",
+    "afterFileEdit",
+    "postToolUse",
+    "postToolUseFailure",
+    "stop",
+)
+
+KIRO_MANAGED_DESCRIPTION = "Kiro agent with SidePulse lifecycle monitoring enabled."
+
+HOOK_PROVIDERS = ("codex", "claude", "grok", "antigravity", "cursor", "kiro", "opencode")
+KNOWN_EVENTS = tuple(dict.fromkeys(CODEX_EVENTS + CLAUDE_EVENTS + GROK_EVENTS + KIRO_EVENTS + OPENCODE_EVENTS))
 
 
 @dataclass(frozen=True)
@@ -101,7 +144,15 @@ def default_log_path(provider: str, home: Path | None = None) -> Path:
 
 
 def detect_provider_configs(home: Path | None = None) -> list[ProviderConfig]:
-    return [detect_codex_config(home), detect_claude_config(home), detect_grok_config(home)]
+    return [
+        detect_codex_config(home),
+        detect_claude_config(home),
+        detect_grok_config(home),
+        detect_antigravity_config(home),
+        detect_cursor_config(home),
+        detect_kiro_config(home),
+        detect_opencode_config(home),
+    ]
 
 
 def detect_codex_config(home: Path | None = None) -> ProviderConfig:
@@ -243,6 +294,149 @@ def detect_grok_config(home: Path | None = None) -> ProviderConfig:
     )
 
 
+def default_antigravity_hook_config_path(home: Path | None = None) -> Path:
+    base = home or Path.home()
+    return base / ".gemini" / "config" / "hooks.json"
+
+
+def detect_antigravity_config(home: Path | None = None) -> ProviderConfig:
+    config_path = default_antigravity_hook_config_path(home)
+    if not config_path.exists():
+        return ProviderConfig("antigravity", config_path, False, False, (), ())
+
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return ProviderConfig("antigravity", config_path, True, False, (), ())
+
+    integration = data.get("sidepulse-agent-monitor") or {}
+    hook_events: list[str] = []
+    paths: list[Path] = []
+    if isinstance(integration, dict):
+        for event_name, entries in integration.items():
+            if event_name not in ANTIGRAVITY_EVENTS or not isinstance(entries, list):
+                continue
+            hook_events.append(event_name)
+            paths.extend(_paths_from_antigravity_entries(entries))
+
+    return ProviderConfig(
+        "antigravity",
+        config_path,
+        True,
+        bool(hook_events),
+        tuple(sorted(set(hook_events))),
+        _dedupe_paths(paths),
+    )
+
+
+def default_opencode_plugin_path(home: Path | None = None) -> Path:
+    if home is not None:
+        config_dir = home / ".config" / "opencode"
+    elif os.environ.get("OPENCODE_CONFIG_DIR"):
+        config_dir = Path(os.environ["OPENCODE_CONFIG_DIR"]).expanduser()
+    elif os.environ.get("XDG_CONFIG_HOME"):
+        config_dir = Path(os.environ["XDG_CONFIG_HOME"]).expanduser() / "opencode"
+    else:
+        config_dir = Path.home() / ".config" / "opencode"
+    return config_dir / "plugins" / "sidepulse.js"
+
+
+def detect_opencode_config(home: Path | None = None) -> ProviderConfig:
+    config_path = default_opencode_plugin_path(home)
+    if not config_path.exists():
+        return ProviderConfig("opencode", config_path, False, False, (), ())
+    try:
+        text = config_path.read_text()
+    except OSError:
+        return ProviderConfig("opencode", config_path, True, False, (), ())
+    enabled = "sidepulse-opencode-plugin" in text
+    paths = list(extract_log_paths_from_command(text))
+    match = re.search(r'const SIDEPULSE_LOG = ("(?:[^"\\]|\\.)*")', text)
+    if match:
+        try:
+            paths.append(Path(json.loads(match.group(1))).expanduser())
+        except (ValueError, json.JSONDecodeError):
+            pass
+    return ProviderConfig(
+        "opencode",
+        config_path,
+        True,
+        enabled,
+        OPENCODE_EVENTS if enabled else (),
+        _dedupe_paths(paths),
+    )
+
+
+def default_cursor_hook_config_path(home: Path | None = None) -> Path:
+    base = home or Path.home()
+    return base / ".cursor" / "hooks.json"
+
+
+def detect_cursor_config(home: Path | None = None) -> ProviderConfig:
+    config_path = default_cursor_hook_config_path(home)
+    if not config_path.exists():
+        return ProviderConfig("cursor", config_path, False, False, (), ())
+
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return ProviderConfig("cursor", config_path, True, False, (), ())
+
+    hooks = data.get("hooks") or {}
+    hook_events: list[str] = []
+    paths: list[Path] = []
+    if isinstance(hooks, dict):
+        for event_name, entries in hooks.items():
+            if event_name not in CURSOR_EVENTS or not isinstance(entries, list):
+                continue
+            managed_entries = [
+                entry
+                for entry in entries
+                if isinstance(entry, dict)
+                and "sidepulse.cursor_hook" in str(entry.get("command") or "")
+            ]
+            if managed_entries:
+                hook_events.append(event_name)
+                paths.extend(_paths_from_cursor_entries(managed_entries))
+
+    return ProviderConfig(
+        "cursor",
+        config_path,
+        True,
+        bool(hook_events),
+        tuple(sorted(set(hook_events))),
+        _dedupe_paths(paths),
+    )
+
+
+def default_kiro_agent_config_path(home: Path | None = None) -> Path:
+    return (home or Path.home()) / ".kiro" / "agents" / "sidepulse.json"
+
+
+def detect_kiro_config(home: Path | None = None) -> ProviderConfig:
+    config_path = default_kiro_agent_config_path(home)
+    if not config_path.exists():
+        return ProviderConfig("kiro", config_path, False, False, (), ())
+    try:
+        data = json.loads(config_path.read_text())
+    except Exception:
+        return ProviderConfig("kiro", config_path, True, False, (), ())
+    hooks = data.get("hooks") or {}
+    events: list[str] = []
+    paths: list[Path] = []
+    if isinstance(hooks, dict):
+        for event_name, entries in hooks.items():
+            canonical = canonical_event_name(event_name)
+            if canonical not in KIRO_EVENTS or not isinstance(entries, list):
+                continue
+            events.append(canonical)
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("command"), str):
+                    paths.extend(extract_log_paths_from_command(entry["command"]))
+    enabled = data.get("description") == KIRO_MANAGED_DESCRIPTION and bool(events)
+    return ProviderConfig("kiro", config_path, True, enabled, tuple(sorted(set(events))), _dedupe_paths(paths))
+
+
 def detect_log_path(provider: str, home: Path | None = None) -> Path:
     if provider == "codex":
         config = detect_codex_config(home)
@@ -250,6 +444,14 @@ def detect_log_path(provider: str, home: Path | None = None) -> Path:
         config = detect_claude_config(home)
     elif provider == "grok":
         config = detect_grok_config(home)
+    elif provider == "antigravity":
+        config = detect_antigravity_config(home)
+    elif provider == "cursor":
+        config = detect_cursor_config(home)
+    elif provider == "kiro":
+        config = detect_kiro_config(home)
+    elif provider == "opencode":
+        config = detect_opencode_config(home)
     else:
         config = ProviderConfig(provider, default_log_path(provider, home), False, False, (), ())
     if config.log_paths:
@@ -348,6 +550,15 @@ def canonical_event_name(value: Any) -> str | None:
             "pre_compact": "PreCompact",
             "post_compact": "PostCompact",
             "stop_failure": "StopFailure",
+            "agent_spawn": "SessionStart",
+            "session_created": "SessionStart",
+            "session_status": "UserPromptSubmit",
+            "session_idle": "Stop",
+            "session_error": "StopFailure",
+            "permission_asked": "PermissionRequest",
+            "permission_replied": "PostToolUse",
+            "tool_execute_before": "PreToolUse",
+            "tool_execute_after": "PostToolUse",
         }
     )
     return aliases.get(normalized)
@@ -367,6 +578,8 @@ def normalize_event_payload(raw: dict[str, Any], event_name: str, logged_at: Any
     _copy_alias(normalized, "toolInput", "tool_input")
     _copy_alias(normalized, "toolResponse", "tool_response")
     _copy_alias(normalized, "lastAssistantMessage", "last_assistant_message")
+    if "last_assistant_message" not in normalized and "assistant_response" in normalized:
+        normalized["last_assistant_message"] = normalized["assistant_response"]
     _copy_alias(normalized, "notificationType", "notification_type")
     _copy_alias(normalized, "agentOrigin", "agent_origin")
     _copy_alias(normalized, "agentOriginKind", "agent_origin_kind")
@@ -395,6 +608,22 @@ def _paths_from_hook_entries(entries: list[Any]) -> list[Path]:
             if isinstance(command, str):
                 paths.extend(extract_log_paths_from_command(command))
     return paths
+
+
+def _paths_from_antigravity_entries(entries: list[Any]) -> list[Path]:
+    paths: list[Path] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        command = entry.get("command")
+        if isinstance(command, str):
+            paths.extend(extract_log_paths_from_command(command))
+        paths.extend(_paths_from_hook_entries([entry]))
+    return paths
+
+
+def _paths_from_cursor_entries(entries: list[Any]) -> list[Path]:
+    return _paths_from_antigravity_entries(entries)
 
 
 def extract_log_paths_from_command(command: str) -> list[Path]:

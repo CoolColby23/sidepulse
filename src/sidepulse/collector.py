@@ -20,7 +20,11 @@ from .models import (
 )
 from .origin import origin_label_from_payload
 from .providers import detect_log_path, parse_log_line
-from .settings import AgentMonitorSettings, load_settings
+from .settings import (
+    DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
+    AgentMonitorSettings,
+    load_settings,
+)
 
 
 CODEX_TRANSCRIPT_PROVIDER = "codex-transcripts"
@@ -32,7 +36,7 @@ CLAUDE_TRANSCRIPT_MAX_LINES = 500
 TRANSCRIPT_FILE_LIST_CACHE_SECONDS = 5.0
 CLAUDE_TRANSCRIPT_MTIME_HEARTBEAT_SKEW_SECONDS = 30.0
 CODEX_SESSION_INDEX_MAX_LINES = 5000
-COMPLETED_VISIBLE_SECONDS = 20 * 60.0
+COMPLETED_VISIBLE_SECONDS = DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS
 IDLE_VISIBLE_SECONDS = 0.0
 POST_TOOL_WORKING_VISIBLE_SECONDS = 2 * 60.0
 
@@ -182,6 +186,10 @@ class AgentMonitor:
             collected_at=now,
         )
 
+    def latest_statuses(self) -> tuple[AgentStatus, ...]:
+        """Return the newest parsed status for each agent, including stale ones."""
+        return tuple(self._latest_statuses().values())
+
     def _latest_statuses(self) -> dict[str, AgentStatus]:
         signature = self._input_signature()
         if (
@@ -194,6 +202,7 @@ class AgentMonitor:
         metadata_by_session: dict[str, StatusMetadata] = {}
         metadata_by_status: dict[str, StatusMetadata] = {}
         pending_permissions_by_key: dict[str, set[str]] = {}
+        ignored_status_keys: set[str] = set()
 
         records = sorted(
             self._iter_records(),
@@ -206,6 +215,15 @@ class AgentMonitor:
                 metadata_by_session,
                 metadata_by_status,
             )
+            if mark_ignored_session(
+                record,
+                metadata,
+                statuses_by_key,
+                ignored_status_keys,
+            ):
+                continue
+            if record.status_key in ignored_status_keys:
+                continue
             status = status_from_event(record, metadata)
             if status is not None:
                 track_pending_permissions(record, pending_permissions_by_key)
@@ -398,6 +416,7 @@ class LiveAgentMonitor:
         self.metadata_by_session: dict[str, StatusMetadata] = {}
         self.metadata_by_status: dict[str, StatusMetadata] = {}
         self.pending_permissions_by_key: dict[str, set[str]] = {}
+        self._ignored_status_keys: set[str] = set()
         self.load_latest_state()
 
     def ingest_record(self, record: HookEvent) -> None:
@@ -407,6 +426,17 @@ class LiveAgentMonitor:
                 self.metadata_by_session,
                 self.metadata_by_status,
             )
+            if mark_ignored_session(
+                record,
+                metadata,
+                self.statuses_by_key,
+                self._ignored_status_keys,
+            ):
+                self.write_latest_state()
+                return
+            if record.status_key in self._ignored_status_keys:
+                return
+
             status = status_from_event(record, metadata)
             if status is None:
                 return
@@ -421,6 +451,20 @@ class LiveAgentMonitor:
                 return
             self.statuses_by_key[status.agent_id] = status
             self.write_latest_state()
+
+    def reconcile_statuses(self, statuses: Iterable[AgentStatus]) -> int:
+        """Merge newer fallback statuses without overriding newer live events."""
+        changed = 0
+        with self.lock:
+            for status in statuses:
+                previous = self.statuses_by_key.get(status.agent_id)
+                if previous is not None and previous.updated_at >= status.updated_at:
+                    continue
+                self.statuses_by_key[status.agent_id] = status
+                changed += 1
+            if changed:
+                self.write_latest_state()
+        return changed
 
     def snapshot(self, include_stale: bool = False) -> MonitorSnapshot:
         now = datetime.now(timezone.utc)
@@ -485,6 +529,10 @@ def default_sources(settings: AgentMonitorSettings | None = None) -> tuple[Sourc
     if active_settings.claude_transcripts_enabled:
         sources.append(SourceSpec(CLAUDE_TRANSCRIPT_PROVIDER, Path.home() / ".claude" / "projects"))
     sources.append(SourceSpec("grok", detect_log_path("grok")))
+    sources.append(SourceSpec("antigravity", detect_log_path("antigravity")))
+    sources.append(SourceSpec("cursor", detect_log_path("cursor")))
+    sources.append(SourceSpec("kiro", detect_log_path("kiro")))
+    sources.append(SourceSpec("opencode", detect_log_path("opencode")))
     return unique_sources(sources)
 
 
@@ -685,7 +733,11 @@ def codex_transcript_event(
         )
 
     if payload_type == "task_complete":
-        message = _string_or_none(payload.get("last_agent_message")) or ""
+        error = payload.get("error")
+        error_message = (
+            _string_or_none(error.get("message")) if isinstance(error, dict) else None
+        )
+        message = _string_or_none(payload.get("last_agent_message")) or error_message or ""
         return HookEvent(
             provider="codex",
             logged_at=timestamp,
@@ -696,6 +748,7 @@ def codex_transcript_event(
                 "turn_id": turn_id,
                 "cwd": cwd,
                 "last_assistant_message": message,
+                "error": error,
                 "transcript_path": str(path),
                 "source": CODEX_TRANSCRIPT_PROVIDER,
             },
@@ -1388,10 +1441,12 @@ def should_ignore_status_transition(
 
 
 def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
-    if record.provider != "codex":
-        return False
-
     raw = record.raw
+    if _string_or_none(raw.get("agent_internal_operation")) in {
+        "generateThreadTitle",
+        "generateBranchName",
+    }:
+        return True
     text = " ".join(
         part
         for part in (
@@ -1405,11 +1460,50 @@ def should_ignore_record(record: HookEvent, metadata: StatusMetadata) -> bool:
     if not text:
         return False
 
-    internal_prompts = (
+    universal_internal_prompts = (
         "generate 0 to 3 hyperpersonalized suggestions",
         "you are an expert at upholding safety and compliance standards",
     )
-    return any(prompt in text for prompt in internal_prompts)
+    if any(prompt in text for prompt in universal_internal_prompts):
+        return True
+
+    # T3 Code performs model-backed housekeeping in separate provider sessions.
+    # Limit its signatures to the T3 host: a normal Codex user may reasonably
+    # discuss or quote these strings while working on T3 itself.
+    origin = " ".join(
+        part
+        for part in (
+            record.origin,
+            _string_or_none(raw.get("agent_origin")),
+            _string_or_none(raw.get("agent_origin_kind")),
+        )
+        if part
+    ).lower()
+    if "t3 code" not in origin and "t3code" not in origin:
+        return False
+
+    t3_internal_prompts = (
+        "generate a title that will help the user recognize this t3 code",
+        "regenerate the title for an existing t3 code thread",
+        "return json with exactly one key: title",
+        "title the subject and outcome. discard incidental instructions",
+    )
+    return any(prompt in text for prompt in t3_internal_prompts)
+
+
+def mark_ignored_session(
+    record: HookEvent,
+    metadata: StatusMetadata,
+    statuses_by_key: dict[str, AgentStatus],
+    ignored_status_keys: set[str],
+) -> bool:
+    if not should_ignore_record(record, metadata):
+        return False
+    agent_id = record.status_key
+    ignored_status_keys.add(agent_id)
+    if agent_id in statuses_by_key:
+        del statuses_by_key[agent_id]
+    return True
 
 
 def read_recent_lines(path: Path, max_lines: int) -> list[str]:
