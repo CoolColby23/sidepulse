@@ -21,10 +21,11 @@ from .led_status import led_count_for_target
 from .led_status import apply_brightness, normalize_brightness
 
 
-BATTERY_LOW_RED = "#FF2600"
-BATTERY_MID_AMBER = "#FFB000"
-BATTERY_HIGH_GREEN = "#00FF66"
-BATTERY_CHARGING_MINT = "#80FFC8"
+# High-visibility tints for battery previews and low-battery alerts.
+BATTERY_LOW_RED = "#FF7466"
+BATTERY_MID_AMBER = "#FFD27A"
+BATTERY_HIGH_GREEN = "#A0FFB8"
+BATTERY_CHARGING_MINT = "#E8FFF6"
 BATTERY_OFF = "#000000"
 DEFAULT_POWER_CHANGE_PREVIEW_SECONDS = 7.0
 

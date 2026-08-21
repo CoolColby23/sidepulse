@@ -183,6 +183,22 @@ class StatusBarTestCase(unittest.TestCase):
             raise unittest.SkipTest("StatusBarController could not be created")
 
 
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_status_bar_instance_cannot_take_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("sidepulse.status_bar.default_state_dir", return_value=Path(tmp)):
+                first = sb.acquire_status_bar_instance_lock()
+                self.assertIsNotNone(first)
+                try:
+                    self.assertIsNone(sb.acquire_status_bar_instance_lock())
+                finally:
+                    sb.release_status_bar_instance_lock(first)
+
+                replacement = sb.acquire_status_bar_instance_lock()
+                self.assertIsNotNone(replacement)
+                sb.release_status_bar_instance_lock(replacement)
+
+
 class SelectorWiringTests(StatusBarTestCase):
     """Menu and button actions are strings; a rename must not go unnoticed."""
 

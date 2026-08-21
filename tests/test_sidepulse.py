@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,10 +54,14 @@ from sidepulse.install import (
     hook_command,
     install_claude_hooks,
     install_codex_hooks,
+    install_codex_json_hooks,
     install_grok_hooks,
+    install_opencode_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_codex_json_hooks,
     uninstall_grok_hooks,
+    uninstall_opencode_hooks,
     update_codex_trusted_hashes,
 )
 from sidepulse.keep_awake import KeepAwakeController, status_file_for_target
@@ -81,10 +86,13 @@ from sidepulse.lid_sleep import (
     run_sudo_pmset_disablesleep,
     sleep_helper_sudoers_rule,
 )
-from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
+from sidepulse.models import AgentMode, AgentStatus, AggregateStatus, HookEvent
 from sidepulse.origin import ProcessInfo, origin_from_processes
+from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
+from sidepulse.origin import ProcessInfo, origin_from_environment, origin_from_processes
 from sidepulse.providers import (
     detect_grok_config,
+    detect_opencode_config,
     default_log_path,
     default_state_dir,
     parse_log_line,
@@ -107,6 +115,7 @@ from sidepulse.session_actions import (
     SESSION_OPEN_VSCODE,
     default_session_open_action,
     session_deep_link,
+    session_open_action_label,
     session_open_target,
     session_resume_command,
     session_vscode_link,
@@ -117,6 +126,7 @@ from sidepulse.settings import (
     CLOSED_LID_AWAKE_NEVER,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
     DEFAULT_HISTORY_TIMEFRAME_SECONDS,
+    DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
     DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
     HISTORY_TIMEFRAME_24H_SECONDS,
     HISTORY_TIMEFRAME_48H_SECONDS,
@@ -147,6 +157,7 @@ from sidepulse.status_bar_launch import (
     STATUS_BAR_DISPLAY_NAME,
     build_launch_agent_plist,
     build_status_bar_launcher_script,
+    build_status_bar_bundle_info,
     install_launch_agent,
     launch_agent_installed,
 )
@@ -311,6 +322,137 @@ class AgentMonitorTests(unittest.TestCase):
             ).label,
             "Claude Code CLI",
         )
+
+    def test_t3_code_origin_wins_over_nested_codex_process(self) -> None:
+        origin = origin_from_processes(
+            "codex",
+            (
+                ProcessInfo(pid=10, ppid=20, comm="codex", command="codex app-server"),
+                ProcessInfo(
+                    pid=20,
+                    ppid=1,
+                    comm="/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+                    command="/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+                ),
+            ),
+        )
+        self.assertIsNotNone(origin)
+        self.assertEqual(origin.label, "T3 Code")
+        self.assertEqual(origin.kind, "codex_t3code")
+
+    def test_t3_code_origin_recognizes_mcp_environment(self) -> None:
+        origin = origin_from_environment(
+            "opencode",
+            {"T3_MCP_BEARER_TOKEN": "present"},
+        )
+        self.assertIsNotNone(origin)
+        self.assertEqual(origin.label, "T3 Code")
+        self.assertEqual(origin.kind, "opencode_t3code")
+
+    def test_opencode_event_names_are_normalized(self) -> None:
+        record = parse_log_line(
+            "opencode",
+            json.dumps(
+                {
+                    "event_name": "tool.execute.before",
+                    "session_id": "open-session",
+                    "cwd": "/tmp/project",
+                    "tool_name": "bash",
+                    "timestamp": "2026-08-14T12:00:00Z",
+                }
+            ),
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(record.provider, "opencode")
+        self.assertEqual(record.event_name, "PreToolUse")
+
+    def test_opencode_session_can_resume_in_terminal(self) -> None:
+        from sidepulse.session_actions import session_resume_command
+
+        status = AgentStatus(
+            provider="opencode",
+            agent_id="opencode:session:open-session",
+            display_name="OpenCode session",
+            mode=AgentMode.COMPLETED,
+            updated_at=datetime.now(timezone.utc),
+            event_name="Stop",
+            session_id="open-session",
+            cwd="/tmp/project",
+        )
+        self.assertEqual(
+            session_resume_command(status),
+            "cd /tmp/project && opencode --session open-session",
+        )
+
+    def test_opencode_plugin_install_detect_and_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plugin = base / ".config" / "opencode" / "plugins" / "sidepulse.js"
+            log = base / "state" / "opencode.jsonl"
+
+            installed = install_opencode_hooks(log_path=log, config_path=plugin)
+            self.assertTrue(installed.changed)
+            self.assertTrue(plugin.exists())
+            self.assertIn("sidepulse-opencode-plugin", plugin.read_text())
+            self.assertIn(str(log), plugin.read_text())
+            self.assertIn("T3_MCP_BEARER_TOKEN", plugin.read_text())
+
+            detected = detect_opencode_config(base)
+            self.assertTrue(detected.hooks_enabled)
+            self.assertEqual(detected.log_paths, (log,))
+
+            repeated = install_opencode_hooks(log_path=log, config_path=plugin)
+            self.assertFalse(repeated.changed)
+
+            removed = uninstall_opencode_hooks(log_path=log, config_path=plugin)
+            self.assertTrue(removed.changed)
+            self.assertFalse(plugin.exists())
+
+    def test_opencode_plugin_refuses_to_replace_unmanaged_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plugin = base / "sidepulse.js"
+            plugin.write_text("export const ExistingPlugin = true\n")
+
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite unmanaged"):
+                install_opencode_hooks(
+                    log_path=base / "opencode.jsonl",
+                    config_path=plugin,
+                )
+
+            self.assertEqual(plugin.read_text(), "export const ExistingPlugin = true\n")
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required for OpenCode plugin test")
+    def test_opencode_plugin_emits_t3_busy_and_idle_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plugin = base / "sidepulse.mjs"
+            log = base / "deleted-state" / "opencode.jsonl"
+            install_opencode_hooks(log_path=log, config_path=plugin)
+            log.unlink()
+            log.parent.rmdir()
+
+            runner = base / "run-plugin.mjs"
+            runner.write_text(
+                'import { SidePulsePlugin } from "./sidepulse.mjs"\n'
+                'const hooks = await SidePulsePlugin({directory: "/tmp/project", worktree: "/tmp/project"})\n'
+                'await hooks.event({event: {type: "session.status", properties: {sessionID: "open-session", status: {type: "busy"}}}})\n'
+                'await hooks.event({event: {type: "session.idle", properties: {sessionID: "open-session"}}})\n'
+            )
+            env = {**os.environ, "T3CODE_HOME": str(base / "t3")}
+            completed = subprocess.run(
+                [shutil.which("node"), str(runner)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            payloads = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual([item["event_name"] for item in payloads], ["session.status", "session.idle"])
+            self.assertTrue(all(item["agent_origin"] == "T3 Code" for item in payloads))
 
     def test_grok_log_line_normalizes_camel_case_payload(self) -> None:
         record = parse_log_line(
@@ -529,7 +671,6 @@ class AgentMonitorTests(unittest.TestCase):
                     {"recorded_at": "2026-07-20T12:00:00Z"},
                     path=blocking_file / "status-history.jsonl",
                 )
-
     def test_hook_event_server_receives_socket_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             received: list[tuple[str, dict]] = []
@@ -647,6 +788,83 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.aggregate.mode, AgentMode.WORKING)
             self.assertIn("startup replay", snapshot.statuses[0].display_name)
 
+    def test_status_bar_reconciles_missing_codex_stop_hook_from_transcript(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        session_id = "eeeeeeee-ffff-7aaa-8bbb-cccccccccccc"
+        live = LiveAgentMonitor()
+        live.ingest_record(
+            HookEvent(
+                provider="codex",
+                logged_at=now,
+                event_name="UserPromptSubmit",
+                raw={"prompt": "try this after the limit"},
+                session_id=session_id,
+            )
+        )
+        transcript = AgentMonitor(sources=())
+        completed = AgentStatus(
+            provider="codex",
+            agent_id=f"codex:session:{session_id}",
+            display_name="Codex limit test",
+            mode=AgentMode.COMPLETED,
+            updated_at=now + timedelta(seconds=2),
+            event_name="Stop",
+            session_id=session_id,
+            message="You've hit your usage limit.",
+        )
+
+        with patch.object(transcript, "latest_statuses", return_value=(completed,)):
+            changed = status_bar.reconcile_codex_terminal_transcripts(live, transcript)
+
+        self.assertEqual(changed, 1)
+        snapshot = live.snapshot()
+        self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
+        self.assertIn("usage limit", snapshot.statuses[0].message)
+
+    def test_status_bar_keeps_newer_live_codex_state_during_reconciliation(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        now = datetime.now(timezone.utc)
+        session_id = "dddddddd-eeee-7fff-8aaa-bbbbbbbbbbbb"
+        live = LiveAgentMonitor()
+        live.ingest_record(
+            HookEvent(
+                provider="codex",
+                logged_at=now,
+                event_name="UserPromptSubmit",
+                raw={"prompt": "a newer request"},
+                session_id=session_id,
+            )
+        )
+        transcript = AgentMonitor(sources=())
+        stale_completion = AgentStatus(
+            provider="codex",
+            agent_id=f"codex:session:{session_id}",
+            display_name="Codex stale completion",
+            mode=AgentMode.COMPLETED,
+            updated_at=now - timedelta(seconds=2),
+            event_name="Stop",
+            session_id=session_id,
+        )
+
+        with patch.object(
+            transcript,
+            "latest_statuses",
+            return_value=(stale_completion,),
+        ):
+            changed = status_bar.reconcile_codex_terminal_transcripts(live, transcript)
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(live.snapshot().aggregate.mode, AgentMode.WORKING)
+
     def test_status_bar_session_menu_title_is_task_and_project(self) -> None:
         try:
             from sidepulse import status_bar
@@ -736,6 +954,27 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIsNotNone(image)
         self.assertEqual(image.size().width, 24)
         self.assertEqual(image.size().height, 18)
+
+    def test_status_bar_t3_origin_uses_t3_icon_without_codex_overlay(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        status = AgentStatus(
+            provider="codex",
+            agent_id="codex:session:abc",
+            display_name="T3 task",
+            mode=AgentMode.WORKING,
+            updated_at=datetime.now(timezone.utc),
+            event_name="UserPromptSubmit",
+            origin="T3 Code",
+        )
+        sentinel = object()
+        with patch("sidepulse.status_bar.host_icon_for_origin", return_value=sentinel):
+            image = status_bar.session_origin_icon_for_status(status)
+
+        self.assertIs(image, sentinel)
 
     def test_status_bar_session_row_icon_combines_status_and_origin(self) -> None:
         try:
@@ -1187,7 +1426,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="grok:session:recent-done",
             display_name="other: Recent done (recent-d)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(minutes=8),
+            updated_at=now - timedelta(seconds=29),
             event_name="Stop",
             session_id="recent-done",
             cwd="/Users/pero/pgit/other",
@@ -1198,7 +1437,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="claude:session:old-done",
             display_name="old: Old done (old-done)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(hours=49),
+            updated_at=now - timedelta(seconds=31),
             event_name="Stop",
             session_id="old-done",
             cwd="/Users/pero/pgit/old",
@@ -1219,7 +1458,7 @@ class AgentMonitorTests(unittest.TestCase):
             ["working", "recent-done"],
         )
 
-    def test_status_bar_recent_statuses_keeps_last_ten_within_retention(self) -> None:
+    def test_status_bar_recent_statuses_respect_completed_visibility_setting(self) -> None:
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1232,7 +1471,7 @@ class AgentMonitorTests(unittest.TestCase):
                 agent_id=f"codex:session:done-{index}",
                 display_name=f"project: Done {index} (done-{index})",
                 mode=AgentMode.COMPLETED,
-                updated_at=now - timedelta(hours=index),
+                updated_at=now - timedelta(seconds=index),
                 event_name="Stop",
                 session_id=f"done-{index}",
                 cwd="/Users/pero/pgit/project",
@@ -1245,7 +1484,7 @@ class AgentMonitorTests(unittest.TestCase):
             agent_id="claude:session:too-old",
             display_name="old: Too old (too-old)",
             mode=AgentMode.COMPLETED,
-            updated_at=now - timedelta(hours=50),
+            updated_at=now - timedelta(seconds=31),
             event_name="Stop",
             session_id="too-old",
             cwd="/Users/pero/pgit/old",
@@ -1269,9 +1508,16 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(statuses[-1].session_id, "done-10")
         self.assertNotIn("too-old", [status.session_id for status in statuses])
 
+        longer = status_bar.recent_statuses(
+            snapshot,
+            AgentMonitorSettings(completed_session_visibility_seconds=60),
+            limit=20,
+        )
+        self.assertIn("too-old", [status.session_id for status in longer])
+
         shorter = status_bar.recent_statuses(
             snapshot,
-            AgentMonitorSettings(recent_session_retention_seconds=2.5 * 60 * 60),
+            AgentMonitorSettings(completed_session_visibility_seconds=2.5),
         )
         self.assertEqual([status.session_id for status in shorter], ["done-1", "done-2"])
 
@@ -1746,9 +1992,10 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("debug_log_status", target.settings_fields)
         self.assertIn("status_history_status", target.settings_fields)
         self.assertIn("status_history_chart", target.settings_fields)
+        self.assertIn("t3code_hook_status", target.settings_fields)
         self.assertIn("session_terminal", target.settings_fields)
         self.assertIn("custom_terminal_path", target.settings_fields)
-        self.assertIn("recent_session_retention_hours", target.settings_fields)
+        self.assertIn("completed_session_visibility_seconds", target.settings_fields)
         self.assertIn("idle_timeout_minutes", target.settings_fields)
         self.assertIn("sleep_prevention_min_battery_percent", target.settings_fields)
         self.assertIn("status_history_timeframe", target.settings_fields)
@@ -1893,7 +2140,10 @@ class AgentMonitorTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             fake = SimpleNamespace(
-                settings=AgentMonitorSettings(idle_timeout_seconds=1234)
+                settings=AgentMonitorSettings(
+                    idle_timeout_seconds=1234,
+                    completed_session_visibility_seconds=45,
+                )
             )
             with (
                 patch(
@@ -1908,6 +2158,7 @@ class AgentMonitorTests(unittest.TestCase):
                 monitor = status_bar.StatusBarController.build_monitor(fake)
 
         self.assertEqual(monitor.stale_after_seconds, 1234)
+        self.assertEqual(monitor.completed_visible_seconds, 45)
 
     def test_status_bar_setup_window_has_first_launch_controls(self) -> None:
         try:
@@ -1924,9 +2175,11 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("eject_guard", target.setup_buttons)
         self.assertIn("eject_guard_uninstall", target.setup_buttons)
         self.assertIn("sleep_helper", target.setup_buttons)
+        self.assertIn("opencode", target.setup_buttons)
         self.assertIn("launch_status", target.setup_fields)
         self.assertIn("eject_status", target.setup_fields)
         self.assertIn("sleep_status", target.setup_fields)
+        self.assertIn("opencode_status", target.setup_fields)
 
     def test_first_launch_setup_window_only_shows_until_completed(self) -> None:
         try:
@@ -2749,6 +3002,39 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertIn(f'[hooks.state."{key}"]', text)
             self.assertIn('trusted_hash = "sha256:new-current-hash"', text)
 
+    def test_codex_json_installer_preserves_other_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config = base / "hooks.json"
+            log = base / "codex.jsonl"
+            config.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {"hooks": [{"type": "command", "command": "echo keep"}]}
+                            ]
+                        }
+                    }
+                )
+            )
+
+            self.assertTrue(
+                install_codex_json_hooks(
+                    config,
+                    log,
+                    python_executable="python3",
+                )
+            )
+            entries = json.loads(config.read_text())["hooks"]["PreToolUse"]
+            commands = [hook["command"] for entry in entries for hook in entry["hooks"]]
+            self.assertIn("echo keep", commands)
+            self.assertTrue(any(str(log) in command for command in commands))
+
+            self.assertTrue(uninstall_codex_json_hooks(config, log))
+            remaining = json.loads(config.read_text())["hooks"]["PreToolUse"]
+            self.assertEqual(remaining, [{"hooks": [{"type": "command", "command": "echo keep"}]}])
+
     def test_update_codex_trusted_hashes_preserves_other_state(self) -> None:
         text = "\n".join(
             [
@@ -3341,6 +3627,34 @@ class AgentMonitorTests(unittest.TestCase):
             changed=True,
             backup_path=None,
         )
+        antigravity_result = SimpleNamespace(
+            provider="antigravity",
+            config_path=Path("/tmp/antigravity-hooks.json"),
+            log_path=Path("/tmp/antigravity.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
+        cursor_result = SimpleNamespace(
+            provider="cursor",
+            config_path=Path("/tmp/cursor-hooks.json"),
+            log_path=Path("/tmp/cursor.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
+        kiro_result = SimpleNamespace(
+            provider="kiro",
+            config_path=Path("/tmp/sidepulse-kiro.json"),
+            log_path=Path("/tmp/kiro.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
+        opencode_result = SimpleNamespace(
+            provider="opencode",
+            config_path=Path("/tmp/sidepulse.js"),
+            log_path=Path("/tmp/opencode.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
         launch_result = SimpleNamespace(
             plist_path=Path("/tmp/io.sidepulse.agentstatus.plist"),
             changed=True,
@@ -3361,6 +3675,26 @@ class AgentMonitorTests(unittest.TestCase):
             patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
             patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
             patch.object(cli_module, "install_grok_hooks", return_value=grok_result) as grok,
+            patch.object(
+                cli_module,
+                "install_antigravity_hooks",
+                return_value=antigravity_result,
+            ) as antigravity,
+            patch.object(
+                cli_module,
+                "install_cursor_hooks",
+                return_value=cursor_result,
+            ) as cursor,
+            patch.object(
+                cli_module,
+                "install_kiro_hooks",
+                return_value=kiro_result,
+            ) as kiro,
+            patch.object(
+                cli_module,
+                "install_opencode_hooks",
+                return_value=opencode_result,
+            ) as opencode,
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
                 return_value=guard_result,
@@ -3376,6 +3710,10 @@ class AgentMonitorTests(unittest.TestCase):
         codex.assert_called_once()
         claude.assert_called_once()
         grok.assert_called_once()
+        antigravity.assert_called_once()
+        cursor.assert_called_once()
+        kiro.assert_called_once()
+        opencode.assert_called_once()
         guard.assert_called_once_with(scope="auto", dry_run=False)
         launch.assert_called_once_with(start=True)
 
@@ -3537,7 +3875,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(
             program_for_display_state(LedDisplayState.IDLE),
-            "off\n#020204 6s pulse\nrepeat",
+            "off\n0:#020611 5.6s pulse;1:#020611 5.6s pulse 240ms;2:#080319 5.6s pulse 480ms;3:#080319 5.6s pulse 720ms;4:#080319 5.6s pulse 720ms;5:#080319 5.6s pulse 480ms;6:#020611 5.6s pulse 240ms;7:#020611 5.6s pulse\nrepeat",
         )
         self.assertEqual(program_for_display_state(LedDisplayState.DONE), "#00FF66")
         self.assertIn("#FF3A00 1.6s pulse", program_for_display_state(LedDisplayState.ASK))
@@ -3578,7 +3916,7 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(
                 (device / "LEDS.LED").read_text(),
-                "off\n#020204 6s pulse\nrepeat",
+                "off\n0:#020611 5.6s pulse;1:#020611 5.6s pulse 240ms;2:#080319 5.6s pulse 480ms;3:#080319 5.6s pulse 720ms;4:#080319 5.6s pulse 720ms;5:#080319 5.6s pulse 480ms;6:#020611 5.6s pulse 240ms;7:#020611 5.6s pulse\nrepeat",
             )
 
             write_mode_to_leds(AgentMode.COMPLETED, device_path=device, brightness=64)
@@ -3684,8 +4022,8 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         self.assertEqual(len(program.splitlines()), 1)
-        self.assertIn("0:#FFB000 360ms ease", program)
-        self.assertIn("3:#FFB000 360ms ease", program)
+        self.assertIn("0:#FFD27A 360ms ease", program)
+        self.assertIn("3:#FFD27A 360ms ease", program)
         self.assertIn("4:#000000 360ms ease", program)
         self.assertNotIn("repeat", program)
 
@@ -3696,9 +4034,9 @@ class AgentMonitorTests(unittest.TestCase):
 
         validate_led_text(program)
         segments = program.split(";")
-        self.assertEqual(segments[0], "0:#00FF66 360ms ease")
-        self.assertEqual(segments[3], "3:#00FF66 360ms ease")
-        self.assertEqual(segments[4], "4:#008F39 360ms ease")
+        self.assertEqual(segments[0], "0:#A0FFB8 360ms ease")
+        self.assertEqual(segments[3], "3:#A0FFB8 360ms ease")
+        self.assertEqual(segments[4], "4:#5A8F67 360ms ease")
         self.assertEqual(segments[5], "5:#000000 360ms ease")
 
     def test_battery_program_uses_brightness_command(self) -> None:
@@ -4298,6 +4636,7 @@ class AgentMonitorTests(unittest.TestCase):
             settings_path = Path(tmp) / "settings.json"
             settings = AgentMonitorSettings().with_agent_list_timing(
                 recent_session_retention_seconds=36 * 60 * 60,
+                completed_session_visibility_seconds=75,
                 idle_timeout_seconds=15 * 60,
             )
 
@@ -4309,10 +4648,15 @@ class AgentMonitorTests(unittest.TestCase):
                 DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
             )
             self.assertEqual(
+                AgentMonitorSettings().completed_session_visibility_seconds,
+                DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
+            )
+            self.assertEqual(
                 AgentMonitorSettings().idle_timeout_seconds,
                 DEFAULT_IDLE_TIMEOUT_SECONDS,
             )
             self.assertEqual(loaded.recent_session_retention_seconds, 36 * 60 * 60)
+            self.assertEqual(loaded.completed_session_visibility_seconds, 75)
             self.assertEqual(loaded.idle_timeout_seconds, 15 * 60)
 
     def test_settings_migrates_missing_agent_list_timing_to_defaults(self) -> None:
@@ -4325,6 +4669,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(
                 loaded.recent_session_retention_seconds,
                 DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+            )
+            self.assertEqual(
+                loaded.completed_session_visibility_seconds,
+                DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
             )
             self.assertEqual(loaded.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS)
 
@@ -4401,6 +4749,25 @@ class AgentMonitorTests(unittest.TestCase):
             loaded = load_settings(settings_path)
 
             self.assertEqual(loaded.brightness_for_device("/Volumes/SidePulseDot"), 96)
+
+    def test_settings_round_trip_per_device_idle_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_path = Path(tmp) / "settings.json"
+            settings = AgentMonitorSettings().with_idle_preset(
+                "music",
+                device_id="/Volumes/SidePulsePro",
+                name="SidePulse Pro",
+                path="/Volumes/SidePulsePro",
+            )
+
+            save_settings(settings, settings_path)
+            loaded = load_settings(settings_path)
+
+            self.assertEqual(loaded.idle_preset, "breathing")
+            self.assertEqual(
+                loaded.idle_preset_for_device("/Volumes/SidePulsePro"),
+                "music",
+            )
 
     def test_settings_round_trip_session_open_preferences(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4619,13 +4986,16 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(plist["RunAtLoad"])
         self.assertEqual(plist["StandardOutPath"], "/tmp/sidepulse.out.log")
         self.assertEqual(plist["StandardErrorPath"], "/tmp/sidepulse.err.log")
-        self.assertNotIn("KeepAlive", plist)
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(plist["ThrottleInterval"], 10)
 
     def test_status_bar_launcher_uses_background_item_name(self) -> None:
         script = build_status_bar_launcher_script(python_executable="/usr/bin/python3")
 
-        self.assertEqual(STATUS_BAR_DISPLAY_NAME, "SidePulse Status Bar")
+        self.assertEqual(STATUS_BAR_DISPLAY_NAME, "SidePulse")
         self.assertIn("exec /usr/bin/python3 -m sidepulse status-bar --foreground", script)
+        self.assertEqual(build_status_bar_bundle_info()["CFBundleIdentifier"], "io.sidepulse.statusbar")
+        self.assertTrue(build_status_bar_bundle_info()["LSUIElement"])
 
     def test_status_bar_launch_agent_installed_checks_plist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4640,6 +5010,24 @@ class AgentMonitorTests(unittest.TestCase):
             script = build_status_bar_launcher_script()
 
         self.assertIn("status-bar start --foreground", script)
+
+    def test_frozen_install_runs_application_binary_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            plist = base / "io.sidepulse.agentstatus.plist"
+            executable = base / "SidePulse.app" / "Contents" / "MacOS" / "SidePulse"
+            with (
+                patch("sidepulse.status_bar_launch.sys.frozen", True, create=True),
+                patch("sidepulse.status_bar_launch.sys.executable", str(executable)),
+                patch("sidepulse.status_bar_launch.default_state_dir", return_value=base / "state"),
+                patch("sidepulse.status_bar_launch.subprocess.run"),
+            ):
+                install_launch_agent(start=False, plist_path=plist)
+
+            self.assertEqual(
+                plistlib.loads(plist.read_bytes())["ProgramArguments"],
+                [str(executable), "status-bar", "start", "--foreground"],
+            )
 
     def test_frozen_hook_command_uses_internal_cli(self) -> None:
         with patch("sidepulse.install.sys.frozen", True, create=True):
@@ -4693,7 +5081,7 @@ class AgentMonitorTests(unittest.TestCase):
             target = base / "io.sidepulse.agentstatus.plist"
             legacy = base / "com.sidepulse.agentstatus.plist"
             pixiepulse_legacy = base / "com.pixiepulse.agentstatus.plist"
-            launcher = base / "SidePulse Status Bar"
+            launcher = base / "SidePulse.app" / "Contents" / "MacOS" / "SidePulse"
             legacy.write_bytes(b"old")
             pixiepulse_legacy.write_bytes(b"old")
 
@@ -4713,6 +5101,7 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertTrue(result.changed)
             self.assertTrue(target.exists())
             self.assertTrue(launcher.exists())
+            self.assertTrue((base / "SidePulse.app" / "Contents" / "Info.plist").exists())
             self.assertEqual(plistlib.loads(target.read_bytes())["ProgramArguments"], [str(launcher)])
             self.assertFalse(legacy.exists())
             self.assertFalse(pixiepulse_legacy.exists())
@@ -5172,10 +5561,10 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(len(snapshot.stale_statuses), 1)
             self.assertEqual(snapshot.stale_statuses[0].mode, AgentMode.COMPLETED)
 
-    def test_completed_status_stays_visible_for_twenty_minutes_by_default(self) -> None:
+    def test_completed_status_clears_after_thirty_seconds_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "codex.jsonl"
-            recent_done = datetime.now(timezone.utc) - timedelta(minutes=19)
+            recent_done = datetime.now(timezone.utc) - timedelta(seconds=31)
             log.write_text(
                 json.dumps(
                     {
@@ -5196,8 +5585,9 @@ class AgentMonitorTests(unittest.TestCase):
             )
             snapshot = monitor.snapshot()
 
-            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
-            self.assertEqual(len(snapshot.statuses), 1)
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.IDLE_READY)
+            self.assertEqual(snapshot.statuses, ())
+            self.assertEqual(len(snapshot.stale_statuses), 1)
 
     def test_completed_status_is_hidden_when_active_work_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5467,6 +5857,211 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(snapshot.aggregate.mode, AgentMode.IDLE_READY)
             self.assertEqual(snapshot.statuses, ())
+
+    def test_t3_code_title_generation_sessions_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "codex.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            title_prompt = (
+                "Generate a title that will help the user recognize this T3 Code "
+                "thread weeks later.\n"
+                "Return JSON with exactly one key: title.\n\n"
+                "Before answering, silently reduce the request to:\n"
+                "- Subject: What system, feature, or problem is this really about?\n"
+                "- Outcome: What does the user ultimately want to understand or change?\n"
+                "- Incidental instructions: What only describes how the agent should do the work?\n\n"
+                "Title the subject and outcome. Discard incidental instructions.\n\n"
+                "User message:\n"
+                "could you clean up the email template"
+            )
+            log.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "logged_at": now,
+                                "event": {
+                                    "hook_event_name": "SessionStart",
+                                    "session_id": "t3-title-session",
+                                    "cwd": "/Users/example/pgit/sidepulse",
+                                    "source": "startup",
+                                    "agent_origin": "T3 Code",
+                                    "agent_origin_kind": "codex_t3code",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "logged_at": now,
+                                "event": {
+                                    "hook_event_name": "UserPromptSubmit",
+                                    "session_id": "t3-title-session",
+                                    "cwd": "/Users/example/pgit/sidepulse",
+                                    "prompt": title_prompt,
+                                    "agent_origin": "T3 Code",
+                                    "agent_origin_kind": "codex_t3code",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "logged_at": now,
+                                "event": {
+                                    "hook_event_name": "Stop",
+                                    "session_id": "t3-title-session",
+                                    "cwd": "/Users/example/pgit/sidepulse",
+                                    "last_assistant_message": '{"title":"Clean email templates"}',
+                                    "agent_origin": "T3 Code",
+                                    "agent_origin_kind": "codex_t3code",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "logged_at": now,
+                                "event": {
+                                    "hook_event_name": "UserPromptSubmit",
+                                    "session_id": "real-t3-work",
+                                    "cwd": "/Users/example/pgit/sidepulse",
+                                    "prompt": "could you clean up the email template",
+                                    "agent_origin": "T3 Code",
+                                    "agent_origin_kind": "codex_t3code",
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("codex", log),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(len(snapshot.statuses), 1)
+            self.assertEqual(snapshot.statuses[0].session_id, "real-t3-work")
+            self.assertEqual(snapshot.statuses[0].mode, AgentMode.WORKING)
+            self.assertNotIn(
+                "Generate a title",
+                snapshot.statuses[0].display_name,
+            )
+            self.assertIn(
+                "clean up the email template",
+                snapshot.statuses[0].display_name.lower(),
+            )
+
+    def test_t3_title_prompt_text_in_standalone_codex_is_not_ignored(self) -> None:
+        record = HookEvent(
+            provider="codex",
+            logged_at=datetime.now(timezone.utc),
+            event_name="UserPromptSubmit",
+            raw={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "real-codex-work",
+                "prompt": "Fix T3's Generate a title that will help the user recognize prompt",
+            },
+            session_id="real-codex-work",
+            message="Fix T3's Generate a title that will help the user recognize prompt",
+        )
+
+        self.assertFalse(
+            collector_module.should_ignore_record(
+                record,
+                collector_module.StatusMetadata(cwd="/tmp/project"),
+            )
+        )
+
+    def test_structured_t3_text_generation_operation_is_ignored(self) -> None:
+        record = HookEvent(
+            provider="codex",
+            logged_at=datetime.now(timezone.utc),
+            event_name="UserPromptSubmit",
+            raw={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "helper",
+                "agent_internal_operation": "generateThreadTitle",
+            },
+            session_id="helper",
+        )
+        self.assertTrue(
+            collector_module.should_ignore_record(
+                record,
+                collector_module.StatusMetadata(cwd="/tmp/project"),
+            )
+        )
+
+    def test_live_ingest_clears_t3_title_generation_session(self) -> None:
+        store = collector_module.LiveAgentMonitor(
+            sources=(),
+            stale_after_seconds=3600,
+        )
+        now = datetime.now(timezone.utc)
+        session_id = "t3-title-live"
+        start = HookEvent(
+            provider="codex",
+            logged_at=now,
+            event_name="SessionStart",
+            raw={
+                "hook_event_name": "SessionStart",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "agent_origin": "T3 Code",
+            },
+            session_id=session_id,
+            cwd="/tmp/project",
+            origin="T3 Code",
+        )
+        store.ingest_record(start)
+        self.assertEqual(len(store.statuses_by_key), 1)
+
+        title = HookEvent(
+            provider="codex",
+            logged_at=now,
+            event_name="UserPromptSubmit",
+            raw={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "prompt": (
+                    "Generate a title that will help the user recognize this T3 Code "
+                    "thread weeks later.\nReturn JSON with exactly one key: title.\n"
+                    "Title the subject and outcome. Discard incidental instructions.\n"
+                    "User message:\nfix the LED mapping"
+                ),
+                "agent_origin": "T3 Code",
+            },
+            session_id=session_id,
+            cwd="/tmp/project",
+            message=(
+                "Generate a title that will help the user recognize this T3 Code "
+                "thread weeks later."
+            ),
+            origin="T3 Code",
+        )
+        store.ingest_record(title)
+        self.assertEqual(store.statuses_by_key, {})
+
+        stop = HookEvent(
+            provider="codex",
+            logged_at=now,
+            event_name="Stop",
+            raw={
+                "hook_event_name": "Stop",
+                "session_id": session_id,
+                "cwd": "/tmp/project",
+                "last_assistant_message": '{"title":"Fix LED mapping"}',
+                "agent_origin": "T3 Code",
+            },
+            session_id=session_id,
+            cwd="/tmp/project",
+            message='{"title":"Fix LED mapping"}',
+            origin="T3 Code",
+        )
+        store.ingest_record(stop)
+        self.assertEqual(store.statuses_by_key, {})
+
 
     def test_codex_transcript_fallback_marks_recent_user_turn_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5763,6 +6358,63 @@ class AgentMonitorTests(unittest.TestCase):
 
             self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
             self.assertEqual(snapshot.statuses[0].event_name, "Stop")
+
+    def test_codex_transcript_usage_limit_completes_without_stop_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_id = "019ff788-2e54-7f12-8d13-91b66abe029d"
+            path = root / f"rollout-2026-08-12T15-52-04-{session_id}.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": now,
+                                "type": "turn_context",
+                                "payload": {"cwd": "/tmp/project", "turn_id": "turn-1"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": now,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "continue"}],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": now,
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "task_complete",
+                                    "turn_id": "turn-1",
+                                    "last_agent_message": None,
+                                    "error": {
+                                        "message": "You've hit your usage limit.",
+                                        "codex_error_info": "usage_limit_exceeded",
+                                    },
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            monitor = AgentMonitor(
+                sources=(SourceSpec("codex-transcripts", root),),
+                stale_after_seconds=3600,
+            )
+            snapshot = monitor.snapshot()
+
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
+            self.assertEqual(snapshot.statuses[0].event_name, "Stop")
+            self.assertIn("usage limit", snapshot.statuses[0].message)
 
     def test_claude_transcript_fallback_marks_tool_calls_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6500,6 +7152,16 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
             default_session_open_action(status_for("codex", "Codex UI")),
             SESSION_OPEN_APP,
         )
+        t3_status = status_for("codex", "T3 Code")
+        self.assertEqual(default_session_open_action(t3_status), SESSION_OPEN_APP)
+        self.assertEqual(
+            session_open_target(t3_status, SESSION_OPEN_APP),
+            ("application", "t3code"),
+        )
+        self.assertEqual(
+            session_open_action_label(t3_status, SESSION_OPEN_APP),
+            "Open T3 Code",
+        )
 
     def test_claude_session_actions_build_app_link_and_resume_command(self) -> None:
         status = AgentStatus(
@@ -6528,6 +7190,31 @@ team id YOUR_TEAM_ID, push key '/path/to/AuthKey_YOUR_KEY_ID.p8'
             (
                 "url",
                 "vscode://anthropic.claude-code/open?session=1ca4348e-2aec-4147-9e81-d7d56364d257",
+            ),
+        )
+
+    def test_kiro_session_action_resumes_in_terminal(self) -> None:
+        status = AgentStatus(
+            provider="kiro",
+            agent_id="kiro:session:abc",
+            display_name="Kiro abc",
+            mode=AgentMode.WAITING_FOR_INPUT,
+            updated_at=datetime.now(timezone.utc),
+            event_name="agentSpawn",
+            session_id="kiro-session-123",
+            cwd="/Users/example/My Project",
+        )
+
+        self.assertEqual(
+            session_resume_command(status),
+            "cd '/Users/example/My Project' && kiro-cli chat --resume-id kiro-session-123",
+        )
+        self.assertEqual(default_session_open_action(status), SESSION_OPEN_TERMINAL)
+        self.assertEqual(
+            session_open_target(status, SESSION_OPEN_TERMINAL),
+            (
+                "terminal",
+                "cd '/Users/example/My Project' && kiro-cli chat --resume-id kiro-session-123",
             ),
         )
 

@@ -33,3 +33,15 @@ and configures hooks and per-user LaunchAgents for the logged-in user.
 For local packaging verification when release certificates are unavailable,
 run `ALLOW_UNSIGNED=1 ./packaging/build_macos_pkg.sh`. That output is explicitly
 not suitable for distribution and cannot be notarized.
+
+For local development, build, install, and configure the standalone app in one
+step:
+
+```sh
+./scripts/install-macos-local.sh
+```
+
+This installs an ad-hoc-signed `/Applications/SidePulse.app` and starts its
+LaunchAgent from the frozen SidePulse executable. As a result, macOS attributes
+the running menu-bar app and its permissions to SidePulse instead of Python.
+Use the signed and notarized PKG workflow above for distribution to other Macs.
