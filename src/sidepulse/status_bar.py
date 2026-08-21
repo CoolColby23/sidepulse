@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -48,7 +50,8 @@ try:
         NSWindowStyleMaskTitled,
         NSVariableStatusItemLength,
     )
-    from Foundation import NSObject, NSString, NSTimer, NSURL
+    from Foundation import NSObject, NSProcessInfo, NSString, NSTimer, NSURL
+    from Quartz import CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess
 except ImportError as exc:  # pragma: no cover - only exercised on non-macOS setups.
     raise SystemExit(
         f"The status-bar app requires PyObjC/AppKit ({exc}):\n"
@@ -67,12 +70,26 @@ from .battery import (
     program_for_battery,
     read_battery_snapshot,
 )
+from .ambient import (
+    BatteryThresholdAlert,
+    SystemAudioMeter,
+    battery_warning_program,
+    music_visualizer_program,
+)
 from .audit import (
     default_status_audit_log_path,
     export_status_audit_csv,
     export_status_audit_html,
+    rotate_status_audit_log,
 )
-from .collector import LiveAgentMonitor, SourceSpec, read_recent_lines
+from .collector import (
+    CODEX_TRANSCRIPT_PROVIDER,
+    COMPLETED_VISIBLE_SECONDS,
+    AgentMonitor,
+    LiveAgentMonitor,
+    SourceSpec,
+    read_recent_lines,
+)
 from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
@@ -91,9 +108,16 @@ from .install import (
     install_claude_hooks,
     install_codex_hooks,
     install_grok_hooks,
+    install_kiro_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
     uninstall_grok_hooks,
+    uninstall_kiro_hooks,
+    install_opencode_hooks,
+    uninstall_claude_hooks,
+    uninstall_codex_hooks,
+    uninstall_grok_hooks,
+    uninstall_opencode_hooks,
 )
 from .led_status import (
     AgentLedController,
@@ -101,6 +125,7 @@ from .led_status import (
     brightness_percent,
     normalize_brightness,
     normalized_device_name,
+    led_count_for_target,
     program_for_display_state,
     write_mode_to_leds,
     display_state_for_mode,
@@ -119,6 +144,8 @@ from .providers import (
     detect_claude_config,
     detect_codex_config,
     detect_grok_config,
+    detect_kiro_config,
+    detect_opencode_config,
     detect_log_path,
     default_state_dir,
     parse_log_line,
@@ -144,10 +171,16 @@ from .settings import (
     CLOSED_LID_AWAKE_CHOICES,
     CLOSED_LID_AWAKE_NEVER,
     DEFAULT_IDLE_TIMEOUT_SECONDS,
-    DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
+    DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
     LED_DISPLAY_AGENT,
     LED_DISPLAY_BATTERY,
     LED_DISPLAY_CUSTOM,
+    IDLE_PRESET_BATTERY,
+    IDLE_PRESET_BREATHING,
+    IDLE_PRESET_CHOICES,
+    IDLE_PRESET_MUSIC,
+    IDLE_PRESET_OFF,
+    IDLE_PRESET_SOLID,
     LID_ANIMATION_CLOSED,
     LID_ANIMATION_OPEN,
     TERMINAL_APP_ALACRITTY,
@@ -218,6 +251,19 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
 STATUS_BAR_SESSION_HISTORY_LIMIT = 10
+AMBIENT_REFRESH_SECONDS = 0.20
+MUSIC_WRITE_INTERVAL_SECONDS = 0.50
+MUSIC_LEVEL_STEPS = 12
+
+
+def system_audio_helper_path() -> Path:
+    """Use the signed helper bundled with the app, with a source-install fallback."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        bundled = Path(bundle_root) / "system-audio-meter"
+        if bundled.exists():
+            return bundled
+    return Path.home() / ".local" / "share" / "sidepulse" / "system-audio-meter"
 SCREEN_BAR_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
 STATUS_BAR_STARTUP_REPLAY_LINES = 200
@@ -230,6 +276,13 @@ CLOSED_LID_AWAKE_LABELS = {
     CLOSED_LID_AWAKE_NEVER: "Never",
     CLOSED_LID_AWAKE_AGENTS: "When Agents Work",
     CLOSED_LID_AWAKE_ALWAYS: "Always",
+}
+IDLE_PRESET_LABELS = {
+    IDLE_PRESET_BREATHING: "Breathing Wave",
+    IDLE_PRESET_SOLID: "Dim Solid",
+    IDLE_PRESET_MUSIC: "Music Visualizer",
+    IDLE_PRESET_BATTERY: "Battery Level",
+    IDLE_PRESET_OFF: "Off",
 }
 TERMINAL_APP_LABELS = {
     TERMINAL_APP_TERMINAL: "Terminal",
@@ -282,7 +335,7 @@ def state_for_mode(mode: AgentMode) -> StatusBarState:
 def replay_recent_debug_logs(
     monitor: LiveAgentMonitor,
     *,
-    providers: tuple[str, ...] = ("codex", "claude", "grok"),
+    providers: tuple[str, ...] = ("codex", "claude", "grok", "opencode"),
     max_lines: int = STATUS_BAR_STARTUP_REPLAY_LINES,
 ) -> int:
     replayed = 0
@@ -303,6 +356,19 @@ def replay_recent_debug_logs(
     return replayed
 
 
+def reconcile_codex_terminal_transcripts(
+    monitor: LiveAgentMonitor,
+    transcript_monitor: AgentMonitor,
+) -> int:
+    """Recover terminal Codex states that can be omitted from live hooks."""
+    terminal = (
+        status
+        for status in transcript_monitor.latest_statuses()
+        if status.provider == "codex" and status.event_name == "Stop"
+    )
+    return monitor.reconcile_statuses(terminal)
+
+
 class StatusBarController(NSObject):
     def init(self):
         self = objc.super(StatusBarController, self).init()
@@ -311,15 +377,18 @@ class StatusBarController(NSObject):
 
         self.settings = load_settings()
         self.monitor = self.build_monitor()
+        self.codex_terminal_monitor = self.build_codex_terminal_monitor()
         self.event_server = None
         self.status_item = None
         self.timer = None
         self.lid_timer = None
         self.device_timer = None
+        self.ambient_timer = None
         self.settings_window = None
         self.setup_window = None
         self.settings_fields = {}
         self.settings_buttons = {}
+        self.settings_message_generation = 0
         self.setup_fields = {}
         self.setup_buttons = {}
         self.last_snapshot = None
@@ -327,12 +396,15 @@ class StatusBarController(NSObject):
         self.last_battery_error = None
         self.last_power_connected = None
         self.battery_preview_until = 0.0
+        self.battery_threshold_alert = BatteryThresholdAlert()
         self.current_state = STATE_IDLE
         self.led_controller = AgentLedController()
         self.battery_led_controller = BatteryLedController()
         self.agent_led_controllers_by_device = {}
         self.battery_led_controllers_by_device = {}
         self.last_led_display_kind_by_device = {}
+        self.last_custom_program_by_device = {}
+        self.last_custom_write_at_by_device = {}
         self.device_errors = {}
         self.leds_enabled = True
         self.led_sync_in_flight = False
@@ -352,10 +424,16 @@ class StatusBarController(NSObject):
         self.led_animation_until_monotonic = 0.0
         self.led_animation_token = 0
         self.virtual_status_device = VirtualStatusDevice.alloc().init()
+        self.system_audio_meter = SystemAudioMeter(
+            system_audio_helper_path(),
+            logger=lambda message: log_status_bar(f"system audio: {message}"),
+        )
         return self
 
     def applicationDidFinishLaunching_(self, _notification):
+        NSProcessInfo.processInfo().setProcessName_("SidePulse")
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        self.remove_unavailable_virtual_device()
         log_status_bar("launching status item")
         self.start_event_server()
         self.replay_debug_logs()
@@ -391,15 +469,43 @@ class StatusBarController(NSObject):
             None,
             True,
         )
+        self.sync_system_audio_meter()
+        self.ambient_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            AMBIENT_REFRESH_SECONDS,
+            self,
+            "refreshAmbient:",
+            None,
+            True,
+        )
         self.show_setup_window_if_needed()
         if SCREEN_BAR_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
             self.virtual_status_device.show()
         else:
             self.virtual_status_device.hide()
 
+    def remove_unavailable_virtual_device(self) -> None:
+        if SCREEN_BAR_FEATURE_ENABLED:
+            return
+        has_virtual_device = any(
+            device.device_id == VIRTUAL_DEVICE_ID for device in self.settings.devices
+        )
+        if not self.settings.virtual_status_device_enabled and not has_virtual_device:
+            return
+        try:
+            self.settings = self.settings.with_virtual_status_device(False)
+            self.settings = self.settings.without_device(VIRTUAL_DEVICE_ID)
+            save_settings(self.settings)
+            log_status_bar("removed unavailable Screen Bar setting")
+        except Exception as exc:
+            log_status_bar(f"could not remove unavailable Screen Bar setting: {exc}")
+
     @objc.IBAction
     def refresh_(self, _sender):
         try:
+            reconcile_codex_terminal_transcripts(
+                self.monitor,
+                self.codex_terminal_monitor,
+            )
             snapshot = self.monitor.snapshot(include_stale=False)
         except Exception as exc:
             log_status_bar(f"refresh error: {exc}")
@@ -411,6 +517,15 @@ class StatusBarController(NSObject):
 
         self.last_snapshot = snapshot
         battery_snapshot = self.read_battery_snapshot()
+        if battery_snapshot is not None:
+            threshold = self.battery_threshold_alert.update(
+                battery_snapshot.percent,
+                snapshot.aggregate.mode,
+            )
+            if threshold is not None:
+                log_status_bar(f"battery low warning threshold={threshold}%")
+                self.reset_led_controllers_for_display_change()
+        self.battery_threshold_alert.adjust_for_mode(snapshot.aggregate.mode)
         state = state_for_mode(snapshot.aggregate.mode)
         self.observe_connected_devices()
         self.set_status(state)
@@ -421,6 +536,19 @@ class StatusBarController(NSObject):
             self.active_led_display_kind(battery_snapshot),
         )
         self.status_item.setMenu_(build_menu(snapshot, state, self))
+
+    @objc.IBAction
+    def refreshAmbient_(self, _sender):
+        if self.last_snapshot is None:
+            return
+        mode = self.last_snapshot.aggregate.mode
+        self.battery_threshold_alert.adjust_for_mode(mode)
+        if self.battery_threshold_alert.active() or mode == AgentMode.IDLE_READY:
+            self.sync_leds(
+                mode,
+                self.last_battery_snapshot,
+                self.active_led_display_kind(self.last_battery_snapshot),
+            )
 
     @objc.IBAction
     def forceRefresh_(self, _sender):
@@ -585,6 +713,20 @@ class StatusBarController(NSObject):
         self.update_hooks("grok", install=False)
 
     @objc.IBAction
+    def installKiroHooks_(self, _sender):
+        self.update_hooks("kiro", install=True)
+
+    @objc.IBAction
+    def uninstallKiroHooks_(self, _sender):
+        self.update_hooks("kiro", install=False)
+    def installOpenCodeHooks_(self, _sender):
+        self.update_hooks("opencode", install=True)
+
+    @objc.IBAction
+    def uninstallOpenCodeHooks_(self, _sender):
+        self.update_hooks("opencode", install=False)
+
+    @objc.IBAction
     def toggleCodexTranscripts_(self, sender):
         self.set_transcript_monitoring("codex", sender.state() == NSOnState)
 
@@ -603,6 +745,74 @@ class StatusBarController(NSObject):
     @objc.IBAction
     def toggleBatteryPowerPreview_(self, _sender):
         self.set_battery_power_preview(not self.settings.battery_show_on_power_change)
+
+    @objc.IBAction
+    def toggleBatteryThresholdAlerts_(self, _sender):
+        self.settings = self.settings.with_ambient_features(
+            battery_alerts=not self.settings.battery_threshold_alerts_enabled
+        )
+        save_settings(self.settings)
+        self.refresh_(None)
+
+    @objc.IBAction
+    def toggleMusicVisualizer_(self, _sender):
+        enabled = not self.settings.music_visualizer_enabled
+        self.settings = self.settings.with_ambient_features(music_visualizer=enabled)
+        self.settings = self.settings.with_idle_preset(
+            IDLE_PRESET_MUSIC if enabled else IDLE_PRESET_BREATHING
+        )
+        save_settings(self.settings)
+        self.sync_system_audio_meter()
+        self.reset_led_controllers_for_display_change()
+        self.refresh_(None)
+
+    @objc.IBAction
+    def setIdlePreset_(self, sender):
+        payload = sender.representedObject()
+        if not isinstance(payload, dict):
+            return
+        preset = payload.get("preset")
+        device_id = payload.get("device_id")
+        if preset not in IDLE_PRESET_CHOICES:
+            return
+        device = next(
+            (item for item in self.status_bar_devices(remember=False) if item.device_id == device_id),
+            None,
+        )
+        self.settings = self.settings.with_idle_preset(
+            preset,
+            device_id=device_id,
+            name=device.name if device else None,
+            path=str(device.root) if device else None,
+        )
+        if preset == IDLE_PRESET_MUSIC and not self.settings.music_visualizer_enabled:
+            self.settings = self.settings.with_ambient_features(music_visualizer=True)
+        save_settings(self.settings)
+        self.sync_system_audio_meter()
+        self.reset_led_controllers_for_display_change()
+        self.set_settings_message(f"Idle mode: {IDLE_PRESET_LABELS[preset]}.")
+        self.refresh_(None)
+
+    @objc.IBAction
+    def requestScreenCapturePermission_(self, _sender):
+        granted = bool(CGPreflightScreenCaptureAccess() or CGRequestScreenCaptureAccess())
+        self.set_settings_message(
+            "Screen & System Audio Recording permission granted."
+            if granted
+            else "Permission not granted. Enable SidePulse in System Settings."
+        )
+        self.refresh_settings_window()
+
+    @objc.IBAction
+    def openScreenCaptureSettings_(self, _sender):
+        open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+
+    def sync_system_audio_meter(self) -> None:
+        if self.settings.music_visualizer_enabled:
+            if not self.system_audio_meter.start():
+                log_status_bar(f"system audio unavailable: {self.system_audio_meter.last_error}")
+        else:
+            self.system_audio_meter.stop()
 
     @objc.IBAction
     def setBatteryPowerPreviewFromCheckbox_(self, sender):
@@ -674,6 +884,7 @@ class StatusBarController(NSObject):
 
     def applicationWillTerminate_(self, _notification):
         self.stop_event_server()
+        self.system_audio_meter.stop()
         self.closed_lid_awake.release()
         self.keep_awake.release()
 
@@ -696,11 +907,23 @@ class StatusBarController(NSObject):
         return LiveAgentMonitor(
             sources=(SourceSpec("event-bus", socket_path),),
             stale_after_seconds=self.settings.idle_timeout_seconds,
+            completed_visible_seconds=self.settings.completed_session_visibility_seconds,
             latest_state_path=default_latest_state_path(),
+        )
+
+    def build_codex_terminal_monitor(self) -> AgentMonitor:
+        return AgentMonitor(
+            sources=(
+                SourceSpec(
+                    CODEX_TRANSCRIPT_PROVIDER,
+                    Path.home() / ".codex" / "sessions",
+                ),
+            ),
         )
 
     def reload_monitor(self) -> None:
         self.monitor = self.build_monitor()
+        self.codex_terminal_monitor = self.build_codex_terminal_monitor()
 
     def start_event_server(self) -> None:
         self.stop_event_server()
@@ -774,6 +997,13 @@ class StatusBarController(NSObject):
         launch_installed = launch_agent_installed()
         eject_installed = sd_eject_guard_installed()
         sleep_installed = sleep_helper_installed()
+        codex = detect_codex_config()
+        claude = detect_claude_config()
+        grok = detect_grok_config()
+        opencode = detect_opencode_config()
+        integrations_installed = all(
+            config.hooks_enabled for config in (codex, claude, grok, opencode)
+        )
 
         set_field_value(
             self.setup_fields.get("launch_status"),
@@ -787,9 +1017,14 @@ class StatusBarController(NSObject):
             self.setup_fields.get("sleep_status"),
             "Installed" if sleep_installed else "Needs administrator setup",
         )
+        set_field_value(
+            self.setup_fields.get("opencode_status"),
+            "Installed" if integrations_installed else "Not installed",
+        )
         self.set_setup_checkbox("launch", True, enabled=not launch_installed)
         self.set_setup_checkbox("eject_guard", True, enabled=not eject_installed)
         self.set_setup_checkbox("sleep_helper", True, enabled=not sleep_installed)
+        self.set_setup_checkbox("opencode", True, enabled=not integrations_installed)
         eject_uninstall = self.setup_buttons.get("eject_guard_uninstall")
         if eject_uninstall is not None:
             eject_uninstall.setEnabled_(eject_installed)
@@ -805,6 +1040,22 @@ class StatusBarController(NSObject):
         messages: list[str] = []
         errors: list[str] = []
         opened_sleep_installer = False
+
+        if checkbox_is_on(self.setup_buttons.get("opencode")):
+            try:
+                results = (
+                    install_codex_hooks(),
+                    install_claude_hooks(),
+                    install_grok_hooks(),
+                    install_opencode_hooks(),
+                )
+                messages.append(
+                    "Agent integrations for OpenCode / T3 Code installed."
+                    if any(result.changed for result in results)
+                    else "Agent integrations for OpenCode / T3 Code already installed."
+                )
+            except Exception as exc:
+                errors.append(f"OpenCode / T3 Code monitoring failed: {exc}")
 
         if checkbox_is_on(self.setup_buttons.get("launch")) and not launch_agent_installed():
             try:
@@ -890,6 +1141,8 @@ class StatusBarController(NSObject):
         codex = detect_codex_config()
         claude = detect_claude_config()
         grok = detect_grok_config()
+        kiro = detect_kiro_config()
+        opencode = detect_opencode_config()
         set_field_value(
             self.settings_fields.get("codex_hook_status"),
             hook_status_text(codex),
@@ -901,6 +1154,15 @@ class StatusBarController(NSObject):
         set_field_value(
             self.settings_fields.get("grok_hook_status"),
             hook_status_text(grok),
+        )
+        set_field_value(self.settings_fields.get("kiro_hook_status"), hook_status_text(kiro))
+        set_field_value(
+            self.settings_fields.get("opencode_hook_status"),
+            hook_status_text(opencode),
+        )
+        set_field_value(
+            self.settings_fields.get("t3code_hook_status"),
+            "Automatic · uses the selected agent's hooks",
         )
         set_field_value(
             self.settings_fields.get("settings_path"),
@@ -926,7 +1188,15 @@ class StatusBarController(NSObject):
             self.settings_buttons.get("battery_power_preview"),
             self.settings.battery_show_on_power_change,
         )
-        for provider in ("codex", "claude", "grok"):
+        set_field_value(
+            self.settings_fields.get("screen_capture_status"),
+            (
+                "Permission: granted"
+                if CGPreflightScreenCaptureAccess()
+                else "Permission: not granted"
+            ),
+        )
+        for provider in ("codex", "claude", "grok", "opencode"):
             popup = self.settings_fields.get(f"{provider}_session_opener")
             if popup is not None:
                 refresh_provider_opener_popup(
@@ -965,8 +1235,8 @@ class StatusBarController(NSObject):
             f"{opened.duration_seconds:g}",
         )
         set_text_control_value(
-            self.settings_fields.get("recent_session_retention_hours"),
-            f"{self.settings.recent_session_retention_seconds / 3600:g}",
+            self.settings_fields.get("completed_session_visibility_seconds"),
+            f"{self.settings.completed_session_visibility_seconds:g}",
         )
         set_text_control_value(
             self.settings_fields.get("idle_timeout_minutes"),
@@ -974,9 +1244,26 @@ class StatusBarController(NSObject):
         )
 
     def set_settings_message(self, message: str) -> None:
+        self.settings_message_generation += 1
         set_field_value(self.settings_fields.get("message"), message)
         if message:
             log_status_bar(f"settings: {message}")
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                6.0,
+                self,
+                "clearSettingsMessage:",
+                self.settings_message_generation,
+                False,
+            )
+
+    @objc.IBAction
+    def clearSettingsMessage_(self, timer):
+        if int(timer.userInfo()) == self.settings_message_generation:
+            set_field_value(self.settings_fields.get("message"), "")
+
+    def tabView_didSelectTabViewItem_(self, _tab_view, _item):
+        self.settings_message_generation += 1
+        set_field_value(self.settings_fields.get("message"), "")
 
     def set_session_terminal(
         self,
@@ -1016,6 +1303,15 @@ class StatusBarController(NSObject):
     def exportDebugHtml_(self, _sender):
         self.export_debug_log("html")
 
+    @objc.IBAction
+    def archiveDebugLog_(self, _sender):
+        path = default_status_audit_log_path()
+        if rotate_status_audit_log(path, max_bytes=1):
+            self.set_settings_message("Debug log archived and cleared.")
+        else:
+            self.set_settings_message("Debug log is already empty.")
+        self.refresh_settings_window()
+
     def export_debug_log(self, format_name: str) -> None:
         path = choose_debug_export_path(format_name)
         if path is None:
@@ -1040,19 +1336,27 @@ class StatusBarController(NSObject):
                 result = install_claude_hooks()
             elif provider == "claude":
                 result = uninstall_claude_hooks()
-            elif install:
+            elif provider == "grok" and install:
                 result = install_grok_hooks()
-            else:
+            elif provider == "grok":
                 result = uninstall_grok_hooks()
+            elif provider == "kiro" and install:
+                result = install_kiro_hooks()
+            elif provider == "kiro":
+                result = uninstall_kiro_hooks()
+            elif provider == "opencode" and install:
+                result = install_opencode_hooks()
+            else:
+                result = uninstall_opencode_hooks()
         except Exception as exc:
-            self.set_settings_message(f"{provider.title()} hooks failed: {exc}")
+            self.set_settings_message(f"{provider_label(provider)} hooks failed: {exc}")
             self.refresh_settings_window()
             return
 
         action = "installed" if install else "removed"
         if not result.changed:
             action = "already installed" if install else "already removed"
-        self.set_settings_message(f"{provider.title()} hooks {action}.")
+        self.set_settings_message(f"{provider_label(provider)} hooks {action}.")
         self.reload_monitor()
         self.refresh_settings_window()
         self.refresh_(None)
@@ -1075,13 +1379,15 @@ class StatusBarController(NSObject):
         self.refresh_(None)
 
     def save_agent_list_timing_from_fields(self) -> None:
-        retention_text = text_control_value(
-            self.settings_fields.get("recent_session_retention_hours")
+        completed_visibility_text = text_control_value(
+            self.settings_fields.get("completed_session_visibility_seconds")
         )
         idle_text = text_control_value(self.settings_fields.get("idle_timeout_minutes"))
         try:
-            retention_hours = float(retention_text) if retention_text else (
-                DEFAULT_RECENT_SESSION_RETENTION_SECONDS / 3600
+            completed_visibility_seconds = (
+                float(completed_visibility_text)
+                if completed_visibility_text
+                else DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS
             )
             idle_minutes = float(idle_text) if idle_text else (
                 DEFAULT_IDLE_TIMEOUT_SECONDS / 60
@@ -1092,7 +1398,7 @@ class StatusBarController(NSObject):
 
         try:
             self.settings = self.settings.with_agent_list_timing(
-                recent_session_retention_seconds=retention_hours * 3600,
+                completed_session_visibility_seconds=completed_visibility_seconds,
                 idle_timeout_seconds=idle_minutes * 60,
             )
             save_settings(self.settings)
@@ -1223,6 +1529,7 @@ class StatusBarController(NSObject):
         if not SCREEN_BAR_FEATURE_ENABLED:
             try:
                 self.settings = self.settings.with_virtual_status_device(False)
+                self.settings = self.settings.without_device(VIRTUAL_DEVICE_ID)
                 save_settings(self.settings)
             except Exception as exc:
                 self.set_settings_message(f"Could not disable Screen Bar: {exc}")
@@ -1381,6 +1688,8 @@ class StatusBarController(NSObject):
         kind, value = target
         if kind == "url":
             open_url(value)
+        elif kind == "application":
+            open_host_application(value)
         elif kind == "terminal":
             open_terminal_command(
                 value,
@@ -1475,6 +1784,8 @@ class StatusBarController(NSObject):
         for controller in self.battery_led_controllers_by_device.values():
             controller.reset()
         self.last_led_display_kind_by_device.clear()
+        self.last_custom_program_by_device.clear()
+        self.last_custom_write_at_by_device.clear()
         self.last_led_error = None
 
     def reset_led_controllers_for_device(self, device_id: str) -> None:
@@ -1485,6 +1796,8 @@ class StatusBarController(NSObject):
         if battery_controller is not None:
             battery_controller.reset()
         self.last_led_display_kind_by_device.pop(device_id, None)
+        self.last_custom_program_by_device.pop(device_id, None)
+        self.last_custom_write_at_by_device.pop(device_id, None)
         self.device_errors.pop(device_id, None)
         self.last_led_error = None
 
@@ -1629,6 +1942,49 @@ class StatusBarController(NSObject):
             return LED_DISPLAY_BATTERY
         return LED_DISPLAY_AGENT
 
+    def custom_led_program_for_device(
+        self,
+        device: StatusBarDevice,
+        mode: AgentMode,
+        battery_snapshot: BatterySnapshot | None,
+    ) -> tuple[str, str] | None:
+        if self.settings.battery_threshold_alerts_enabled and self.battery_threshold_alert.active():
+            return "battery-warning", battery_warning_program(brightness=device.brightness)
+
+        display = self.active_led_display_kind_for_device(device, battery_snapshot)
+        if display != LED_DISPLAY_AGENT or mode != AgentMode.IDLE_READY:
+            return None
+        preset = self.settings.idle_preset_for_device(device.device_id)
+        if preset == IDLE_PRESET_OFF:
+            return "idle-off", apply_brightness("off", device.brightness)
+        if preset == IDLE_PRESET_SOLID:
+            return "idle-solid", apply_brightness("#020611", device.brightness)
+        if preset == IDLE_PRESET_BATTERY and battery_snapshot is not None:
+            led_count = 8 if device.device_id == VIRTUAL_DEVICE_ID else led_count_for_target(device.target)
+            return (
+                "idle-battery",
+                program_for_battery(
+                    battery_snapshot,
+                    led_count=led_count,
+                    brightness=device.brightness,
+                ),
+            )
+        if preset != IDLE_PRESET_MUSIC or not self.settings.music_visualizer_enabled:
+            return None
+        level = self.system_audio_meter.level()
+        if level is None:
+            return None
+        level = round(level * MUSIC_LEVEL_STEPS) / MUSIC_LEVEL_STEPS
+        led_count = 8 if device.device_id == VIRTUAL_DEVICE_ID else led_count_for_target(device.target)
+        return (
+            "music",
+            music_visualizer_program(
+                level,
+                led_count=led_count,
+                brightness=device.brightness,
+            ),
+        )
+
     def sync_leds(
         self,
         mode: AgentMode,
@@ -1671,6 +2027,11 @@ class StatusBarController(NSObject):
             None,
         )
         if device is None:
+            return
+        custom = self.custom_led_program_for_device(device, mode, battery_snapshot)
+        if custom is not None:
+            _kind, program = custom
+            self.virtual_status_device.set_program(program)
             return
         display = self.active_led_display_kind_for_device(device, battery_snapshot)
         if display == LED_DISPLAY_CUSTOM:
@@ -1724,12 +2085,20 @@ class StatusBarController(NSObject):
         if not devices:
             self.last_led_error = None
             return
+        if display_kind == LED_DISPLAY_CUSTOM:
+            for device in devices:
+                self.device_errors.pop(device.device_id, None)
+                self.last_led_display_kind_by_device[device.device_id] = LED_DISPLAY_CUSTOM
+            self.last_led_error = None
+            return
 
         active_errors: dict[str, str] = {}
         for device in devices:
-            device_display_kind = self.active_led_display_kind_for_device(
-                device,
-                battery_snapshot,
+            custom = self.custom_led_program_for_device(device, mode, battery_snapshot)
+            device_display_kind = (
+                custom[0]
+                if custom is not None
+                else self.active_led_display_kind_for_device(device, battery_snapshot)
             )
             if self.last_led_display_kind_by_device.get(device.device_id) != device_display_kind:
                 self.reset_led_controllers_for_device(device.device_id)
@@ -1739,6 +2108,31 @@ class StatusBarController(NSObject):
                 self.device_errors.pop(device.device_id, None)
                 continue
 
+            if custom is not None:
+                _kind, program = custom
+                if self.last_custom_program_by_device.get(device.device_id) == program:
+                    continue
+                now = time.monotonic()
+                if (
+                    _kind == "music"
+                    and now - self.last_custom_write_at_by_device.get(device.device_id, 0.0)
+                    < MUSIC_WRITE_INTERVAL_SECONDS
+                ):
+                    continue
+                try:
+                    write_led_program(program, device_path=device.target)
+                    self.last_custom_program_by_device[device.device_id] = program
+                    self.last_custom_write_at_by_device[device.device_id] = now
+                    self.device_errors.pop(device.device_id, None)
+                except Exception as exc:
+                    error = str(exc)
+                    active_errors[device.device_id] = error
+                    if self.device_errors.get(device.device_id) != error:
+                        log_status_bar(f"led error {device.name}: {error}")
+                continue
+
+            self.last_custom_program_by_device.pop(device.device_id, None)
+            self.last_custom_write_at_by_device.pop(device.device_id, None)
             if device_display_kind == LED_DISPLAY_BATTERY and battery_snapshot is not None:
                 result = self.battery_controller_for_device(device).sync_snapshot(battery_snapshot)
                 label = (
@@ -1788,7 +2182,13 @@ class StatusBarController(NSObject):
             )
         ]
         if not devices:
+            self.set_settings_message("No connected SidePulse device is available for preview.")
             return
+
+        self.set_settings_message(
+            f"Previewing {LID_ANIMATION_LABELS[kind]} on {len(devices)} device"
+            f"{'s' if len(devices) != 1 else ''}."
+        )
 
         self.led_animation_token += 1
         token = self.led_animation_token
@@ -2056,6 +2456,20 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
         menu.addItem_(virtual_toggle)
 
     menu.addItem_(NSMenuItem.separatorItem())
+    battery_alerts = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Battery Threshold Alerts", "toggleBatteryThresholdAlerts:", ""
+    )
+    battery_alerts.setTarget_(target)
+    battery_alerts.setState_(1 if target.settings.battery_threshold_alerts_enabled else 0)
+    menu.addItem_(battery_alerts)
+    music = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Idle Music Visualizer", "toggleMusicVisualizer:", ""
+    )
+    music.setTarget_(target)
+    music.setState_(1 if target.settings.music_visualizer_enabled else 0)
+    menu.addItem_(music)
+
+    menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Keep Awake With Lid Closed"))
     for policy in CLOSED_LID_AWAKE_CHOICES:
         menu.addItem_(build_closed_lid_awake_policy_item(policy, target))
@@ -2137,6 +2551,28 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     custom.setState_(1 if device.display == LED_DISPLAY_CUSTOM else 0)
     submenu.addItem_(custom)
 
+    submenu.addItem_(NSMenuItem.separatorItem())
+    idle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Idle Mode", None, "")
+    idle_menu = NSMenu.alloc().init()
+    settings = getattr(target, "settings", None)
+    selected_idle = (
+        settings.idle_preset_for_device(device.device_id)
+        if settings is not None
+        else IDLE_PRESET_BREATHING
+    )
+    for preset in IDLE_PRESET_CHOICES:
+        preset_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            IDLE_PRESET_LABELS[preset],
+            "setIdlePreset:",
+            "",
+        )
+        preset_item.setTarget_(target)
+        preset_item.setRepresentedObject_({"device_id": device.device_id, "preset": preset})
+        preset_item.setState_(1 if preset == selected_idle else 0)
+        idle_menu.addItem_(preset_item)
+    idle_item.setSubmenu_(idle_menu)
+    submenu.addItem_(idle_item)
+
     if device.device_id != VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
         submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
@@ -2189,7 +2625,7 @@ def build_brightness_slider_item(
 
 def build_setup_window(target: StatusBarController) -> NSWindow:
     width = 620
-    height = 330
+    height = 410
     style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
@@ -2206,8 +2642,21 @@ def build_setup_window(target: StatusBarController) -> NSWindow:
     window.center()
     content = window.contentView()
 
-    add_label(content, "SidePulse", 24, 282, 180, 28)
-    add_label(content, "Finish setup for this Mac.", 24, 254, 340, 22)
+    add_label(content, "SidePulse", 24, 362, 180, 28)
+    add_label(content, "Finish setup for this Mac.", 24, 334, 340, 22)
+
+    opencode = add_checkbox(
+        content,
+        "Agent Integrations (OpenCode / T3 Code)",
+        32,
+        276,
+        300,
+        24,
+        target,
+        "",
+    )
+    add_label(content, "Install provider hooks and identify agents hosted by T3 Code once.", 56, 254, 430, 20)
+    opencode_status = add_label(content, "", 440, 276, 150, 22)
 
     launch = add_checkbox(
         content,
@@ -2258,6 +2707,7 @@ def build_setup_window(target: StatusBarController) -> NSWindow:
         "launch_status": launch_status,
         "eject_status": eject_status,
         "sleep_status": sleep_status,
+        "opencode_status": opencode_status,
         "message": message,
     }
     target.setup_buttons = {
@@ -2265,6 +2715,7 @@ def build_setup_window(target: StatusBarController) -> NSWindow:
         "eject_guard": eject_guard,
         "eject_guard_uninstall": eject_uninstall,
         "sleep_helper": sleep_helper,
+        "opencode": opencode,
     }
     return window
 
@@ -2276,6 +2727,8 @@ def choose_debug_export_path(format_name: str) -> Path | None:
     panel.setNameFieldStringValue_(f"sidepulse-agent-debug.{extension}")
     if hasattr(panel, "setAllowedFileTypes_"):
         panel.setAllowedFileTypes_([extension])
+    NSApp.activateIgnoringOtherApps_(True)
+    panel.orderFrontRegardless()
     if panel.runModal() != 1:
         return None
     url = panel.URL()
@@ -2322,7 +2775,7 @@ def format_byte_count(size: int) -> str:
 
 def build_settings_window(target: StatusBarController) -> NSWindow:
     width = 680
-    height = 560
+    height = 600
     style = (
         NSWindowStyleMaskTitled
         | NSWindowStyleMaskClosable
@@ -2342,6 +2795,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     tab_width = width - 40
     tab_height = height - 84
     tab_view = NSTabView.alloc().initWithFrame_(((20, 54), (tab_width, tab_height)))
+    tab_view.setDelegate_(target)
     agents_tab = add_settings_tab(tab_view, "agents", "Agents", tab_width, tab_height)
     devices_tab = add_settings_tab(
         tab_view,
@@ -2373,23 +2827,41 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     )
     content.addSubview_(tab_view)
 
-    add_label(agents_tab, "Agent Hooks", 24, 398, 200, 24)
-    add_label(agents_tab, "Codex", 32, 360, 80, 22)
-    codex_status = add_label(agents_tab, "", 130, 360, 240, 22)
-    add_button(agents_tab, "Install", 400, 356, 90, 28, target, "installCodexHooks:")
-    add_button(agents_tab, "Uninstall", 500, 356, 100, 28, target, "uninstallCodexHooks:")
+    add_label(agents_tab, "Agent Hooks", 24, 438, 200, 24)
+    t3code_status = add_label(
+        agents_tab,
+        "T3 Code: automatic · uses the selected agent's hooks",
+        220,
+        440,
+        390,
+        20,
+    )
+    add_label(agents_tab, "Codex", 32, 400, 80, 22)
+    codex_status = add_label(agents_tab, "", 130, 400, 240, 22)
+    add_button(agents_tab, "Install", 400, 396, 90, 28, target, "installCodexHooks:")
+    add_button(agents_tab, "Uninstall", 500, 396, 100, 28, target, "uninstallCodexHooks:")
 
-    add_label(agents_tab, "Claude", 32, 326, 80, 22)
-    claude_status = add_label(agents_tab, "", 130, 326, 240, 22)
-    add_button(agents_tab, "Install", 400, 322, 90, 28, target, "installClaudeHooks:")
-    add_button(agents_tab, "Uninstall", 500, 322, 100, 28, target, "uninstallClaudeHooks:")
+    add_label(agents_tab, "Claude", 32, 366, 80, 22)
+    claude_status = add_label(agents_tab, "", 130, 366, 240, 22)
+    add_button(agents_tab, "Install", 400, 362, 90, 28, target, "installClaudeHooks:")
+    add_button(agents_tab, "Uninstall", 500, 362, 100, 28, target, "uninstallClaudeHooks:")
 
-    add_label(agents_tab, "Grok", 32, 292, 80, 22)
-    grok_status = add_label(agents_tab, "", 130, 292, 240, 22)
-    add_button(agents_tab, "Install", 400, 288, 90, 28, target, "installGrokHooks:")
-    add_button(agents_tab, "Uninstall", 500, 288, 100, 28, target, "uninstallGrokHooks:")
+    add_label(agents_tab, "Grok", 32, 332, 80, 22)
+    grok_status = add_label(agents_tab, "", 130, 332, 240, 22)
+    add_button(agents_tab, "Install", 400, 328, 90, 28, target, "installGrokHooks:")
+    add_button(agents_tab, "Uninstall", 500, 328, 100, 28, target, "uninstallGrokHooks:")
 
-    add_separator(agents_tab, 24, 258, tab_width - 48)
+    add_label(agents_tab, "OpenCode", 32, 298, 80, 22)
+    opencode_status = add_label(agents_tab, "", 130, 298, 240, 22)
+    add_button(agents_tab, "Install", 400, 294, 90, 28, target, "installOpenCodeHooks:")
+    add_button(agents_tab, "Uninstall", 500, 294, 100, 28, target, "uninstallOpenCodeHooks:")
+
+    add_label(agents_tab, "Kiro", 32, 264, 80, 22)
+    kiro_status = add_label(agents_tab, "", 130, 264, 240, 22)
+    add_button(agents_tab, "Install", 400, 260, 90, 28, target, "installKiroHooks:")
+    add_button(agents_tab, "Uninstall", 500, 260, 100, 28, target, "uninstallKiroHooks:")
+
+    add_separator(agents_tab, 24, 250, tab_width - 48)
     add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
     add_label(agents_tab, "Codex", 32, 188, 100, 22)
     codex_opener = add_provider_opener_popup(agents_tab, "codex", 160, 186, target)
@@ -2447,6 +2919,37 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         target,
         "setBatteryPowerPreviewFromCheckbox:",
     )
+    add_separator(devices_tab, 24, 286, tab_width - 48)
+    add_label(devices_tab, "Idle Music Visualizer", 24, 252, 240, 24)
+    capture_status = add_label(devices_tab, "", 32, 216, 300, 22)
+    add_button(
+        devices_tab,
+        "Request Permission",
+        340,
+        212,
+        130,
+        28,
+        target,
+        "requestScreenCapturePermission:",
+    )
+    add_button(
+        devices_tab,
+        "System Settings…",
+        480,
+        212,
+        130,
+        28,
+        target,
+        "openScreenCaptureSettings:",
+    )
+    add_label(
+        devices_tab,
+        "Choose each device’s idle preset from its menu. Music capture is optional.",
+        32,
+        178,
+        560,
+        22,
+    )
 
     add_label(sleep_tab, "Lid Closed", 24, 398, 120, 22)
     add_label(sleep_tab, "Duration", 516, 398, 70, 22)
@@ -2464,11 +2967,11 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     add_button(sleep_tab, "Reset", 124, 14, 90, 28, target, "resetLidOpenAnimation:")
     add_button(sleep_tab, "Save Animations", 490, 14, 146, 28, target, "saveLidAnimations:")
 
-    add_label(behavior_tab, "Agent List", 24, 398, 240, 24)
-    add_label(behavior_tab, "Keep last 10 sessions for", 32, 356, 180, 22)
-    retention_hours = add_editable_field(behavior_tab, "", 224, 354, 58, 24)
-    add_label(behavior_tab, "hours", 292, 356, 60, 22)
-    add_label(behavior_tab, "Idle timeout", 32, 316, 120, 22)
+    add_label(behavior_tab, "Session Visibility", 24, 398, 240, 24)
+    add_label(behavior_tab, "Hide completed sessions after", 32, 356, 190, 22)
+    completed_visibility = add_editable_field(behavior_tab, "", 232, 354, 58, 24)
+    add_label(behavior_tab, "seconds", 300, 356, 70, 22)
+    add_label(behavior_tab, "Hide inactive sessions after", 32, 316, 190, 22)
     idle_minutes = add_editable_field(behavior_tab, "", 224, 314, 58, 24)
     add_label(behavior_tab, "minutes", 292, 316, 80, 22)
     add_button(behavior_tab, "Save", 32, 266, 90, 28, target, "saveAgentListTiming:")
@@ -2477,6 +2980,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
     debug_log_status = add_label(diagnostics_tab, "", 32, 360, 588, 22)
     add_button(diagnostics_tab, "Export CSV", 32, 318, 110, 28, target, "exportDebugCsv:")
     add_button(diagnostics_tab, "Export HTML", 152, 318, 120, 28, target, "exportDebugHtml:")
+    add_button(diagnostics_tab, "Archive & Clear", 282, 318, 130, 28, target, "archiveDebugLog:")
     add_separator(diagnostics_tab, 24, 280, tab_width - 48)
     add_label(diagnostics_tab, "Settings File", 24, 246, 240, 24)
     settings_path = add_label(diagnostics_tab, "", 32, 208, 588, 22)
@@ -2487,7 +2991,11 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "codex_hook_status": codex_status,
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
+        "kiro_hook_status": kiro_status,
+        "opencode_hook_status": opencode_status,
+        "t3code_hook_status": t3code_status,
         "debug_log_status": debug_log_status,
+        "screen_capture_status": capture_status,
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,
         "grok_session_opener": grok_opener,
@@ -2497,7 +3005,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "closed_animation_duration": closed_duration,
         "open_animation_program": open_program,
         "open_animation_duration": open_duration,
-        "recent_session_retention_hours": retention_hours,
+        "completed_session_visibility_seconds": completed_visibility,
         "idle_timeout_minutes": idle_minutes,
         "message": message,
         "settings_path": settings_path,
@@ -2514,8 +3022,15 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
 def add_settings_tab(tab_view, identifier: str, title: str, width: int, height: int):
     item = NSTabViewItem.alloc().initWithIdentifier_(identifier)
     item.setLabel_(title)
-    view = NSView.alloc().initWithFrame_(((0, 0), (width, height - 34)))
-    item.setView_(view)
+    viewport_height = height - 34
+    scroll = NSScrollView.alloc().initWithFrame_(((0, 0), (width, viewport_height)))
+    scroll.setHasVerticalScroller_(True)
+    scroll.setHasHorizontalScroller_(False)
+    scroll.setAutohidesScrollers_(True)
+    scroll.setBorderType_(0)
+    view = NSView.alloc().initWithFrame_(((0, 0), (width, viewport_height + 80)))
+    scroll.setDocumentView_(view)
+    item.setView_(scroll)
     tab_view.addTabViewItem_(item)
     return view
 
@@ -2622,7 +3137,10 @@ def provider_open_action_label(provider: str, action: str, settings=None) -> str
         return "VS Code"
     if action == SESSION_OPEN_TERMINAL:
         return "Resume in Terminal"
-    return {"codex": "Codex", "claude": "Claude"}.get(provider, "App")
+    return {"codex": "Codex", "claude": "Claude", "opencode": "OpenCode"}.get(
+        provider,
+        "App",
+    )
 
 
 def refresh_provider_opener_popup(popup, provider: str, action: str, settings) -> None:
@@ -3030,6 +3548,8 @@ def build_session_menu_item(
 
 def native_session_menu_title(status: AgentStatus, *, disambiguate: bool = False) -> str:
     title, project = session_title_parts(status)
+    if normalized_origin_text(status.origin) == "t3 code":
+        title = f"T3 Code  {title}"
     if disambiguate and status.session_id:
         title = f"{title} ({status.session_id[:8]})"
     parts = [title]
@@ -3111,6 +3631,8 @@ def session_origin_icon_for_status(status: AgentStatus):
     host_icon = host_icon_for_origin(status.origin)
     if host_icon is None:
         return provider_icon
+    if normalized_origin_text(status.origin) == "t3 code":
+        return host_icon
     return composite_app_icons(host_icon, provider_icon)
 
 
@@ -3136,6 +3658,16 @@ def provider_icon_for_provider(provider: str):
         if image is not None:
             return image
         return grok_badge_icon()
+    if provider == "kiro":
+        image = first_app_icon(("/Applications/Kiro.app", str(Path.home() / "Applications" / "Kiro.app")))
+        if image is not None:
+            return image
+        return image_for_symbol("wand.and.stars", "Kiro")
+    if provider == "opencode":
+        image = first_app_icon(("/Applications/OpenCode.app", "/Applications/opencode.app"))
+        if image is not None:
+            return image
+        return image_for_symbol("chevron.left.forwardslash.chevron.right", "OpenCode")
     return image_for_symbol("terminal", provider.title() or "Agent")
 
 
@@ -3143,6 +3675,15 @@ def host_icon_for_origin(origin: str | None):
     normalized = normalized_origin_text(origin)
     if not normalized:
         return None
+    if normalized == "t3 code" or "t3code" in normalized:
+        return first_app_icon(
+            (
+                "/Applications/T3 Code.app",
+                "/Applications/T3 Code (Alpha).app",
+                "/Applications/T3 Code (Nightly).app",
+                "/Applications/t3-code.app",
+            )
+        ) or image_for_symbol("square.stack.3d.up", "T3 Code")
     if "vs code" in normalized or "vscode" in normalized or "visual studio code" in normalized:
         return first_app_icon(
             (
@@ -3336,9 +3877,12 @@ def menu_statuses(snapshot, settings=None) -> tuple[AgentStatus, ...]:
     statuses = list(snapshot.statuses)
     now = snapshot.collected_at
     retention_seconds = (
-        settings.recent_session_retention_seconds
+        min(
+            settings.recent_session_retention_seconds,
+            settings.completed_session_visibility_seconds,
+        )
         if settings is not None
-        else DEFAULT_RECENT_SESSION_RETENTION_SECONDS
+        else COMPLETED_VISIBLE_SECONDS
     )
     statuses.extend(
         status
@@ -3512,6 +4056,22 @@ def open_url(url: str) -> None:
     ns_url = NSURL.URLWithString_(url)
     if ns_url is not None:
         NSWorkspace.sharedWorkspace().openURL_(ns_url)
+
+
+def open_host_application(host: str) -> None:
+    if host != "t3code":
+        return
+    paths = (
+        "/Applications/T3 Code.app",
+        "/Applications/T3 Code (Alpha).app",
+        "/Applications/T3 Code (Nightly).app",
+        "/Applications/t3-code.app",
+    )
+    path = next((candidate for candidate in paths if Path(candidate).exists()), None)
+    if path is None:
+        subprocess.Popen(["open", "-a", "T3 Code"])
+        return
+    NSWorkspace.sharedWorkspace().openURL_(NSURL.fileURLWithPath_(path))
 
 
 def open_terminal_command(
@@ -4050,11 +4610,36 @@ def applescript_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def run_status_bar() -> None:
+def acquire_status_bar_instance_lock():
+    """Hold a process-wide lock so only one menu-bar icon can exist."""
+    lock_path = default_state_dir() / "status-bar.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def release_status_bar_instance_lock(lock_file) -> None:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    lock_file.close()
+
+
+def run_status_bar() -> bool:
+    instance_lock = acquire_status_bar_instance_lock()
+    if instance_lock is None:
+        return False
     app = NSApplication.sharedApplication()
     controller = StatusBarController.alloc().init()
     app.setDelegate_(controller)
-    app.run()
+    try:
+        app.run()
+    finally:
+        release_status_bar_instance_lock(instance_lock)
+    return True
 
 
 def main() -> int:

@@ -11,11 +11,13 @@ APP_PATH="$BUILD_DIR/pyinstaller/SidePulse.app"
 COMPONENT_PKG="$BUILD_DIR/SidePulse-component.pkg"
 OUTPUT_PKG="$DIST_DIR/SidePulse-${VERSION}-${ARCH}.pkg"
 APP_ID="${APP_ID:-io.sidepulse.cli}"
+SYSTEM_AUDIO_HELPER="$BUILD_DIR/system-audio-meter"
 
 APP_SIGN_IDENTITY="${APP_SIGN_IDENTITY:-}"
 INSTALLER_SIGN_IDENTITY="${INSTALLER_SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 ALLOW_UNSIGNED="${ALLOW_UNSIGNED:-0}"
+APP_ONLY="${APP_ONLY:-0}"
 
 if { [ -z "$APP_SIGN_IDENTITY" ] || [ -z "$INSTALLER_SIGN_IDENTITY" ]; } && [ "$ALLOW_UNSIGNED" != "1" ]; then
     echo "Set APP_SIGN_IDENTITY to a Developer ID Application identity and" >&2
@@ -29,6 +31,10 @@ python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
 "$VENV_DIR/bin/python" -m pip install 'pyinstaller>=6.10' "$ROOT_DIR"
 
+xcrun swiftc -parse-as-library -O \
+    "$ROOT_DIR/src/sidepulse/resources/system_audio_meter.swift" \
+    -o "$SYSTEM_AUDIO_HELPER"
+
 "$VENV_DIR/bin/pyinstaller" \
     --noconfirm --clean --windowed \
     --name SidePulse \
@@ -38,12 +44,15 @@ python3 -m venv "$VENV_DIR"
     --specpath "$BUILD_DIR" \
     --collect-submodules Cocoa \
     --collect-data sidepulse.resources \
+    --add-binary "$SYSTEM_AUDIO_HELPER:." \
     "$ROOT_DIR/packaging/sidepulse_entry.py"
 
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP_PATH/Contents/Info.plist" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP_PATH/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $VERSION" "$APP_PATH/Contents/Info.plist" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP_PATH/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :NSScreenCaptureUsageDescription string SidePulse uses system audio levels to animate LEDs when the optional Idle Music Visualizer is enabled." "$APP_PATH/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :NSScreenCaptureUsageDescription SidePulse uses system audio levels to animate LEDs when the optional Idle Music Visualizer is enabled." "$APP_PATH/Contents/Info.plist"
 
 if [ -n "$APP_SIGN_IDENTITY" ]; then
     codesign --force --deep --options runtime --timestamp \
@@ -52,6 +61,11 @@ if [ -n "$APP_SIGN_IDENTITY" ]; then
     codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 else
     codesign --force --deep --sign - "$APP_PATH"
+fi
+
+if [ "$APP_ONLY" = "1" ]; then
+    echo "Built app: $APP_PATH"
+    exit 0
 fi
 
 chmod 755 "$ROOT_DIR/packaging/scripts/postinstall"

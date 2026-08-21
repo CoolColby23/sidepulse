@@ -32,7 +32,8 @@ LED_STATE_LABELS: dict[LedDisplayState, str] = {
 ASK_AMBER = "#FF3A00"
 WORKING_CYAN = "#00E5FF"
 DONE_GREEN = "#00FF66"
-IDLE_DIM = "#020204"
+IDLE_BLUE = "#020611"
+IDLE_VIOLET = "#080319"
 DEVICE_LED_COUNTS = {
     "sidepulsedot": 2,
     "sidepulsepro": 8,
@@ -77,7 +78,12 @@ def program_for_display_state(
             "\n".join(
                 [
                     "off",
-                    f"{IDLE_DIM} 6s pulse",
+                    (
+                        f"0:{IDLE_BLUE} 5.6s pulse;1:{IDLE_BLUE} 5.6s pulse 240ms;"
+                        f"2:{IDLE_VIOLET} 5.6s pulse 480ms;3:{IDLE_VIOLET} 5.6s pulse 720ms;"
+                        f"4:{IDLE_VIOLET} 5.6s pulse 720ms;5:{IDLE_VIOLET} 5.6s pulse 480ms;"
+                        f"6:{IDLE_BLUE} 5.6s pulse 240ms;7:{IDLE_BLUE} 5.6s pulse"
+                    ),
                     "repeat",
                 ]
             ),

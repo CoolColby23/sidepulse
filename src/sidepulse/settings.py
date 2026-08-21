@@ -33,6 +33,18 @@ LED_DISPLAY_AGENT = "agent"
 LED_DISPLAY_BATTERY = "battery"
 LED_DISPLAY_CUSTOM = "custom"
 LED_DISPLAY_CHOICES = (LED_DISPLAY_AGENT, LED_DISPLAY_BATTERY, LED_DISPLAY_CUSTOM)
+IDLE_PRESET_BREATHING = "breathing"
+IDLE_PRESET_SOLID = "solid"
+IDLE_PRESET_MUSIC = "music"
+IDLE_PRESET_BATTERY = "battery"
+IDLE_PRESET_OFF = "off"
+IDLE_PRESET_CHOICES = (
+    IDLE_PRESET_BREATHING,
+    IDLE_PRESET_SOLID,
+    IDLE_PRESET_MUSIC,
+    IDLE_PRESET_BATTERY,
+    IDLE_PRESET_OFF,
+)
 CLOSED_LID_AWAKE_NEVER = "never"
 CLOSED_LID_AWAKE_AGENTS = "agents"
 CLOSED_LID_AWAKE_ALWAYS = "always"
@@ -46,36 +58,30 @@ LID_ANIMATION_OPEN = "open"
 LID_ANIMATION_CHOICES = (LID_ANIMATION_CLOSED, LID_ANIMATION_OPEN)
 DEFAULT_LID_CLOSED_ANIMATION_PROGRAM = "\n".join(
     [
-        "off 90ms cosine",
-        (
-            "0:#FF7A00 180ms ease; 7:#FF7A00 180ms ease; "
-            "1:#FF7A00 180ms ease 80ms; 6:#FF7A00 180ms ease 80ms"
-        ),
-        (
-            "2:#FF4A00 180ms ease; 5:#FF4A00 180ms ease; "
-            "3:#FF3000 180ms ease 80ms; 4:#FF3000 180ms ease 80ms"
-        ),
-        "off 360ms ease-out",
+        "#00E5FF #326BFF #8A36FF #FF2BA6 #FF2BA6 #8A36FF #326BFF #00E5FF 140ms ease",
+        "0:#000000 120ms ease;7:#000000 120ms ease",
+        "1:#000000 120ms ease;6:#000000 120ms ease",
+        "2:#000000 120ms ease;5:#000000 120ms ease",
+        "3:#FFB000 100ms pulse;4:#FFB000 100ms pulse",
+        "off 220ms ease-out",
     ]
 )
 DEFAULT_LID_OPEN_ANIMATION_PROGRAM = "\n".join(
     [
-        "off 90ms cosine",
-        (
-            "3:#00E5FF 180ms ease; 4:#00E5FF 180ms ease; "
-            "2:#00E5FF 180ms ease 80ms; 5:#00E5FF 180ms ease 80ms"
-        ),
-        (
-            "1:#00FFB0 180ms ease; 6:#00FFB0 180ms ease; "
-            "0:#00FF66 180ms ease 80ms; 7:#00FF66 180ms ease 80ms"
-        ),
-        "#00FF66 220ms ease",
-        "off 320ms ease-out",
+        "off 60ms cosine",
+        "3:#FFB000 110ms ease;4:#FFB000 110ms ease",
+        "2:#FF3B8D 110ms ease;5:#FF3B8D 110ms ease",
+        "1:#8A36FF 110ms ease;6:#8A36FF 110ms ease",
+        "0:#00E5FF 110ms ease;7:#00E5FF 110ms ease",
+        "#00E5FF #326BFF #8A36FF #FF2BA6 #FFB000 #50FFB0 #00E5FF #326BFF 180ms ease",
+        "1:#FFFFFF 80ms pulse;4:#FFFFFF 80ms pulse;7:#FFFFFF 80ms pulse",
+        "off 260ms ease-out",
     ]
 )
-DEFAULT_LID_CLOSED_ANIMATION_SECONDS = 0.9
-DEFAULT_LID_OPEN_ANIMATION_SECONDS = 1.0
+DEFAULT_LID_CLOSED_ANIMATION_SECONDS = 0.82
+DEFAULT_LID_OPEN_ANIMATION_SECONDS = 1.15
 DEFAULT_RECENT_SESSION_RETENTION_SECONDS = 48 * 60 * 60
+DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS = 30.0
 DEFAULT_IDLE_TIMEOUT_SECONDS = 60 * 60
 
 
@@ -98,6 +104,7 @@ class DeviceDisplaySetting:
     path: str
     led_display: str = LED_DISPLAY_AGENT
     brightness: int = 255
+    idle_preset: str = IDLE_PRESET_BREATHING
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +113,7 @@ class DeviceDisplaySetting:
             "path": self.path,
             "led_display": self.led_display,
             "brightness": self.brightness,
+            "idle_preset": self.idle_preset,
         }
 
 
@@ -127,11 +135,18 @@ class AgentMonitorSettings:
     battery_full_charge_watts: float | None = None
     battery_show_on_power_change: bool = True
     battery_power_change_preview_seconds: float = DEFAULT_POWER_CHANGE_PREVIEW_SECONDS
+    battery_threshold_alerts_enabled: bool = True
+    # ScreenCaptureKit requires explicit macOS consent, so audio capture must
+    # never begin until the user opts into the visualizer.
+    music_visualizer_enabled: bool = False
+    idle_preset: str = IDLE_PRESET_BREATHING
+    completed_visible_seconds: float = 15.0
     session_open_preferences: dict[str, str] = field(default_factory=dict)
     grok_session_open_action: str = SESSION_OPEN_TERMINAL
     session_terminal_app: str = TERMINAL_APP_TERMINAL
     custom_terminal_path: str = ""
     recent_session_retention_seconds: float = DEFAULT_RECENT_SESSION_RETENTION_SECONDS
+    completed_session_visibility_seconds: float = DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS
     idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS
     setup_screen_completed: bool = False
 
@@ -166,6 +181,12 @@ class AgentMonitorSettings:
                 return normalize_brightness(device.brightness)
         return 255
 
+    def idle_preset_for_device(self, device_id: str) -> str:
+        for device in self.devices:
+            if device.device_id == device_id:
+                return normalize_idle_preset(device.idle_preset, self.idle_preset)
+        return self.idle_preset
+
     def with_device_display(
         self,
         device_id: str,
@@ -188,6 +209,7 @@ class AgentMonitorSettings:
                         path=path or device.path,
                         led_display=display,
                         brightness=device.brightness,
+                        idle_preset=device.idle_preset,
                     )
                 )
                 updated = True
@@ -201,6 +223,7 @@ class AgentMonitorSettings:
                     path=path or device_id,
                     led_display=display,
                     brightness=self.brightness_for_device(device_id),
+                    idle_preset=self.idle_preset_for_device(device_id),
                 )
             )
         return replace(self, devices=tuple(devices))
@@ -225,6 +248,7 @@ class AgentMonitorSettings:
                         path=path or device.path,
                         led_display=device.led_display,
                         brightness=value,
+                        idle_preset=device.idle_preset,
                     )
                 )
                 updated = True
@@ -238,6 +262,39 @@ class AgentMonitorSettings:
                     path=path or device_id,
                     led_display=self.display_for_device(device_id),
                     brightness=value,
+                    idle_preset=self.idle_preset_for_device(device_id),
+                )
+            )
+        return replace(self, devices=tuple(devices))
+
+    def with_idle_preset(
+        self,
+        preset: str,
+        *,
+        device_id: str | None = None,
+        name: str | None = None,
+        path: str | None = None,
+    ) -> "AgentMonitorSettings":
+        value = normalize_idle_preset(preset)
+        if device_id is None:
+            return replace(self, idle_preset=value)
+        devices: list[DeviceDisplaySetting] = []
+        updated = False
+        for device in self.devices:
+            if device.device_id == device_id:
+                devices.append(replace(device, idle_preset=value))
+                updated = True
+            else:
+                devices.append(device)
+        if not updated:
+            devices.append(
+                DeviceDisplaySetting(
+                    device_id=device_id,
+                    name=name or device_id,
+                    path=path or device_id,
+                    led_display=self.display_for_device(device_id),
+                    brightness=self.brightness_for_device(device_id),
+                    idle_preset=value,
                 )
             )
         return replace(self, devices=tuple(devices))
@@ -404,18 +461,45 @@ class AgentMonitorSettings:
         self,
         *,
         recent_session_retention_seconds: float | None = None,
+        completed_session_visibility_seconds: float | None = None,
         idle_timeout_seconds: float | None = None,
     ) -> "AgentMonitorSettings":
         retention = self.recent_session_retention_seconds
+        completed_visibility = self.completed_session_visibility_seconds
         idle_timeout = self.idle_timeout_seconds
         if recent_session_retention_seconds is not None:
             retention = normalize_seconds_setting(recent_session_retention_seconds)
+        if completed_session_visibility_seconds is not None:
+            completed_visibility = normalize_seconds_setting(
+                completed_session_visibility_seconds
+            )
         if idle_timeout_seconds is not None:
             idle_timeout = normalize_seconds_setting(idle_timeout_seconds)
         return replace(
             self,
             recent_session_retention_seconds=retention,
+            completed_session_visibility_seconds=completed_visibility,
             idle_timeout_seconds=idle_timeout,
+        )
+
+    def with_ambient_features(
+        self,
+        *,
+        battery_alerts: bool | None = None,
+        music_visualizer: bool | None = None,
+    ) -> "AgentMonitorSettings":
+        return replace(
+            self,
+            battery_threshold_alerts_enabled=(
+                self.battery_threshold_alerts_enabled
+                if battery_alerts is None
+                else bool(battery_alerts)
+            ),
+            music_visualizer_enabled=(
+                self.music_visualizer_enabled
+                if music_visualizer is None
+                else bool(music_visualizer)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -435,7 +519,11 @@ class AgentMonitorSettings:
                 "full_charge_watts": self.battery_full_charge_watts,
                 "show_on_power_change": self.battery_show_on_power_change,
                 "power_change_preview_seconds": self.battery_power_change_preview_seconds,
+                "threshold_alerts_enabled": self.battery_threshold_alerts_enabled,
             },
+            "music_visualizer_enabled": self.music_visualizer_enabled,
+            "idle_preset": self.idle_preset,
+            "completed_visible_seconds": self.completed_visible_seconds,
             "session_open_preferences": dict(sorted(self.session_open_preferences.items())),
             "grok_session_open_action": self.grok_session_open_action,
             "session_terminal": {
@@ -444,6 +532,7 @@ class AgentMonitorSettings:
             },
             "agent_list": {
                 "recent_session_retention_seconds": self.recent_session_retention_seconds,
+                "completed_session_visibility_seconds": self.completed_session_visibility_seconds,
                 "idle_timeout_seconds": self.idle_timeout_seconds,
             },
             "setup_screen_completed": self.setup_screen_completed,
@@ -551,10 +640,20 @@ def load_settings(path: Path | None = None) -> AgentMonitorSettings:
             ),
             DEFAULT_RECENT_SESSION_RETENTION_SECONDS,
         ),
+        completed_session_visibility_seconds=_nonnegative_float_setting(
+            agent_list.get("completed_session_visibility_seconds"),
+            DEFAULT_COMPLETED_SESSION_VISIBILITY_SECONDS,
+        ),
         idle_timeout_seconds=_nonnegative_float_setting(
             agent_list.get("idle_timeout_seconds", data.get("idle_timeout_seconds")),
             DEFAULT_IDLE_TIMEOUT_SECONDS,
         ),
+        battery_threshold_alerts_enabled=_bool_setting(
+            battery.get("threshold_alerts_enabled"), True
+        ),
+        music_visualizer_enabled=_bool_setting(data.get("music_visualizer_enabled"), False),
+        idle_preset=normalize_idle_preset(data.get("idle_preset")),
+        completed_visible_seconds=_float_setting(data.get("completed_visible_seconds"), 15.0),
         setup_screen_completed=_bool_setting(data.get("setup_screen_completed"), False),
     )
 
@@ -619,6 +718,7 @@ def _device_display_settings(value: object, default_display: str) -> tuple[Devic
             name = Path(path).name or device_id
         display = _led_display_setting(item.get("led_display"), default_display)
         brightness = normalize_brightness(item.get("brightness"))
+        idle_preset = normalize_idle_preset(item.get("idle_preset"))
         devices.append(
             DeviceDisplaySetting(
                 device_id=device_id,
@@ -626,6 +726,7 @@ def _device_display_settings(value: object, default_display: str) -> tuple[Devic
                 path=path,
                 led_display=display,
                 brightness=brightness,
+                idle_preset=idle_preset,
             )
         )
         seen.add(device_id)
@@ -694,6 +795,15 @@ def normalize_brightness(value: object) -> int:
     if isinstance(value, (int, float)):
         return max(0, min(255, int(round(float(value)))))
     return 255
+
+
+def normalize_idle_preset(
+    value: object,
+    default: str = IDLE_PRESET_BREATHING,
+) -> str:
+    if isinstance(value, str) and value in IDLE_PRESET_CHOICES:
+        return value
+    return default
 
 
 def default_lid_animation(kind: str) -> LedAnimationSetting:

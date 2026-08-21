@@ -99,14 +99,14 @@ SidePulse Pro and SidePulse Dot.
 
 #### AI Agent Monitoring
 
-SidePulse can monitor AI agents such as Codex, Claude, and Grok through hooks, then
+SidePulse can monitor AI agents such as Codex, Claude, Grok, and OpenCode through hooks, then
 translate the current agent state into a small, glanceable LED status.
 
 Agent status modes:
 
 | Mode | Meaning | LED pattern |
 | --- | --- | --- |
-| Idle / Ready | The agent is available and not currently running a task. | Very dim idle pulse. |
+| Idle / Ready | The agent is available and not currently running a task. | Per-device breathing, solid, music, battery, or off preset. |
 | Working | The agent is thinking, generating, or otherwise actively processing. | Cyan rolling animation. |
 | Tool Running | A shell command, API call, or external tool is in progress. | Cyan rolling animation. |
 | Waiting for Input | The agent needs a user decision, approval, or additional context. | Slow amber pulse. |
@@ -160,6 +160,13 @@ The monitor currently supports:
 | Codex | `~/.codex/config.toml` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/codex.jsonl` |
 | Claude | `~/.claude/settings.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/claude.jsonl` |
 | Grok | `~/.grok/hooks/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/grok.jsonl` |
+| Cursor | `~/.cursor/hooks.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/cursor.jsonl` |
+| Kiro CLI | `~/.kiro/agents/sidepulse.json` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/kiro.jsonl` |
+| OpenCode | `~/.config/opencode/plugins/sidepulse.js` | `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/opencode.jsonl` |
+
+Agents launched through T3 Code are identified as `T3 Code` in the menu while
+retaining their underlying provider session. This avoids counting a T3-hosted
+Codex session once as T3 Code and again as standalone Codex.
 
 #### Local reply classifier (Apple Silicon)
 
@@ -235,11 +242,19 @@ Set up this Mac explicitly after package install:
 sidepulse setup
 ```
 
-`sidepulse setup` installs or refreshes Codex, Claude, and Grok hooks, installs
+`sidepulse setup` installs or refreshes Codex, Claude, Grok, and Cursor hooks, installs
+`sidepulse setup` installs or refreshes Codex, Claude, Grok, and OpenCode hooks, installs
 SidePulse Pro Eject Prevention, writes the status-bar LaunchAgent, starts both helpers
 immediately, and enables them at login. This is intentionally an explicit
 command instead of a `pip install` side effect. To set up only one provider, use
-`sidepulse setup codex`, `sidepulse setup claude`, or `sidepulse setup grok`.
+`sidepulse setup codex`, `sidepulse setup claude`, `sidepulse setup grok`, or
+`sidepulse setup cursor`.
+`sidepulse setup` installs or refreshes Codex, Claude, Grok, and Kiro hooks, installs
+SidePulse Pro Eject Prevention, writes the status-bar LaunchAgent, starts both helpers
+immediately, and enables them at login. This is intentionally an explicit
+command instead of a `pip install` side effect. To set up only one provider, use
+`sidepulse setup codex`, `sidepulse setup claude`, `sidepulse setup grok`, or `sidepulse setup kiro`.
+`sidepulse setup opencode`.
 To skip the status-bar app but still install hooks and SidePulse Pro Eject Prevention, use
 `sidepulse setup --no-status-bar`.
 
@@ -289,6 +304,19 @@ Check the current hook configuration:
 sidepulse agent-monitor doctor
 ```
 
+For runtime checks and a shareable diagnostics archive:
+
+```sh
+sidepulse agent-monitor doctor --verbose
+sidepulse agent-monitor doctor --preview-bundle
+sidepulse agent-monitor doctor --bundle ~/Desktop/sidepulse-diagnostics.zip
+```
+
+The bundle contains the structured health report and only the last 200 lines of
+SidePulse's own status-bar logs. Provider configs and transcripts are excluded.
+`--preview-bundle` shows the exact redacted `doctor.json`, archive metadata,
+and sensitive data categories that are excluded without writing a ZIP file.
+
 Install or refresh the monitor hooks:
 
 ```sh
@@ -296,7 +324,15 @@ sidepulse agent-monitor install
 sidepulse agent-monitor install codex
 sidepulse agent-monitor install claude
 sidepulse agent-monitor install grok
+sidepulse agent-monitor install cursor
+sidepulse agent-monitor install kiro
+sidepulse agent-monitor install opencode
 ```
+
+Kiro CLI currently scopes hooks to agent configuration files rather than a
+universal global hook file. SidePulse installs a managed global agent named
+`sidepulse`; launch it with `kiro-cli --agent sidepulse`. The installer refuses
+to overwrite an unmanaged `~/.kiro/agents/sidepulse.json`.
 
 Each hook invokes a small, standard-library-only Python entry point. It writes
 the event to the monitor log and then makes a short best-effort local socket
@@ -397,6 +433,12 @@ sidepulse uninstall
 sidepulse uninstall codex
 sidepulse uninstall claude
 sidepulse uninstall grok
+sidepulse agent-monitor uninstall
+sidepulse agent-monitor uninstall codex
+sidepulse agent-monitor uninstall claude
+sidepulse agent-monitor uninstall grok
+sidepulse agent-monitor uninstall cursor
+sidepulse agent-monitor uninstall kiro
 ```
 
 The older `sidepulse agent-monitor uninstall ...` spelling remains supported.
@@ -449,6 +491,14 @@ battery status. When agent status is selected, `Show Battery on Plug/Unplug`
 can briefly show the battery animation for seven seconds after the power source
 changes.
 
+Each device has its own **Idle Mode** submenu with Breathing Wave, Dim Solid,
+Music Visualizer, Battery Level, and Off presets. Music visualization is
+opt-in: SidePulse starts its signed system-audio helper only after that preset
+is selected. Settings → Devices & LEDs shows the current macOS Screen & System
+Audio Recording permission and provides actions to request it or open the
+correct System Settings pane. Audio levels are quantized and physical-device
+writes are capped at two per second to reduce unnecessary flash writes.
+
 The Devices section also offers **Add Screen Bar**, an optional virtual
 eight-LED device. It appears as a notch-shaped status-bar overlay that covers
 the camera island/notch footprint and adds a straight 5 px LED band along the
@@ -461,7 +511,7 @@ firmware/websim `sdled.wasm` engine, then AppKit only draws the returned RGB
 frames.
 
 Open `Settings...` from the dropdown to manage agent integrations. The settings
-window can install or uninstall Codex, Claude, and Grok hooks. The transcript
+window can install or uninstall Codex, Claude, Grok, and OpenCode hooks. The transcript
 checkboxes control the file-based CLI/debug fallback; the status-bar app gets
 live updates from the local hook event socket. Settings are stored at
 `${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`.
