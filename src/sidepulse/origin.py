@@ -282,10 +282,13 @@ def annotate_payload_with_origin(
     *,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    if "agent_origin" in payload or "agentOrigin" in payload:
-        return payload
+    active_env = os.environ if env is None else env
     result = dict(payload)
-    result.update(detect_agent_origin(provider, env=env).to_payload())
+    if "agent_origin" not in payload and "agentOrigin" not in payload:
+        result.update(detect_agent_origin(provider, env=active_env).to_payload())
+    operation = clean_label(active_env.get("T3CODE_TEXT_GENERATION_OPERATION"))
+    if operation:
+        result["agent_internal_operation"] = operation
     return result
 
 

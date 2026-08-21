@@ -5641,6 +5641,69 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.aggregate.mode, AgentMode.IDLE_READY)
             self.assertEqual(snapshot.statuses, ())
 
+    def test_t3_title_helpers_are_ignored_without_hiding_standalone_codex(self) -> None:
+        now = datetime.now(timezone.utc)
+        helper = collector_module.HookEvent(
+            provider="codex",
+            logged_at=now,
+            event_name="UserPromptSubmit",
+            raw={
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "t3-title",
+                "prompt": (
+                    "Generate a title that will help the user recognize this T3 Code "
+                    "thread weeks later. Return JSON with exactly one key: title."
+                ),
+                "agent_origin": "T3 Code",
+            },
+            session_id="t3-title",
+            message="Generate a title for this T3 Code thread",
+            origin="T3 Code",
+        )
+        standalone = collector_module.HookEvent(
+            provider="codex",
+            logged_at=now,
+            event_name="UserPromptSubmit",
+            raw={**helper.raw, "session_id": "standalone", "agent_origin": "Codex"},
+            session_id="standalone",
+            message=helper.message,
+            origin="Codex",
+        )
+        metadata = collector_module.StatusMetadata(cwd="/tmp/project")
+
+        self.assertTrue(collector_module.should_ignore_record(helper, metadata))
+        self.assertFalse(collector_module.should_ignore_record(standalone, metadata))
+
+    def test_structured_t3_helper_operation_removes_live_session(self) -> None:
+        store = collector_module.LiveAgentMonitor(sources=(), stale_after_seconds=3600)
+        now = datetime.now(timezone.utc)
+        session_id = "t3-helper"
+        store.ingest_record(
+            collector_module.HookEvent(
+                provider="codex",
+                logged_at=now,
+                event_name="SessionStart",
+                raw={"hook_event_name": "SessionStart", "session_id": session_id},
+                session_id=session_id,
+            )
+        )
+        self.assertEqual(len(store.statuses_by_key), 1)
+
+        store.ingest_record(
+            collector_module.HookEvent(
+                provider="codex",
+                logged_at=now,
+                event_name="UserPromptSubmit",
+                raw={
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session_id,
+                    "agent_internal_operation": "generateThreadTitle",
+                },
+                session_id=session_id,
+            )
+        )
+        self.assertEqual(store.statuses_by_key, {})
+
     def test_codex_transcript_fallback_marks_recent_user_turn_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
