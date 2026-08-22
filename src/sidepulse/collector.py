@@ -701,6 +701,8 @@ def t3code_event_mapping(
         return "UserPromptSubmit", AgentMode.WORKING
     if event_type in {"request.opened", "user-input.requested"}:
         return "PermissionRequest", AgentMode.WAITING_FOR_INPUT
+    if event_type in {"request.resolved", "user-input.resolved"}:
+        return "PostToolUse", AgentMode.WORKING
     if event_type in {"runtime.error", "thread.realtime.error"}:
         return "StopFailure", AgentMode.BLOCKED_ERROR
     if event_type in {"item.started", "task.started"}:

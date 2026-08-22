@@ -6033,13 +6033,30 @@ class AgentMonitorTests(unittest.TestCase):
                 }
             )
         )
+        resolved = collector_module.parse_t3code_event_line(
+            f"[{now}] CANON: "
+            + json.dumps(
+                {
+                    "type": "user-input.resolved",
+                    "provider": "claudeAgent",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": {},
+                }
+            )
+        )
 
         self.assertIsNotNone(tool)
         self.assertIsNotNone(waiting)
+        self.assertIsNotNone(resolved)
         self.assertEqual(collector_module.status_from_event(tool).mode, AgentMode.TOOL_RUNNING)
         self.assertEqual(
             collector_module.status_from_event(waiting).mode,
             AgentMode.WAITING_FOR_INPUT,
+        )
+        self.assertEqual(
+            collector_module.status_from_event(resolved).mode,
+            AgentMode.WORKING,
         )
         self.assertEqual(tool.origin, "T3 Code")
         self.assertEqual(tool.provider, "claude")
