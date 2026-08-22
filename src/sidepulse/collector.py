@@ -29,10 +29,13 @@ from .settings import (
 
 CODEX_TRANSCRIPT_PROVIDER = "codex-transcripts"
 CLAUDE_TRANSCRIPT_PROVIDER = "claude-transcripts"
+T3CODE_PROVIDER = "t3code"
 CODEX_TRANSCRIPT_MAX_FILES = 12
 CODEX_TRANSCRIPT_MAX_LINES = 500
 CLAUDE_TRANSCRIPT_MAX_FILES = 24
 CLAUDE_TRANSCRIPT_MAX_LINES = 500
+T3CODE_MAX_FILES = 256
+T3CODE_MAX_LINES = 5000
 TRANSCRIPT_FILE_LIST_CACHE_SECONDS = 5.0
 CLAUDE_TRANSCRIPT_MTIME_HEARTBEAT_SKEW_SECONDS = 30.0
 CODEX_SESSION_INDEX_MAX_LINES = 5000
@@ -208,8 +211,17 @@ class AgentMonitor:
             self._iter_records(),
             key=lambda record: record.logged_at,
         )
+        has_t3code_records = any(
+            record.raw.get("source") == T3CODE_PROVIDER for record in records
+        )
 
         for record in records:
+            if (
+                has_t3code_records
+                and record.raw.get("source") != T3CODE_PROVIDER
+                and record.origin == "T3 Code"
+            ):
+                continue
             metadata = metadata_for_record(
                 record,
                 metadata_by_session,
@@ -267,6 +279,15 @@ class AgentMonitor:
                     )
                 )
                 continue
+            if source.provider == T3CODE_PROVIDER:
+                parts.append(
+                    (
+                        source.provider,
+                        str(source.path),
+                        self._t3code_source_signature(source.path),
+                    )
+                )
+                continue
 
             parts.append((source.provider, str(source.path), file_signature(source.path)))
         return tuple(parts)
@@ -282,6 +303,15 @@ class AgentMonitor:
             for path in self._recent_transcript_files(root, limit=limit)
         )
 
+    def _t3code_source_signature(
+        self,
+        root: Path,
+    ) -> tuple[tuple[str, tuple[float, int] | None], ...]:
+        return tuple(
+            (str(path), file_signature(path))
+            for path in recent_t3code_event_files(root, limit=T3CODE_MAX_FILES)
+        )
+
     def _iter_records(self) -> Iterable[HookEvent]:
         for source in self.sources:
             if not source.path.exists():
@@ -291,6 +321,9 @@ class AgentMonitor:
                 continue
             if source.provider == CLAUDE_TRANSCRIPT_PROVIDER:
                 yield from self._iter_claude_transcript_records(source.path)
+                continue
+            if source.provider == T3CODE_PROVIDER:
+                yield from self._iter_t3code_records(source.path)
                 continue
             yield from self._cached_log_records(source)
 
@@ -333,6 +366,14 @@ class AgentMonitor:
                 CLAUDE_TRANSCRIPT_PROVIDER,
                 path,
                 iter_claude_transcript_file,
+            )
+
+    def _iter_t3code_records(self, root: Path) -> Iterable[HookEvent]:
+        for path in recent_t3code_event_files(root, limit=T3CODE_MAX_FILES):
+            yield from self._cached_transcript_records(
+                T3CODE_PROVIDER,
+                path,
+                iter_t3code_event_file,
             )
 
     def _recent_transcript_files(self, root: Path, *, limit: int) -> tuple[Path, ...]:
@@ -533,6 +574,9 @@ def default_sources(settings: AgentMonitorSettings | None = None) -> tuple[Sourc
     sources.append(SourceSpec("cursor", detect_log_path("cursor")))
     sources.append(SourceSpec("kiro", detect_log_path("kiro")))
     sources.append(SourceSpec("opencode", detect_log_path("opencode")))
+    t3code_logs = default_t3code_event_log_dir()
+    if t3code_logs.exists():
+        sources.append(SourceSpec(T3CODE_PROVIDER, t3code_logs))
     return unique_sources(sources)
 
 
@@ -565,6 +609,127 @@ def recent_transcript_files(
 
     files.sort(key=lambda path: safe_mtime(path), reverse=True)
     return files[:limit]
+
+
+def default_t3code_event_log_dir(home: Path | None = None) -> Path:
+    root = home or Path.home()
+    return root / ".t3" / "userdata" / "logs" / "provider"
+
+
+def recent_t3code_event_files(root: Path, *, limit: int = T3CODE_MAX_FILES) -> list[Path]:
+    try:
+        files = [
+            path
+            for path in root.glob("events.*.log*")
+            if path.is_file() and re.search(r"\.log(?:\.\d+)?$", path.name)
+        ]
+    except OSError:
+        return []
+    files.sort(key=lambda path: safe_mtime(path), reverse=True)
+    return files[:limit]
+
+
+def iter_t3code_event_file(path: Path) -> Iterable[HookEvent]:
+    for line in read_recent_lines(path, T3CODE_MAX_LINES):
+        record = parse_t3code_event_line(line)
+        if record is not None:
+            yield record
+
+
+def parse_t3code_event_line(line: str) -> HookEvent | None:
+    match = re.match(r"^\[([^\]]+)\]\s+CANON:\s+(\{.*\})\s*$", line)
+    if match is None:
+        return None
+    try:
+        event = json.loads(match.group(2))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(event, dict):
+        return None
+
+    event_type = event.get("type")
+    thread_id = _string_or_none(event.get("threadId"))
+    provider = normalize_t3code_provider(event.get("provider"))
+    if not isinstance(event_type, str) or thread_id is None or provider is None:
+        return None
+
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    hook_event, mode = t3code_event_mapping(event_type, payload)
+    if hook_event is None or mode is None:
+        return None
+
+    tool_name = _string_or_none(payload.get("title"))
+    message = t3code_event_message(event_type, payload)
+    raw = {
+        "hook_event_name": hook_event,
+        "session_id": thread_id,
+        "turn_id": event.get("turnId"),
+        "agent_origin": "T3 Code",
+        "agent_origin_kind": "t3code",
+        "sidepulse_mode": mode.value,
+        "source": T3CODE_PROVIDER,
+        "provider_instance_id": event.get("providerInstanceId"),
+        "t3code_event_type": event_type,
+        "t3code_payload": payload,
+    }
+    return HookEvent(
+        provider=provider,
+        logged_at=parse_datetime(event.get("createdAt"), parse_datetime(match.group(1))),
+        event_name=hook_event,
+        raw=raw,
+        session_id=thread_id,
+        turn_id=_string_or_none(event.get("turnId")),
+        tool_name=tool_name,
+        message=message,
+        origin="T3 Code",
+    )
+
+
+def normalize_t3code_provider(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return {"claudeAgent": "claude"}.get(value, value)
+
+
+def t3code_event_mapping(
+    event_type: str,
+    payload: dict[str, Any],
+) -> tuple[str | None, AgentMode | None]:
+    if event_type in {"turn.completed", "turn.aborted", "session.exited"}:
+        return "Stop", AgentMode.COMPLETED
+    if event_type == "turn.started":
+        return "UserPromptSubmit", AgentMode.WORKING
+    if event_type in {"request.opened", "user-input.requested"}:
+        return "PermissionRequest", AgentMode.WAITING_FOR_INPUT
+    if event_type in {"runtime.error", "thread.realtime.error"}:
+        return "StopFailure", AgentMode.BLOCKED_ERROR
+    if event_type in {"item.started", "task.started"}:
+        item_type = str(payload.get("itemType", "")).lower()
+        if event_type == "task.started" or any(
+            marker in item_type
+            for marker in ("tool", "command", "file_change", "mcp", "browser")
+        ):
+            return "PreToolUse", AgentMode.TOOL_RUNNING
+        return "UserPromptSubmit", AgentMode.WORKING
+    if event_type in {"item.completed", "task.completed"}:
+        return "PostToolUse", AgentMode.WORKING
+    if event_type == "session.state.changed":
+        state = str(payload.get("state", "")).lower()
+        if state in {"idle", "ready"}:
+            return "Stop", AgentMode.COMPLETED
+        if state in {"error", "failed", "exited", "closed"}:
+            return "StopFailure", AgentMode.BLOCKED_ERROR
+        if state in {"busy", "running", "active"}:
+            return "UserPromptSubmit", AgentMode.WORKING
+    return None, None
+
+
+def t3code_event_message(event_type: str, payload: dict[str, Any]) -> str | None:
+    for key in ("message", "errorMessage", "reason", "stopReason", "title"):
+        value = _string_or_none(payload.get(key))
+        if value is not None:
+            return value
+    return event_type
 
 
 def safe_mtime(path: Path) -> float:
@@ -756,6 +921,29 @@ def codex_transcript_event(
             turn_id=turn_id,
             cwd=cwd,
             message=message,
+        )
+
+    if payload_type == "turn_aborted":
+        reason = _string_or_none(payload.get("reason")) or "aborted"
+        aborted_turn_id = _string_or_none(payload.get("turn_id")) or turn_id
+        return HookEvent(
+            provider="codex",
+            logged_at=timestamp,
+            event_name="Stop",
+            raw={
+                "hook_event_name": "Stop",
+                "session_id": session_id,
+                "turn_id": aborted_turn_id,
+                "cwd": cwd,
+                "last_assistant_message": "",
+                "reason": reason,
+                "transcript_path": str(path),
+                "source": CODEX_TRANSCRIPT_PROVIDER,
+            },
+            session_id=session_id,
+            turn_id=aborted_turn_id,
+            cwd=cwd,
+            message=reason,
         )
 
     return None

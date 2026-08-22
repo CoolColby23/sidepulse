@@ -5893,6 +5893,157 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
             self.assertEqual(snapshot.statuses[0].event_name, "Stop")
 
+    def test_codex_transcript_turn_aborted_clears_running_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session_id = "01a026a9-a542-7de3-9818-bb7966e1376f"
+            path = root / f"rollout-2026-08-21T19-30-47-{session_id}.jsonl"
+            now = datetime.now(timezone.utc).isoformat()
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": now,
+                                "type": "turn_context",
+                                "payload": {
+                                    "turn_id": "turn-1",
+                                    "cwd": "/tmp/project",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": now,
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "function_call",
+                                    "name": "exec_command",
+                                    "call_id": "call-1",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "timestamp": now,
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "turn_aborted",
+                                    "turn_id": "turn-1",
+                                    "reason": "interrupted",
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            snapshot = AgentMonitor(
+                sources=(SourceSpec("codex-transcripts", root),),
+                stale_after_seconds=3600,
+            ).snapshot()
+
+            self.assertEqual(snapshot.aggregate.mode, AgentMode.COMPLETED)
+            self.assertEqual(snapshot.statuses[0].event_name, "Stop")
+            self.assertEqual(snapshot.statuses[0].message, "interrupted")
+
+    def test_t3code_canonical_events_track_all_provider_lifecycles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = datetime.now(timezone.utc)
+            providers = ("codex", "claudeAgent", "opencode", "cursor", "grok")
+            for index, provider in enumerate(providers):
+                thread_id = f"00000000-0000-4000-8000-{index:012d}"
+                path = root / f"events.{thread_id}.log"
+                started_at = (now + timedelta(milliseconds=index * 2)).isoformat()
+                ended_at = (now + timedelta(milliseconds=index * 2 + 1)).isoformat()
+                path.write_text(
+                    "\n".join(
+                        [
+                            f"[{started_at}] CANON: "
+                            + json.dumps(
+                                {
+                                    "type": "turn.started",
+                                    "provider": provider,
+                                    "threadId": thread_id,
+                                    "createdAt": started_at,
+                                    "payload": {},
+                                }
+                            ),
+                            f"[{ended_at}] CANON: "
+                            + json.dumps(
+                                {
+                                    "type": "turn.aborted",
+                                    "provider": provider,
+                                    "threadId": thread_id,
+                                    "createdAt": ended_at,
+                                    "payload": {"reason": "interrupted"},
+                                }
+                            ),
+                        ]
+                    )
+                    + "\n"
+                )
+
+            snapshot = AgentMonitor(
+                sources=(SourceSpec("t3code", root),),
+                stale_after_seconds=3600,
+            ).snapshot()
+
+            self.assertEqual(len(snapshot.statuses), len(providers))
+            self.assertTrue(
+                all(status.mode == AgentMode.COMPLETED for status in snapshot.statuses)
+            )
+            self.assertTrue(all(status.origin == "T3 Code" for status in snapshot.statuses))
+            self.assertEqual(
+                {status.provider for status in snapshot.statuses},
+                {"codex", "claude", "opencode", "cursor", "grok"},
+            )
+
+    def test_t3code_canonical_tool_and_input_events_map_to_statuses(self) -> None:
+        thread_id = "00000000-0000-4000-8000-000000000001"
+        now = datetime.now(timezone.utc).isoformat()
+
+        tool = collector_module.parse_t3code_event_line(
+            f"[{now}] CANON: "
+            + json.dumps(
+                {
+                    "type": "item.started",
+                    "provider": "claudeAgent",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": {
+                        "itemType": "command_execution",
+                        "title": "Bash",
+                    },
+                }
+            )
+        )
+        waiting = collector_module.parse_t3code_event_line(
+            f"[{now}] CANON: "
+            + json.dumps(
+                {
+                    "type": "user-input.requested",
+                    "provider": "claudeAgent",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": {"message": "Choose an option"},
+                }
+            )
+        )
+
+        self.assertIsNotNone(tool)
+        self.assertIsNotNone(waiting)
+        self.assertEqual(collector_module.status_from_event(tool).mode, AgentMode.TOOL_RUNNING)
+        self.assertEqual(
+            collector_module.status_from_event(waiting).mode,
+            AgentMode.WAITING_FOR_INPUT,
+        )
+        self.assertEqual(tool.origin, "T3 Code")
+        self.assertEqual(tool.provider, "claude")
+
     def test_codex_transcript_usage_limit_completes_without_stop_hook(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
