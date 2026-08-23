@@ -85,9 +85,11 @@ from .audit import (
 from .collector import (
     CODEX_TRANSCRIPT_PROVIDER,
     COMPLETED_VISIBLE_SECONDS,
+    T3CODE_PROVIDER,
     AgentMonitor,
     LiveAgentMonitor,
     SourceSpec,
+    default_t3code_event_log_dir,
     read_recent_lines,
 )
 from .device_writer import (
@@ -251,6 +253,9 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
 STATUS_BAR_SESSION_HISTORY_LIMIT = 10
+# Below this the number is noise; above it the session is close enough to a
+# compaction that it is worth seeing without opening the submenu.
+CONTEXT_PERCENT_MENU_THRESHOLD = 70.0
 AMBIENT_REFRESH_SECONDS = 0.20
 MUSIC_WRITE_INTERVAL_SECONDS = 0.50
 MUSIC_LEVEL_STEPS = 12
@@ -369,6 +374,24 @@ def reconcile_codex_terminal_transcripts(
     return monitor.reconcile_statuses(terminal)
 
 
+def reconcile_t3code_sessions(
+    monitor: LiveAgentMonitor,
+    t3code_monitor: AgentMonitor,
+) -> int:
+    """Prefer T3 Code's canonical event log over the hosted agent's own hooks.
+
+    T3 reports every provider it hosts, including ones that ship no hooks at
+    all, and it keys sessions by its own thread id. Only live threads are
+    reconciled so a rotated-out log can never retire a session that is still
+    reporting through hooks.
+    """
+
+    canonical = t3code_monitor.snapshot(include_stale=False).statuses
+    if not canonical:
+        return 0
+    return monitor.reconcile_statuses(canonical, replaces_origin="T3 Code")
+
+
 class StatusBarController(NSObject):
     def init(self):
         self = objc.super(StatusBarController, self).init()
@@ -378,6 +401,7 @@ class StatusBarController(NSObject):
         self.settings = load_settings()
         self.monitor = self.build_monitor()
         self.codex_terminal_monitor = self.build_codex_terminal_monitor()
+        self.t3code_monitor = self.build_t3code_monitor()
         self.event_server = None
         self.status_item = None
         self.timer = None
@@ -506,6 +530,7 @@ class StatusBarController(NSObject):
                 self.monitor,
                 self.codex_terminal_monitor,
             )
+            reconcile_t3code_sessions(self.monitor, self.t3code_monitor)
             snapshot = self.monitor.snapshot(include_stale=False)
         except Exception as exc:
             log_status_bar(f"refresh error: {exc}")
@@ -921,9 +946,17 @@ class StatusBarController(NSObject):
             ),
         )
 
+    def build_t3code_monitor(self) -> AgentMonitor:
+        return AgentMonitor(
+            sources=(SourceSpec(T3CODE_PROVIDER, default_t3code_event_log_dir()),),
+            stale_after_seconds=self.settings.idle_timeout_seconds,
+            completed_visible_seconds=self.settings.completed_session_visibility_seconds,
+        )
+
     def reload_monitor(self) -> None:
         self.monitor = self.build_monitor()
         self.codex_terminal_monitor = self.build_codex_terminal_monitor()
+        self.t3code_monitor = self.build_t3code_monitor()
 
     def start_event_server(self) -> None:
         self.stop_event_server()
@@ -3546,7 +3579,12 @@ def build_session_menu_item(
     return item
 
 
-def native_session_menu_title(status: AgentStatus, *, disambiguate: bool = False) -> str:
+def native_session_menu_title(
+    status: AgentStatus,
+    *,
+    disambiguate: bool = False,
+    include_context: bool = True,
+) -> str:
     title, project = session_title_parts(status)
     if normalized_origin_text(status.origin) == "t3 code":
         title = f"T3 Code  {title}"
@@ -3555,7 +3593,18 @@ def native_session_menu_title(status: AgentStatus, *, disambiguate: bool = False
     parts = [title]
     if project:
         parts.append(project)
+    if include_context:
+        context = format_context_percent(status, threshold=CONTEXT_PERCENT_MENU_THRESHOLD)
+        if context:
+            parts.append(context)
     return "  ".join(parts)
+
+
+def format_context_percent(status: AgentStatus, *, threshold: float = 0.0) -> str | None:
+    percent = status.context_percent
+    if percent is None or percent < threshold or round(percent) <= 0:
+        return None
+    return f"{round(percent)}% context"
 
 
 def build_session_options_menu(
@@ -3904,7 +3953,7 @@ def session_title_collision_keys(statuses: list[AgentStatus]) -> set[tuple[str, 
 def session_title_collision_key(status: AgentStatus) -> tuple[str, str]:
     return (
         status.provider.lower(),
-        normalized_menu_part(native_session_menu_title(status)),
+        normalized_menu_part(native_session_menu_title(status, include_context=False)),
     )
 
 
@@ -3958,6 +4007,9 @@ def session_detail_for_status(status: AgentStatus, now: datetime) -> str:
         details.append(status.origin)
     if status.tool_name:
         details.append(status.tool_name)
+    context = format_context_percent(status)
+    if context:
+        details.append(context)
     return " · ".join(details)
 
 

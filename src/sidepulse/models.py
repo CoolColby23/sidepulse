@@ -78,6 +78,7 @@ class AgentStatus:
     message: str | None = None
     origin: str | None = None
     stale: bool = False
+    context_percent: float | None = None
 
     @property
     def priority(self) -> int:
@@ -108,6 +109,7 @@ class AgentStatus:
             "message": self.message,
             "origin": self.origin,
             "stale": self.stale,
+            "context_percent": self.context_percent,
         }
 
 

@@ -4,7 +4,7 @@ import json
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -34,8 +34,24 @@ CODEX_TRANSCRIPT_MAX_FILES = 12
 CODEX_TRANSCRIPT_MAX_LINES = 500
 CLAUDE_TRANSCRIPT_MAX_FILES = 24
 CLAUDE_TRANSCRIPT_MAX_LINES = 500
-T3CODE_MAX_FILES = 256
+T3CODE_MAX_FILES = 32
 T3CODE_MAX_LINES = 5000
+# Rotated provider logs are large and immutable. Anything older than this window
+# can only describe sessions that have already aged out of the menu, so parsing
+# it costs megabytes of JSON for records that are discarded moments later.
+T3CODE_MAX_FILE_AGE_SECONDS = 24 * 60 * 60
+T3CODE_METADATA_EVENT = "T3SessionMetadata"
+T3CODE_FAILED_STATES = frozenset({"failed", "error", "errored", "cancelled", "canceled"})
+T3CODE_TOOL_ITEM_MARKERS = (
+    "tool",
+    "command",
+    "file_change",
+    "mcp",
+    "browser",
+    "exec",
+    "patch",
+    "web_search",
+)
 TRANSCRIPT_FILE_LIST_CACHE_SECONDS = 5.0
 CLAUDE_TRANSCRIPT_MTIME_HEARTBEAT_SKEW_SECONDS = 30.0
 CODEX_SESSION_INDEX_MAX_LINES = 5000
@@ -55,6 +71,7 @@ class StatusMetadata:
     cwd: str | None = None
     title: str | None = None
     origin: str | None = None
+    context_percent: float | None = None
 
 
 @dataclass(frozen=True)
@@ -247,6 +264,8 @@ class AgentMonitor:
                 ):
                     continue
                 statuses_by_key[status.agent_id] = status
+
+        apply_context_metadata(statuses_by_key, metadata_by_session)
 
         self._latest_status_signature = signature
         self._latest_statuses_by_key = dict(statuses_by_key)
@@ -493,16 +512,38 @@ class LiveAgentMonitor:
             self.statuses_by_key[status.agent_id] = status
             self.write_latest_state()
 
-    def reconcile_statuses(self, statuses: Iterable[AgentStatus]) -> int:
-        """Merge newer fallback statuses without overriding newer live events."""
+    def reconcile_statuses(
+        self,
+        statuses: Iterable[AgentStatus],
+        *,
+        replaces_origin: str | None = None,
+    ) -> int:
+        """Merge newer fallback statuses without overriding newer live events.
+
+        ``replaces_origin`` names an origin whose live rows the incoming
+        statuses are authoritative for. A host such as T3 Code reports the same
+        session under its own thread id, so the agent's own hooks would
+        otherwise leave a duplicate row behind.
+        """
+
         changed = 0
         with self.lock:
+            canonical_keys: set[str] = set()
             for status in statuses:
+                canonical_keys.add(status.agent_id)
                 previous = self.statuses_by_key.get(status.agent_id)
                 if previous is not None and previous.updated_at >= status.updated_at:
                     continue
                 self.statuses_by_key[status.agent_id] = status
                 changed += 1
+            if replaces_origin and canonical_keys:
+                wanted = replaces_origin.strip().casefold()
+                for key, status in list(self.statuses_by_key.items()):
+                    if key in canonical_keys:
+                        continue
+                    if (status.origin or "").strip().casefold() == wanted:
+                        del self.statuses_by_key[key]
+                        changed += 1
             if changed:
                 self.write_latest_state()
         return changed
@@ -616,7 +657,13 @@ def default_t3code_event_log_dir(home: Path | None = None) -> Path:
     return root / ".t3" / "userdata" / "logs" / "provider"
 
 
-def recent_t3code_event_files(root: Path, *, limit: int = T3CODE_MAX_FILES) -> list[Path]:
+def recent_t3code_event_files(
+    root: Path,
+    *,
+    limit: int = T3CODE_MAX_FILES,
+    max_age_seconds: float = T3CODE_MAX_FILE_AGE_SECONDS,
+    now: float | None = None,
+) -> list[Path]:
     try:
         files = [
             path
@@ -626,6 +673,9 @@ def recent_t3code_event_files(root: Path, *, limit: int = T3CODE_MAX_FILES) -> l
     except OSError:
         return []
     files.sort(key=lambda path: safe_mtime(path), reverse=True)
+    if max_age_seconds > 0:
+        cutoff = (time.time() if now is None else now) - max_age_seconds
+        files = [path for path in files if safe_mtime(path) >= cutoff]
     return files[:limit]
 
 
@@ -654,11 +704,41 @@ def parse_t3code_event_line(line: str) -> HookEvent | None:
         return None
 
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    logged_at = parse_datetime(event.get("createdAt"), parse_datetime(match.group(1)))
+
+    # Some canonical events describe the session rather than a state change:
+    # they carry no mode of their own but tell the menu where the session is
+    # running and how full its context is.
+    context_percent = t3code_context_percent(event_type, payload)
+    cwd = t3code_session_cwd(event_type, payload)
+    if context_percent is not None or cwd is not None:
+        raw = {
+            "hook_event_name": T3CODE_METADATA_EVENT,
+            "session_id": thread_id,
+            "cwd": cwd,
+            "agent_origin": "T3 Code",
+            "agent_origin_kind": "t3code",
+            "source": T3CODE_PROVIDER,
+            "t3code_event_type": event_type,
+        }
+        if context_percent is not None:
+            raw["t3code_context_percent"] = context_percent
+        return HookEvent(
+            provider=provider,
+            logged_at=logged_at,
+            event_name=T3CODE_METADATA_EVENT,
+            raw=raw,
+            session_id=thread_id,
+            turn_id=_string_or_none(event.get("turnId")),
+            cwd=cwd,
+            origin="T3 Code",
+        )
+
     hook_event, mode = t3code_event_mapping(event_type, payload)
     if hook_event is None or mode is None:
         return None
 
-    tool_name = _string_or_none(payload.get("title"))
+    tool_name = t3code_tool_name(payload) if t3code_is_tool_item(payload) else None
     message = t3code_event_message(event_type, payload)
     raw = {
         "hook_event_name": hook_event,
@@ -670,11 +750,11 @@ def parse_t3code_event_line(line: str) -> HookEvent | None:
         "source": T3CODE_PROVIDER,
         "provider_instance_id": event.get("providerInstanceId"),
         "t3code_event_type": event_type,
-        "t3code_payload": payload,
+        "t3code_payload": summarize_t3code_payload(payload),
     }
     return HookEvent(
         provider=provider,
-        logged_at=parse_datetime(event.get("createdAt"), parse_datetime(match.group(1))),
+        logged_at=logged_at,
         event_name=hook_event,
         raw=raw,
         session_id=thread_id,
@@ -683,6 +763,25 @@ def parse_t3code_event_line(line: str) -> HookEvent | None:
         message=message,
         origin="T3 Code",
     )
+
+
+def summarize_t3code_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop bulky nested blobs (per-turn usage, provider detail) before caching.
+
+    A single ``turn.completed`` payload can carry tens of kilobytes of
+    per-iteration token accounting, and the parsed records stay cached for the
+    lifetime of the log file.
+    """
+
+    summary = {
+        key: value
+        for key, value in payload.items()
+        if not isinstance(value, (dict, list))
+    }
+    tool_name = t3code_tool_name(payload) if t3code_is_tool_item(payload) else None
+    if tool_name is not None:
+        summary["tool_name"] = tool_name
+    return summary
 
 
 def normalize_t3code_provider(value: object) -> str | None:
@@ -696,6 +795,8 @@ def t3code_event_mapping(
     payload: dict[str, Any],
 ) -> tuple[str | None, AgentMode | None]:
     if event_type in {"turn.completed", "turn.aborted", "session.exited"}:
+        if t3code_state_failed(payload.get("state")):
+            return "StopFailure", AgentMode.BLOCKED_ERROR
         return "Stop", AgentMode.COMPLETED
     if event_type == "turn.started":
         return "UserPromptSubmit", AgentMode.WORKING
@@ -708,14 +809,17 @@ def t3code_event_mapping(
     if event_type in {"item.started", "task.started"}:
         item_type = str(payload.get("itemType", "")).lower()
         if event_type == "task.started" or any(
-            marker in item_type
-            for marker in ("tool", "command", "file_change", "mcp", "browser")
+            marker in item_type for marker in T3CODE_TOOL_ITEM_MARKERS
         ):
             return "PreToolUse", AgentMode.TOOL_RUNNING
         return "UserPromptSubmit", AgentMode.WORKING
     if event_type in {"item.completed", "task.completed"}:
+        if t3code_state_failed(payload.get("status")):
+            return "PostToolUseFailure", AgentMode.BLOCKED_ERROR
         return "PostToolUse", AgentMode.WORKING
-    if event_type == "session.state.changed":
+    # Codex threads hosted by T3 report their idle/active transitions as
+    # thread.state.changed; only agent-level sessions use session.state.changed.
+    if event_type in {"session.state.changed", "thread.state.changed"}:
         state = str(payload.get("state", "")).lower()
         if state in {"idle", "ready"}:
             return "Stop", AgentMode.COMPLETED
@@ -723,10 +827,93 @@ def t3code_event_mapping(
             return "StopFailure", AgentMode.BLOCKED_ERROR
         if state in {"busy", "running", "active"}:
             return "UserPromptSubmit", AgentMode.WORKING
+    if event_type == "account.rate-limits.updated":
+        if t3code_rate_limit_reached(payload):
+            return "StopFailure", AgentMode.BLOCKED_ERROR
     return None, None
 
 
+def t3code_state_failed(value: object) -> bool:
+    return isinstance(value, str) and value.strip().lower() in T3CODE_FAILED_STATES
+
+
+def t3code_is_tool_item(payload: dict[str, Any]) -> bool:
+    """Reasoning and assistant-message items are not tools; don't label them as one."""
+
+    item_type = str(payload.get("itemType", "")).lower()
+    if not item_type:
+        return isinstance(payload.get("data"), dict)
+    return any(marker in item_type for marker in T3CODE_TOOL_ITEM_MARKERS)
+
+
+def t3code_tool_name(payload: dict[str, Any]) -> str | None:
+    """Prefer the real tool name over T3's generic item title.
+
+    T3 titles items with human labels such as "Command run"; the tool that is
+    actually running is carried in the item data.
+    """
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("toolName", "tool_name", "name", "command"):
+            value = _string_or_none(data.get(key))
+            if value is not None:
+                return value
+    return _string_or_none(payload.get("title"))
+
+
+def t3code_rate_limits(payload: dict[str, Any]) -> dict[str, Any] | None:
+    limits = payload.get("rateLimits")
+    # T3 forwards the provider notification verbatim, which nests the payload
+    # under a second "rateLimits" key.
+    for _ in range(2):
+        if not isinstance(limits, dict):
+            return None
+        inner = limits.get("rateLimits")
+        if not isinstance(inner, dict):
+            return limits
+        limits = inner
+    return limits if isinstance(limits, dict) else None
+
+
+def t3code_rate_limit_reached(payload: dict[str, Any]) -> bool:
+    limits = t3code_rate_limits(payload)
+    if limits is None:
+        return False
+    return _string_or_none(limits.get("rateLimitReachedType")) is not None
+
+
+def t3code_session_cwd(event_type: str, payload: dict[str, Any]) -> str | None:
+    """T3 reports the working directory once, when it configures the session."""
+
+    if event_type not in {"session.configured", "thread.configured"}:
+        return None
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return None
+    return _string_or_none(config.get("cwd"))
+
+
+def t3code_context_percent(event_type: str, payload: dict[str, Any]) -> float | None:
+    if event_type not in {"thread.token-usage.updated", "session.token-usage.updated"}:
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    used = usage.get("usedTokens")
+    total = usage.get("maxTokens")
+    if not isinstance(used, (int, float)) or not isinstance(total, (int, float)):
+        return None
+    if total <= 0:
+        return None
+    return max(0.0, min(100.0, round(used / total * 100, 1)))
+
+
 def t3code_event_message(event_type: str, payload: dict[str, Any]) -> str | None:
+    if event_type == "account.rate-limits.updated" and t3code_rate_limit_reached(payload):
+        limits = t3code_rate_limits(payload) or {}
+        reached = _string_or_none(limits.get("rateLimitReachedType")) or "usage"
+        return f"Rate limit reached ({reached})"
     for key in ("message", "errorMessage", "reason", "stopReason", "title"):
         value = _string_or_none(payload.get(key))
         if value is not None:
@@ -1192,6 +1379,27 @@ def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def apply_context_metadata(
+    statuses_by_key: dict[str, AgentStatus],
+    metadata_by_session: dict[str, StatusMetadata],
+) -> None:
+    """Stamp the newest context usage onto statuses set by an earlier event.
+
+    Context usage arrives on its own events, so the status a session is showing
+    was usually produced before the most recent measurement.
+    """
+
+    for key, status in list(statuses_by_key.items()):
+        if not status.session_id:
+            continue
+        metadata = metadata_by_session.get(f"{status.provider}:session:{status.session_id}")
+        if metadata is None or metadata.context_percent is None:
+            continue
+        if status.context_percent == metadata.context_percent:
+            continue
+        statuses_by_key[key] = replace(status, context_percent=metadata.context_percent)
+
+
 def metadata_for_record(
     record: HookEvent,
     metadata_by_session: dict[str, StatusMetadata],
@@ -1214,6 +1422,11 @@ def metadata_for_record(
         cwd=status_metadata.cwd or session_metadata.cwd,
         title=status_metadata.title or session_metadata.title,
         origin=status_metadata.origin or session_metadata.origin,
+        context_percent=(
+            status_metadata.context_percent
+            if status_metadata.context_percent is not None
+            else session_metadata.context_percent
+        ),
     )
 
 
@@ -1228,6 +1441,10 @@ def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
     origin = record.origin or origin_label_from_payload(record.provider, record.raw)
     if origin:
         metadata.origin = origin
+
+    context_percent = record.raw.get("t3code_context_percent")
+    if isinstance(context_percent, (int, float)):
+        metadata.context_percent = float(context_percent)
 
 
 def is_provider_session_title(record: HookEvent, title: str) -> bool:
@@ -1264,10 +1481,11 @@ def status_from_event(record: HookEvent, metadata: StatusMetadata | None = None)
         updated_at=record.logged_at,
         event_name=record.event_name,
         session_id=record.session_id,
-        cwd=record.cwd,
+        cwd=record.cwd or metadata.cwd,
         tool_name=record.tool_name,
         message=record.message,
         origin=record.origin or metadata.origin or origin_label_from_payload(record.provider, record.raw),
+        context_percent=metadata.context_percent,
     )
 
 
@@ -1565,9 +1783,16 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             message=_string_or_none(data.get("message")),
             origin=_string_or_none(data.get("origin")),
             stale=bool(data.get("stale", False)),
+            context_percent=_float_or_none(data.get("context_percent")),
         )
     except Exception:
         return None
+
+
+def _float_or_none(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def status_counts_active(status: AgentStatus) -> bool:
@@ -1723,39 +1948,13 @@ def read_recent_lines(path: Path, max_lines: int) -> list[str]:
 def _replace_stale(status: AgentStatus, stale: bool) -> AgentStatus:
     if status.stale == stale:
         return status
-    return AgentStatus(
-        provider=status.provider,
-        agent_id=status.agent_id,
-        display_name=status.display_name,
-        mode=status.mode,
-        updated_at=status.updated_at,
-        event_name=status.event_name,
-        session_id=status.session_id,
-        cwd=status.cwd,
-        tool_name=status.tool_name,
-        message=status.message,
-        origin=status.origin,
-        stale=stale,
-    )
+    return replace(status, stale=stale)
 
 
 def _replace_mode(status: AgentStatus, mode: AgentMode) -> AgentStatus:
     if status.mode == mode:
         return status
-    return AgentStatus(
-        provider=status.provider,
-        agent_id=status.agent_id,
-        display_name=status.display_name,
-        mode=mode,
-        updated_at=status.updated_at,
-        event_name=status.event_name,
-        session_id=status.session_id,
-        cwd=status.cwd,
-        tool_name=status.tool_name,
-        message=status.message,
-        origin=status.origin,
-        stale=status.stale,
-    )
+    return replace(status, mode=mode)
 
 
 def title_from_event(record: HookEvent) -> str | None:

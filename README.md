@@ -168,6 +168,16 @@ Agents launched through T3 Code are identified as `T3 Code` in the menu while
 retaining their underlying provider session. This avoids counting a T3-hosted
 Codex session once as T3 Code and again as standalone Codex.
 
+T3 Code writes a canonical event log to `~/.t3/userdata/logs/provider`, and
+SidePulse reads it directly rather than relying on each hosted agent shipping
+its own hooks. That log is authoritative for T3-hosted sessions, so a session
+that also reports through provider hooks is shown once, under its T3 thread.
+Canonical events supply the working directory, the running tool, turn and
+thread state, provider rate limits, and token usage; a session whose context is
+at least 70% full shows that percentage in the menu, and every session shows it
+in the session submenu. Only logs modified in the last 24 hours are parsed, so
+rotated history does not slow down a refresh.
+
 #### Local reply classifier (Apple Silicon)
 
 Install the optional MLX dependency, then classify a message with the default

@@ -530,6 +530,10 @@ class AgentMonitorTests(unittest.TestCase):
 
             with (
                 patch("sidepulse.hook.detect_log_path", return_value=grok),
+                # Origin detection walks the real process tree before falling
+                # back to TERM_PROGRAM, so an editor-hosted test runner would
+                # otherwise decide this terminal session belongs to its host.
+                patch("sidepulse.origin.process_ancestry", return_value=()),
                 patch.dict(os.environ, {"TERM_PROGRAM": "Apple_Terminal"}, clear=True),
             ):
                 provider, path, line = routed_hook_payload("claude", claude, payload)
@@ -6060,6 +6064,351 @@ class AgentMonitorTests(unittest.TestCase):
         )
         self.assertEqual(tool.origin, "T3 Code")
         self.assertEqual(tool.provider, "claude")
+
+    def test_t3code_canonical_sessions_replace_duplicate_hook_rows(self) -> None:
+        from sidepulse.status_bar import reconcile_t3code_sessions
+
+        now = datetime.now(timezone.utc)
+        live = collector_module.LiveAgentMonitor(stale_after_seconds=3600)
+        hook_row = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:claude-native-id",
+            display_name="hosted session",
+            mode=AgentMode.WORKING,
+            updated_at=now - timedelta(seconds=30),
+            event_name="PreToolUse",
+            session_id="claude-native-id",
+            origin="T3 Code",
+        )
+        local_row = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:terminal-id",
+            display_name="terminal session",
+            mode=AgentMode.WORKING,
+            updated_at=now - timedelta(seconds=30),
+            event_name="PreToolUse",
+            session_id="terminal-id",
+        )
+        live.statuses_by_key = {
+            hook_row.agent_id: hook_row,
+            local_row.agent_id: local_row,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            thread_id = "00000000-0000-4000-8000-000000000047"
+            started_at = now.isoformat()
+            (root / f"events.{thread_id}.log").write_text(
+                f"[{started_at}] CANON: "
+                + json.dumps(
+                    {
+                        "type": "turn.started",
+                        "provider": "claudeAgent",
+                        "threadId": thread_id,
+                        "createdAt": started_at,
+                        "payload": {},
+                    }
+                )
+                + "\n"
+            )
+            t3code = AgentMonitor(
+                sources=(SourceSpec("t3code", root),),
+                stale_after_seconds=3600,
+            )
+
+            reconcile_t3code_sessions(live, t3code)
+
+        keys = set(live.statuses_by_key)
+        self.assertIn(f"claude:session:{thread_id}", keys)
+        self.assertIn(local_row.agent_id, keys, "non-T3 sessions must survive")
+        self.assertNotIn(
+            hook_row.agent_id,
+            keys,
+            "the hosted agent's own hook row duplicates the canonical T3 row",
+        )
+
+    def test_t3code_reconcile_leaves_hook_rows_when_no_canonical_events(self) -> None:
+        from sidepulse.status_bar import reconcile_t3code_sessions
+
+        now = datetime.now(timezone.utc)
+        live = collector_module.LiveAgentMonitor(stale_after_seconds=3600)
+        hook_row = AgentStatus(
+            provider="claude",
+            agent_id="claude:session:claude-native-id",
+            display_name="hosted session",
+            mode=AgentMode.WORKING,
+            updated_at=now - timedelta(seconds=30),
+            event_name="PreToolUse",
+            session_id="claude-native-id",
+            origin="T3 Code",
+        )
+        live.statuses_by_key = {hook_row.agent_id: hook_row}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            t3code = AgentMonitor(
+                sources=(SourceSpec("t3code", Path(tmp)),),
+                stale_after_seconds=3600,
+            )
+            self.assertEqual(reconcile_t3code_sessions(live, t3code), 0)
+
+        self.assertIn(hook_row.agent_id, live.statuses_by_key)
+
+    def test_t3code_thread_state_changes_drive_codex_status(self) -> None:
+        thread_id = "00000000-0000-4000-8000-000000000042"
+        now = datetime.now(timezone.utc).isoformat()
+
+        def canon(event_type: str, payload: dict) -> str:
+            return f"[{now}] CANON: " + json.dumps(
+                {
+                    "type": event_type,
+                    "provider": "codex",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": payload,
+                }
+            )
+
+        active = collector_module.parse_t3code_event_line(
+            canon("thread.state.changed", {"state": "active"})
+        )
+        idle = collector_module.parse_t3code_event_line(
+            canon("thread.state.changed", {"state": "idle"})
+        )
+
+        self.assertIsNotNone(active)
+        self.assertIsNotNone(idle)
+        self.assertEqual(
+            collector_module.status_from_event(active).mode,
+            AgentMode.WORKING,
+        )
+        self.assertEqual(
+            collector_module.status_from_event(idle).mode,
+            AgentMode.COMPLETED,
+        )
+        self.assertEqual(idle.provider, "codex")
+
+    def test_t3code_failed_items_and_turns_report_errors(self) -> None:
+        thread_id = "00000000-0000-4000-8000-000000000043"
+        now = datetime.now(timezone.utc).isoformat()
+
+        def canon(event_type: str, payload: dict) -> str:
+            return f"[{now}] CANON: " + json.dumps(
+                {
+                    "type": event_type,
+                    "provider": "claudeAgent",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": payload,
+                }
+            )
+
+        failed_item = collector_module.parse_t3code_event_line(
+            canon(
+                "item.completed",
+                {"itemType": "command_execution", "status": "failed", "title": "Command run"},
+            )
+        )
+        ok_item = collector_module.parse_t3code_event_line(
+            canon(
+                "item.completed",
+                {"itemType": "command_execution", "status": "completed", "title": "Command run"},
+            )
+        )
+        failed_turn = collector_module.parse_t3code_event_line(
+            canon("turn.completed", {"state": "failed", "stopReason": "error"})
+        )
+
+        self.assertEqual(
+            collector_module.status_from_event(failed_item).mode,
+            AgentMode.BLOCKED_ERROR,
+        )
+        self.assertEqual(
+            collector_module.status_from_event(ok_item).mode,
+            AgentMode.WORKING,
+        )
+        self.assertEqual(
+            collector_module.status_from_event(failed_turn).mode,
+            AgentMode.BLOCKED_ERROR,
+        )
+
+    def test_t3code_tool_name_prefers_tool_over_generic_title(self) -> None:
+        thread_id = "00000000-0000-4000-8000-000000000044"
+        now = datetime.now(timezone.utc).isoformat()
+
+        def canon(payload: dict) -> str:
+            return f"[{now}] CANON: " + json.dumps(
+                {
+                    "type": "item.started",
+                    "provider": "claudeAgent",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": payload,
+                }
+            )
+
+        tool = collector_module.parse_t3code_event_line(
+            canon(
+                {
+                    "itemType": "command_execution",
+                    "title": "Command run",
+                    "data": {"toolName": "Bash", "input": {"command": "ls"}},
+                }
+            )
+        )
+        titled = collector_module.parse_t3code_event_line(
+            canon({"itemType": "file_change", "title": "File change"})
+        )
+        reasoning = collector_module.parse_t3code_event_line(
+            canon({"itemType": "reasoning", "title": "Reasoning"})
+        )
+
+        self.assertEqual(tool.tool_name, "Bash")
+        self.assertEqual(titled.tool_name, "File change")
+        self.assertIsNone(reasoning.tool_name)
+        self.assertNotIn("input", json.dumps(tool.raw))
+
+    def test_t3code_token_usage_annotates_context_without_changing_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            thread_id = "00000000-0000-4000-8000-000000000045"
+            now = datetime.now(timezone.utc)
+            started_at = now.isoformat()
+            usage_at = (now + timedelta(milliseconds=1)).isoformat()
+            (root / f"events.{thread_id}.log").write_text(
+                "\n".join(
+                    [
+                        f"[{started_at}] CANON: "
+                        + json.dumps(
+                            {
+                                "type": "turn.started",
+                                "provider": "codex",
+                                "threadId": thread_id,
+                                "createdAt": started_at,
+                                "payload": {},
+                            }
+                        ),
+                        f"[{usage_at}] CANON: "
+                        + json.dumps(
+                            {
+                                "type": "thread.token-usage.updated",
+                                "provider": "codex",
+                                "threadId": thread_id,
+                                "createdAt": usage_at,
+                                "payload": {
+                                    "usage": {"usedTokens": 116305, "maxTokens": 258400}
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            snapshot = AgentMonitor(
+                sources=(SourceSpec("t3code", root),),
+                stale_after_seconds=3600,
+            ).snapshot()
+
+            self.assertEqual(len(snapshot.statuses), 1)
+            status = snapshot.statuses[0]
+            self.assertEqual(status.mode, AgentMode.WORKING)
+            self.assertEqual(status.context_percent, 45.0)
+
+    def test_t3code_session_config_names_the_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            thread_id = "00000000-0000-4000-8000-000000000048"
+            now = datetime.now(timezone.utc)
+            configured_at = now.isoformat()
+            started_at = (now + timedelta(milliseconds=1)).isoformat()
+            (root / f"events.{thread_id}.log").write_text(
+                "\n".join(
+                    [
+                        f"[{configured_at}] CANON: "
+                        + json.dumps(
+                            {
+                                "type": "session.configured",
+                                "provider": "claudeAgent",
+                                "threadId": thread_id,
+                                "createdAt": configured_at,
+                                "payload": {
+                                    "config": {
+                                        "cwd": "/Users/test/GitHub/sidepulse",
+                                        "model": "claude-opus-5",
+                                    }
+                                },
+                            }
+                        ),
+                        f"[{started_at}] CANON: "
+                        + json.dumps(
+                            {
+                                "type": "turn.started",
+                                "provider": "claudeAgent",
+                                "threadId": thread_id,
+                                "createdAt": started_at,
+                                "payload": {},
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+
+            snapshot = AgentMonitor(
+                sources=(SourceSpec("t3code", root),),
+                stale_after_seconds=3600,
+            ).snapshot()
+
+            self.assertEqual(len(snapshot.statuses), 1)
+            status = snapshot.statuses[0]
+            self.assertEqual(status.cwd, "/Users/test/GitHub/sidepulse")
+            self.assertIn("sidepulse", status.display_name)
+
+    def test_t3code_rate_limit_reached_blocks_session(self) -> None:
+        thread_id = "00000000-0000-4000-8000-000000000046"
+        now = datetime.now(timezone.utc).isoformat()
+
+        def canon(reached) -> str:
+            return f"[{now}] CANON: " + json.dumps(
+                {
+                    "type": "account.rate-limits.updated",
+                    "provider": "codex",
+                    "threadId": thread_id,
+                    "createdAt": now,
+                    "payload": {
+                        "rateLimits": {
+                            "rateLimits": {
+                                "planType": "plus",
+                                "primary": {"usedPercent": 87},
+                                "rateLimitReachedType": reached,
+                            }
+                        }
+                    },
+                }
+            )
+
+        self.assertIsNone(collector_module.parse_t3code_event_line(canon(None)))
+        reached = collector_module.parse_t3code_event_line(canon("primary"))
+        self.assertIsNotNone(reached)
+        self.assertEqual(
+            collector_module.status_from_event(reached).mode,
+            AgentMode.BLOCKED_ERROR,
+        )
+        self.assertIn("Rate limit reached", reached.message)
+
+    def test_t3code_event_files_skip_stale_rotated_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fresh = root / "events.fresh.log"
+            stale = root / "events.stale.log.1"
+            fresh.write_text("")
+            stale.write_text("")
+            old = time.time() - collector_module.T3CODE_MAX_FILE_AGE_SECONDS - 60
+            os.utime(stale, (old, old))
+
+            files = collector_module.recent_t3code_event_files(root)
+
+            self.assertEqual(files, [fresh])
 
     def test_codex_transcript_usage_limit_completes_without_stop_hook(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
