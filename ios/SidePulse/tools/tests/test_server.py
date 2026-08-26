@@ -69,6 +69,16 @@ class ServerTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(self.fake.calls, [])
 
+    def test_index_does_not_expose_configured_secret(self) -> None:
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('value="secret"', response.text)
+        self.assertNotIn('value="env-device-token"', response.text)
+        self.assertIn('id="deviceToken" value=""', response.text)
+        self.assertIn('id="secret" type="password" value=""', response.text)
+
     def test_friendly_pattern_envelope(self) -> None:
         with TestClient(app) as client:
             response = client.post(
