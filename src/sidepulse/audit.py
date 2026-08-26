@@ -5,7 +5,7 @@ import html
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterator
 
 from .battery import BatterySnapshot
 from .lid_sleep import MacSleepSnapshot
@@ -213,21 +213,24 @@ def truncate_preview(text: str, limit: int) -> str:
 
 
 def read_status_audit_records(path: Path | None = None) -> list[dict[str, str]]:
+    return list(iter_status_audit_records(path))
+
+
+def iter_status_audit_records(path: Path | None = None) -> Iterator[dict[str, str]]:
     source = path or default_status_audit_log_path()
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        handle = source.open(encoding="utf-8")
     except OSError:
-        return []
+        return
 
-    records: list[dict[str, str]] = []
-    for line in lines:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            records.append({column: str(obj.get(column, "")) for column in AUDIT_COLUMNS})
-    return records
+    with handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield {column: str(obj.get(column, "")) for column in AUDIT_COLUMNS}
 
 
 def read_status_history_records(
@@ -237,12 +240,12 @@ def read_status_history_records(
 ) -> list[dict[str, object]]:
     source = path or default_status_history_log_path()
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        if limit is not None and limit > 0:
+            lines = read_recent_lines(source, limit)
+        else:
+            lines = source.read_text(encoding="utf-8").splitlines()
     except OSError:
         return []
-
-    if limit is not None and limit > 0:
-        lines = lines[-limit:]
 
     records: list[dict[str, object]] = []
     for line in lines:
@@ -255,18 +258,42 @@ def read_status_history_records(
     return records
 
 
+def read_recent_lines(path: Path, max_lines: int) -> list[str]:
+    if max_lines <= 0:
+        return []
+
+    chunk_size = 8192
+    chunks: list[bytes] = []
+    newline_count = 0
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        position = handle.tell()
+        while position > 0 and newline_count <= max_lines:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+
+    data = b"".join(reversed(chunks))
+    return data.decode("utf-8", errors="replace").splitlines()[-max_lines:]
+
+
 def export_status_audit_csv(
     destination: Path,
     *,
     source: Path | None = None,
 ) -> int:
-    records = read_status_audit_records(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
     with destination.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=AUDIT_COLUMNS)
         writer.writeheader()
-        writer.writerows(records)
-    return len(records)
+        for record in iter_status_audit_records(source):
+            writer.writerow(record)
+            count += 1
+    return count
 
 
 def export_status_audit_html(
@@ -274,39 +301,41 @@ def export_status_audit_html(
     *,
     source: Path | None = None,
 ) -> int:
-    records = read_status_audit_records(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    body = "\n".join(table_row(record) for record in records)
+    count = 0
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    destination.write_text(
-        "\n".join(
-            [
-                "<!doctype html>",
-                '<meta charset="utf-8">',
-                "<title>SidePulse Agent Debug Log</title>",
-                "<style>",
-                "body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:24px;color:#1d1d1f}",
-                "h1{font-size:22px;margin:0 0 4px}",
-                "p{color:#6e6e73;margin:0 0 20px}",
-                "table{border-collapse:collapse;width:100%;table-layout:fixed}",
-                "th,td{border-bottom:1px solid #ddd;padding:7px 8px;text-align:left;vertical-align:top;word-wrap:break-word}",
-                "th{position:sticky;top:0;background:#fff;font-weight:600}",
-                "td.raw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}",
-                "</style>",
-                "<h1>SidePulse Agent Debug Log</h1>",
-                f"<p>{len(records)} events exported {html.escape(generated_at)}</p>",
-                "<table>",
-                "<thead><tr>",
-                "".join(f"<th>{html.escape(column)}</th>" for column in AUDIT_COLUMNS),
-                "</tr></thead>",
-                f"<tbody>{body}</tbody>",
-                "</table>",
-            ]
+    with destination.open("w", encoding="utf-8") as handle:
+        handle.write(
+            "\n".join(
+                [
+                    "<!doctype html>",
+                    '<meta charset="utf-8">',
+                    "<title>SidePulse Agent Debug Log</title>",
+                    "<style>",
+                    "body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:24px;color:#1d1d1f}",
+                    "h1{font-size:22px;margin:0 0 4px}",
+                    "p{color:#6e6e73;margin:0 0 20px}",
+                    "table{border-collapse:collapse;width:100%;table-layout:fixed}",
+                    "th,td{border-bottom:1px solid #ddd;padding:7px 8px;text-align:left;vertical-align:top;word-wrap:break-word}",
+                    "th{position:sticky;top:0;background:#fff;font-weight:600}",
+                    "td.raw{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}",
+                    "</style>",
+                    "<h1>SidePulse Agent Debug Log</h1>",
+                    f"<p>Exported {html.escape(generated_at)}</p>",
+                    "<table>",
+                    "<thead><tr>",
+                    "".join(f"<th>{html.escape(column)}</th>" for column in AUDIT_COLUMNS),
+                    "</tr></thead><tbody>",
+                ]
+            )
+            + "\n"
         )
-        + "\n",
-        encoding="utf-8",
-    )
-    return len(records)
+        for record in iter_status_audit_records(source):
+            handle.write(table_row(record))
+            handle.write("\n")
+            count += 1
+        handle.write(f"</tbody></table><p>{count} events</p>\n")
+    return count
 
 
 def table_row(record: dict[str, str]) -> str:

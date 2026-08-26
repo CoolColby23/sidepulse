@@ -76,7 +76,7 @@ from .audit import (
     read_status_history_records,
     status_history_record,
 )
-from .collector import LiveAgentMonitor, SourceSpec, read_recent_lines
+from .collector import LiveAgentMonitor, SourceSpec
 from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
@@ -125,7 +125,6 @@ from .providers import (
     detect_claude_config,
     detect_codex_config,
     detect_grok_config,
-    detect_log_path,
     default_state_dir,
     parse_log_line,
 )
@@ -234,10 +233,11 @@ STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
 STATUS_BAR_SESSION_HISTORY_LIMIT = 10
 SCREEN_BAR_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
-STATUS_BAR_STARTUP_REPLAY_LINES = 200
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT = 2400
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT_PADDING = 300
 STATUS_BAR_HISTORY_CHART_RECORD_LIMIT_MULTIPLIER = 3.0
+MAC_SLEEP_POLL_SECONDS = 60.0
+SYSTEM_POLL_ERROR_BACKOFF_SECONDS = 30.0
 LID_ANIMATION_RESTORE_FUDGE_SECONDS = 0.15
 LID_ANIMATION_LABELS = {
     LID_ANIMATION_CLOSED: "Lid Closed",
@@ -338,30 +338,6 @@ def format_percent_value(value: float | int) -> str:
     return f"{number:.1f}%"
 
 
-def replay_recent_debug_logs(
-    monitor: LiveAgentMonitor,
-    *,
-    providers: tuple[str, ...] = ("codex", "claude", "grok"),
-    max_lines: int = STATUS_BAR_STARTUP_REPLAY_LINES,
-) -> int:
-    replayed = 0
-    for provider in providers:
-        try:
-            path = detect_log_path(provider)
-            lines = read_recent_lines(path, max_lines) if path.exists() else []
-        except Exception as exc:
-            log_status_bar(f"startup_replay {provider} error: {exc}")
-            continue
-
-        for line in lines:
-            record = parse_log_line(provider, line)
-            if record is None:
-                continue
-            monitor.ingest_record(record)
-            replayed += 1
-    return replayed
-
-
 class StatusBarController(NSObject):
     def init(self):
         self = objc.super(StatusBarController, self).init()
@@ -406,6 +382,10 @@ class StatusBarController(NSObject):
         self.last_closed_lid_awake_error = None
         self.last_mac_sleep_error = None
         self.last_mac_sleep_snapshot = None
+        self.mac_sleep_poll_in_flight = False
+        self.last_mac_sleep_poll_monotonic = 0.0
+        self.mac_sleep_poll_backoff_until_monotonic = 0.0
+        self.pending_mac_sleep_snapshot = None
         self.last_status_history_error = None
         self.last_status_read_error = None
         self.event_refresh_pending = False
@@ -416,6 +396,10 @@ class StatusBarController(NSObject):
         self.battery_sleep_safeguard_reason = ""
         self.last_lid_closed = None
         self.last_lid_error = None
+        self.lid_poll_in_flight = False
+        self.lid_poll_backoff_until_monotonic = 0.0
+        self.pending_lid_closed = None
+        self.pending_lid_error = None
         self.led_animation_until_monotonic = 0.0
         self.led_animation_token = 0
         self.virtual_status_device = VirtualStatusDevice.alloc().init()
@@ -425,7 +409,6 @@ class StatusBarController(NSObject):
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
         log_status_bar("launching status item")
         self.start_event_server()
-        self.replay_debug_logs()
 
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
             NSVariableStatusItemLength
@@ -853,11 +836,6 @@ class StatusBarController(NSObject):
     def refreshFromEvent_(self, _sender):
         self.event_refresh_pending = False
         self.refresh_(None)
-
-    def replay_debug_logs(self) -> None:
-        replayed = replay_recent_debug_logs(self.monitor)
-        if replayed:
-            log_status_bar(f"startup_replay events={replayed}")
 
     def show_settings_window(self) -> None:
         if self.settings_window is None:
@@ -1620,14 +1598,40 @@ class StatusBarController(NSObject):
         self.last_power_connected = plugged
 
     def read_mac_sleep_snapshot(self) -> MacSleepSnapshot | None:
-        snapshot = read_mac_sleep_snapshot()
+        now = time.monotonic()
+        if (
+            not self.mac_sleep_poll_in_flight
+            and now >= self.mac_sleep_poll_backoff_until_monotonic
+            and now - self.last_mac_sleep_poll_monotonic >= MAC_SLEEP_POLL_SECONDS
+        ):
+            self.mac_sleep_poll_in_flight = True
+            self.last_mac_sleep_poll_monotonic = now
+            threading.Thread(target=self._read_mac_sleep_snapshot_async, daemon=True).start()
+        return self.last_mac_sleep_snapshot
+
+    def _read_mac_sleep_snapshot_async(self) -> None:
+        self.pending_mac_sleep_snapshot = read_mac_sleep_snapshot()
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "handleMacSleepSnapshot:",
+            None,
+            False,
+        )
+
+    def handleMacSleepSnapshot_(self, _sender):
+        self.mac_sleep_poll_in_flight = False
+        snapshot = self.pending_mac_sleep_snapshot
+        self.pending_mac_sleep_snapshot = None
+        if not isinstance(snapshot, MacSleepSnapshot):
+            return
         error = snapshot.error or None
         if error != self.last_mac_sleep_error:
             self.last_mac_sleep_error = error
             if error:
                 log_status_bar(f"mac_sleep error: {error}")
+        self.mac_sleep_poll_backoff_until_monotonic = (
+            time.monotonic() + SYSTEM_POLL_ERROR_BACKOFF_SECONDS if error else 0.0
+        )
         self.last_mac_sleep_snapshot = snapshot
-        return snapshot
 
     def record_status_history(
         self,
@@ -2129,18 +2133,46 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def pollLid_(self, _sender):
+        if self.lid_poll_in_flight:
+            return
+        if time.monotonic() < self.lid_poll_backoff_until_monotonic:
+            return
+        self.lid_poll_in_flight = True
+        threading.Thread(target=self._read_lid_closed_async, daemon=True).start()
+
+    def _read_lid_closed_async(self) -> None:
         try:
-            closed = read_lid_closed()
+            self.pending_lid_closed = read_lid_closed()
+            self.pending_lid_error = None
         except Exception as exc:
-            error = str(exc)
+            self.pending_lid_closed = None
+            self.pending_lid_error = str(exc)
+
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "handleLidPollResult:",
+            None,
+            False,
+        )
+
+    def handleLidPollResult_(self, _sender):
+        self.lid_poll_in_flight = False
+        error = self.pending_lid_error
+        if error:
+            error = str(error)
             if error != self.last_lid_error:
                 self.last_lid_error = error
                 log_status_bar(f"lid_state error: {error}")
+            self.lid_poll_backoff_until_monotonic = (
+                time.monotonic() + SYSTEM_POLL_ERROR_BACKOFF_SECONDS
+            )
             return
 
+        closed = self.pending_lid_closed
         if closed is None:
             return
+        closed = bool(closed)
         self.last_lid_error = None
+        self.lid_poll_backoff_until_monotonic = 0.0
         if self.last_lid_closed is None:
             self.last_lid_closed = closed
             return
@@ -4009,13 +4041,24 @@ def session_open_action_title(status: AgentStatus, action: str, settings=None) -
 
 
 def session_row_icon_for_status(status: AgentStatus):
+    cache_key = (
+        status.mode.value,
+        status.provider.lower(),
+        normalized_origin_text(status.origin),
+    )
+    if cache_key in _session_row_icon_cache:
+        return _session_row_icon_cache[cache_key]
+
     status_icon = status_icon_for_status(status)
     origin_icon = session_origin_icon_for_status(status)
     if origin_icon is None:
-        return status_icon
-    if status_icon is None:
-        return origin_icon
-    return horizontal_icon_pair(status_icon, origin_icon)
+        image = status_icon
+    elif status_icon is None:
+        image = origin_icon
+    else:
+        image = horizontal_icon_pair(status_icon, origin_icon)
+    _session_row_icon_cache[cache_key] = image
+    return image
 
 
 def status_icon_for_status(status: AgentStatus):
@@ -4037,57 +4080,63 @@ def provider_icon_for_status(status: AgentStatus):
 
 def provider_icon_for_provider(provider: str):
     provider = provider.lower()
+    if provider in _provider_icon_cache:
+        return _provider_icon_cache[provider]
+    image = None
     if provider == "codex":
         for path in ("/Applications/Codex.app", "/Applications/ChatGPT.app"):
             image = app_icon(path)
             if image is not None:
-                return image
-        return image_for_symbol("sparkles", "Codex")
-    if provider == "claude":
+                break
+        image = image or image_for_symbol("sparkles", "Codex")
+    elif provider == "claude":
         image = app_icon("/Applications/Claude.app")
-        if image is not None:
-            return image
-        return image_for_symbol("brain.head.profile", "Claude")
-    if provider == "grok":
+        image = image or image_for_symbol("brain.head.profile", "Claude")
+    elif provider == "grok":
         image = app_icon("/Applications/Grok.app")
-        if image is not None:
-            return image
-        return grok_badge_icon()
-    return image_for_symbol("terminal", provider.title() or "Agent")
+        image = image or grok_badge_icon()
+    else:
+        image = image_for_symbol("terminal", provider.title() or "Agent")
+    _provider_icon_cache[provider] = image
+    return image
 
 
 def host_icon_for_origin(origin: str | None):
     normalized = normalized_origin_text(origin)
     if not normalized:
         return None
+    if normalized in _origin_icon_cache:
+        return _origin_icon_cache[normalized]
+    image = None
     if "vs code" in normalized or "vscode" in normalized or "visual studio code" in normalized:
-        return first_app_icon(
+        image = first_app_icon(
             (
                 "/Applications/Visual Studio Code.app",
                 "/Applications/Visual Studio Code - Insiders.app",
             )
         ) or image_for_symbol("chevron.left.forwardslash.chevron.right", "VS Code")
-    if "cursor" in normalized:
-        return first_app_icon(("/Applications/Cursor.app",)) or image_for_symbol(
+    elif "cursor" in normalized:
+        image = first_app_icon(("/Applications/Cursor.app",)) or image_for_symbol(
             "cursorarrow",
             "Cursor",
         )
-    if "windsurf" in normalized:
-        return first_app_icon(("/Applications/Windsurf.app",)) or image_for_symbol(
+    elif "windsurf" in normalized:
+        image = first_app_icon(("/Applications/Windsurf.app",)) or image_for_symbol(
             "wind",
             "Windsurf",
         )
-    if any(token in normalized for token in ("cli", "terminal", "command line")):
-        return first_app_icon(
+    elif any(token in normalized for token in ("cli", "terminal", "command line")):
+        image = first_app_icon(
             (
                 "/System/Applications/Utilities/Terminal.app",
                 "/Applications/iTerm.app",
                 "/Applications/iTerm2.app",
             )
         ) or image_for_symbol("terminal", "Terminal")
-    if "transcript" in normalized:
-        return image_for_symbol("doc.text", "Transcript")
-    return None
+    elif "transcript" in normalized:
+        image = image_for_symbol("doc.text", "Transcript")
+    _origin_icon_cache[normalized] = image
+    return image
 
 
 def first_app_icon(paths: tuple[str, ...]):
@@ -4161,6 +4210,11 @@ def normalized_origin_text(origin: str | None) -> str:
 
 
 _grok_badge_icon = None
+_app_icon_cache = {}
+_provider_icon_cache = {}
+_origin_icon_cache = {}
+_session_row_icon_cache = {}
+_symbol_icon_cache = {}
 
 
 def grok_badge_icon():
@@ -4195,11 +4249,15 @@ def grok_badge_icon():
 
 
 def app_icon(path: str):
+    if path in _app_icon_cache:
+        return _app_icon_cache[path]
     if not Path(path).exists():
+        _app_icon_cache[path] = None
         return None
     image = NSWorkspace.sharedWorkspace().iconForFile_(path)
     if image is not None:
         image.setSize_((18, 18))
+    _app_icon_cache[path] = image
     return image
 
 
@@ -4390,6 +4448,9 @@ def project_name_from_cwd(cwd: str | None) -> str | None:
 
 
 def image_for_symbol(symbol: str, description: str):
+    cache_key = (symbol, description)
+    if cache_key in _symbol_icon_cache:
+        return _symbol_icon_cache[cache_key]
     try:
         image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
             symbol,
@@ -4399,6 +4460,7 @@ def image_for_symbol(symbol: str, description: str):
             image.setTemplate_(True)
     except Exception:
         image = None
+    _symbol_icon_cache[cache_key] = image
     return image
 
 

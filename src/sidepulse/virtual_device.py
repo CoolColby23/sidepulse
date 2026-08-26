@@ -32,13 +32,15 @@ LED_BAND_HEIGHT = 5.0
 WINDOW_HEIGHT = FALLBACK_NOTCH_DEPTH + LED_BAND_HEIGHT
 NOTCH_BOTTOM_RADIUS = 8.0
 LED_BLEND_RADIUS_LEDS = 1.5
-BLEND_COLUMN_WIDTH = 2.0
+BLEND_COLUMN_WIDTH = 4.0
 LED_GLOW_HEIGHT = 11.0
 LED_CORE_BOOST = 1.22
 LED_HOTLINE_BOOST = 1.46
 LED_GAMMA = 0.86
 FRAME_RATE = 60.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
+IDLE_FRAME_RATE = 12.0
+IDLE_FRAME_INTERVAL = 1.0 / IDLE_FRAME_RATE
 
 
 def monotonic_ms() -> int:
@@ -402,6 +404,7 @@ class VirtualStatusDevice(NSObject):
             self.window = None
             self.view = None
             self.timer = None
+            self.frame_interval = None
         return self
 
     def show(self):
@@ -409,29 +412,46 @@ class VirtualStatusDevice(NSObject):
             self._build_window()
         self.reposition()
         self.window.orderFrontRegardless()
-        if self.timer is None:
-            self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                FRAME_INTERVAL, self, "redraw:", None, True
-            )
 
     def hide(self):
-        if self.timer is not None:
-            self.timer.invalidate()
-            self.timer = None
+        self._stop_timer()
         if self.window is not None:
             self.window.orderOut_(None)
 
     def set_state(self, state: LedDisplayState, brightness: int | float):
         self.show()
         self.view.setState_brightness_(state, brightness)
+        if state in {LedDisplayState.WORKING, LedDisplayState.ASK}:
+            self._ensure_timer(FRAME_INTERVAL)
+        elif state == LedDisplayState.IDLE:
+            self._ensure_timer(IDLE_FRAME_INTERVAL)
+        else:
+            self._stop_timer()
 
     def set_battery(self, percent: int, brightness: int | float):
         self.show()
         self.view.setBatteryPercent_brightness_(percent, brightness)
+        self._stop_timer()
 
     def set_program(self, program: str):
         self.show()
         self.view.setProgram_(program)
+        self._ensure_timer(FRAME_INTERVAL)
+
+    def _ensure_timer(self, interval: float):
+        if self.timer is not None and self.frame_interval == interval:
+            return
+        self._stop_timer()
+        self.frame_interval = interval
+        self.timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            interval, self, "redraw:", None, True
+        )
+
+    def _stop_timer(self):
+        if self.timer is not None:
+            self.timer.invalidate()
+            self.timer = None
+        self.frame_interval = None
 
     def reposition(self):
         screen = NSScreen.mainScreen()

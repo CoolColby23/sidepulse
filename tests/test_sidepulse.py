@@ -93,12 +93,15 @@ from sidepulse.sd_eject_guard_launch import (
     SD_EJECT_GUARD_BINARY_NAME,
     SD_EJECT_GUARD_DISPLAY_NAME,
     SD_EJECT_GUARD_LABEL,
+    SD_EJECT_GUARD_LOG_MAX_BYTES,
     SdEjectGuardInstallError,
     SdEjectGuardPaths,
     build_sd_eject_guard_plist,
     install_sd_eject_guard,
+    read_log_tail,
     sd_eject_guard_installed,
     stop_sd_eject_guard,
+    truncate_log_if_large,
     uninstall_sd_eject_guard,
 )
 from sidepulse.session_actions import (
@@ -605,47 +608,6 @@ class AgentMonitorTests(unittest.TestCase):
             )
             self.assertEqual(reloaded.snapshot().aggregate.mode, AgentMode.TOOL_RUNNING)
             self.assertEqual(reloaded.snapshot().statuses[0].origin, "Codex UI")
-
-    def test_status_bar_startup_replay_ingests_recent_debug_logs(self) -> None:
-        try:
-            from sidepulse import status_bar
-        except SystemExit as exc:
-            self.skipTest(str(exc))
-
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            log = base / "codex.jsonl"
-            session_id = "eeeeeeee-ffff-7aaa-8bbb-cccccccccccc"
-            log.write_text(
-                json.dumps(
-                    {
-                        "logged_at": datetime.now(timezone.utc).isoformat(),
-                        "event": {
-                            "hook_event_name": "UserPromptSubmit",
-                            "session_id": session_id,
-                            "cwd": "/tmp/project",
-                            "prompt": "startup replay should restore this",
-                        },
-                    }
-                )
-                + "\n"
-            )
-            monitor = LiveAgentMonitor()
-
-            with patch(
-                "sidepulse.status_bar.detect_log_path",
-                return_value=log,
-            ):
-                replayed = status_bar.replay_recent_debug_logs(
-                    monitor,
-                    providers=("codex",),
-                    max_lines=20,
-                )
-
-            snapshot = monitor.snapshot()
-            self.assertEqual(replayed, 1)
-            self.assertEqual(snapshot.aggregate.mode, AgentMode.WORKING)
-            self.assertIn("startup replay", snapshot.statuses[0].display_name)
 
     def test_status_bar_session_menu_title_is_task_and_project(self) -> None:
         try:
@@ -4741,6 +4703,21 @@ class AgentMonitorTests(unittest.TestCase):
 
     def test_sd_eject_guard_default_binary_uses_background_item_name(self) -> None:
         self.assertEqual(SD_EJECT_GUARD_BINARY_NAME, SD_EJECT_GUARD_DISPLAY_NAME)
+
+    def test_sd_eject_guard_log_cleaner_truncates_files_over_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "sd-eject-guard.out.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("wb") as handle:
+                handle.seek(SD_EJECT_GUARD_LOG_MAX_BYTES)
+                handle.write(b"x")
+
+            self.assertTrue(truncate_log_if_large(log))
+            self.assertEqual(log.stat().st_size, 0)
+
+            log.write_text("prevented eject of disk4s1\n", encoding="utf-8")
+            self.assertFalse(truncate_log_if_large(log))
+            self.assertEqual(read_log_tail(log, 5), "prevented eject of disk4s1")
 
     def test_sd_eject_guard_installed_checks_user_and_system_plists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

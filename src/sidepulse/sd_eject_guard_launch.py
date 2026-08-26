@@ -16,6 +16,7 @@ SD_EJECT_GUARD_DISPLAY_NAME = "SidePulse Pro Eject Prevention"
 SD_EJECT_GUARD_BINARY_NAME = SD_EJECT_GUARD_DISPLAY_NAME
 SD_EJECT_GUARD_LEGACY_BINARY_NAMES = ("sd_eject_guard",)
 SD_EJECT_GUARD_SCOPES = ("auto", "system", "user")
+SD_EJECT_GUARD_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 SdEjectGuardScope = Literal["auto", "system", "user"]
 ResolvedSdEjectGuardScope = Literal["system", "user"]
@@ -105,6 +106,7 @@ def install_sd_eject_guard(
             paths.plist_path.parent.mkdir(parents=True, exist_ok=True)
             paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
             paths.stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            truncate_log_if_large(paths.stdout_path)
 
             if needs_compile:
                 compile_sd_eject_guard(resolved_source, paths.binary_path)
@@ -451,12 +453,46 @@ def read_log_tail(path: Path, line_count: int = 80) -> str:
     if line_count <= 0:
         return ""
     try:
-        lines = path.read_text(errors="replace").splitlines()
+        truncate_log_if_large(path)
+        lines = read_recent_lines(path, line_count)
     except FileNotFoundError:
         return ""
     except OSError as exc:
         return f"(unreadable: {exc})"
-    return "\n".join(lines[-line_count:])
+    return "\n".join(lines)
+
+
+def truncate_log_if_large(
+    path: Path,
+    max_bytes: int = SD_EJECT_GUARD_LOG_MAX_BYTES,
+) -> bool:
+    try:
+        if path.stat().st_size <= max_bytes:
+            return False
+        with path.open("r+b") as handle:
+            handle.truncate(0)
+        return True
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def read_recent_lines(path: Path, max_lines: int) -> list[str]:
+    chunk_size = 8192
+    chunks: list[bytes] = []
+    newline_count = 0
+    with path.open("rb") as handle:
+        handle.seek(0, 2)
+        position = handle.tell()
+        while position > 0 and newline_count <= max_lines:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+
+    data = b"".join(reversed(chunks))
+    return data.decode("utf-8", errors="replace").splitlines()[-max_lines:]
 
 
 def packaged_sd_eject_guard_source():

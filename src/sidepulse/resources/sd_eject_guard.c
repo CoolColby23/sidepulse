@@ -16,11 +16,27 @@
 #include <DiskArbitration/DiskArbitration.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define MOUNT_RETRY_SECONDS 5.0
+#define LOG_TRUNCATE_BYTES (10 * 1024 * 1024)
 
 static DASessionRef g_session;
 static bool g_no_mount = false;
+
+static void truncate_stdout_if_large(void) {
+    fflush(stdout);
+    int fd = fileno(stdout);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+        return;
+    if (st.st_size <= LOG_TRUNCATE_BYTES)
+        return;
+    if (ftruncate(fd, 0) == 0)
+        lseek(fd, 0, SEEK_SET);
+    clearerr(stdout);
+}
 
 static void log_msg(const char *fmt, CFStringRef s) {
     char buf[256] = "?";
@@ -54,8 +70,6 @@ static void mount_done(DADiskRef disk, DADissenterRef dissenter, void *ctx);
 static void retry_mount(CFRunLoopTimerRef timer, void *info) {
     DADiskRef disk = (DADiskRef)info;
     if (is_mounted(disk)) {
-        printf("mounted; stopping retries for %s\n", DADiskGetBSDName(disk));
-        fflush(stdout);
         CFRunLoopTimerInvalidate(timer);
         CFRelease(disk);
         return;
@@ -64,12 +78,9 @@ static void retry_mount(CFRunLoopTimerRef timer, void *info) {
 }
 
 static void mount_done(DADiskRef disk, DADissenterRef dissenter, void *ctx) {
-    if (dissenter)
-        printf("mount of %s dissented (0x%x), will retry\n",
-               DADiskGetBSDName(disk), DADissenterGetStatus(dissenter));
-    else
-        printf("mount of %s succeeded\n", DADiskGetBSDName(disk));
-    fflush(stdout);
+    (void)disk;
+    (void)dissenter;
+    (void)ctx;
 }
 
 static void start_mount_retries(DADiskRef disk) {
@@ -83,23 +94,21 @@ static void start_mount_retries(DADiskRef disk) {
 }
 
 static DADissenterRef eject_approval(DADiskRef disk, void *ctx) {
+    (void)ctx;
     if (!is_builtin_sd(disk))
         return NULL;  // not ours, allow
+    const char *disk_name = DADiskGetBSDName(disk);
+    if (!disk_name) disk_name = "?";
     CFDictionaryRef desc = DADiskCopyDescription(disk);
     CFStringRef vol = desc ? CFDictionaryGetValue(desc, kDADiskDescriptionVolumeNameKey) : NULL;
-    printf("vetoing eject of %s", DADiskGetBSDName(disk));
+    truncate_stdout_if_large();
+    printf("prevented eject of %s", disk_name);
     log_msg(" (volume: %s)\n", vol);
     if (desc) CFRelease(desc);
     if (!g_no_mount)
         start_mount_retries(disk);
     return DADissenterCreate(kCFAllocatorDefault, kDAReturnNotPermitted,
                              CFSTR("SidePulse Pro Eject Prevention: keeping SD card attached"));
-}
-
-static void disk_appeared(DADiskRef disk, void *ctx) {
-    if (!is_builtin_sd(disk)) return;
-    printf("SD disk appeared: %s\n", DADiskGetBSDName(disk));
-    fflush(stdout);
 }
 
 int main(int argc, char **argv) {
@@ -117,11 +126,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     DARegisterDiskEjectApprovalCallback(g_session, NULL, eject_approval, NULL);
-    DARegisterDiskAppearedCallback(g_session, NULL, disk_appeared, NULL);
     DASessionScheduleWithRunLoop(g_session, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
-    printf("SidePulse Pro Eject Prevention: watching for ejects of the built-in SD reader%s...\n",
-           g_no_mount ? " (mount retries disabled)" : "");
-    fflush(stdout);
     CFRunLoopRun();
     return 0;
 }

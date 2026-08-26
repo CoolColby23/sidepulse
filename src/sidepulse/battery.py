@@ -157,6 +157,7 @@ def read_battery_snapshot(
         ["ioreg", "-r", "-n", "AppleSmartBattery", "-a"],
         check=True,
         capture_output=True,
+        timeout=2,
     )
     data = result.stdout
     if isinstance(data, str):
