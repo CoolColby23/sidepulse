@@ -21,14 +21,13 @@ from .providers import (
     CODEX_EVENTS,
     CURSOR_EVENTS,
     GROK_EVENTS,
-    default_antigravity_hook_config_path,
-    default_opencode_plugin_path,
-    default_grok_hook_config_path,
-    default_cursor_hook_config_path,
     KIRO_EVENTS,
     KIRO_MANAGED_DESCRIPTION,
+    default_antigravity_hook_config_path,
+    default_cursor_hook_config_path,
     default_grok_hook_config_path,
     default_kiro_agent_config_path,
+    default_opencode_plugin_path,
     detect_log_path,
 )
 
@@ -386,35 +385,6 @@ def install_cursor_hooks(
         target_log.touch(exist_ok=True)
 
     return InstallResult("cursor", config, target_log, changed, backup, dry_run)
-    config = config_path or default_kiro_agent_config_path()
-    target_log = (log_path or detect_log_path("kiro")).expanduser()
-    original = config.read_text() if config.exists() else ""
-    if original:
-        try:
-            current = json.loads(original)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"refusing to overwrite invalid Kiro agent config: {config}") from exc
-        if current.get("description") != KIRO_MANAGED_DESCRIPTION:
-            raise ValueError(f"refusing to overwrite unmanaged Kiro agent config: {config}")
-    command = hook_command("kiro", target_log, python_executable)
-    event_names = {"SessionStart": "agentSpawn", "UserPromptSubmit": "userPromptSubmit", "PreToolUse": "preToolUse", "PostToolUse": "postToolUse", "Stop": "stop"}
-    hooks: dict[str, list[dict[str, Any]]] = {}
-    for event in KIRO_EVENTS:
-        entry: dict[str, Any] = {"command": command, "timeout_ms": 5000}
-        if event in {"PreToolUse", "PostToolUse"}:
-            entry["matcher"] = "*"
-        hooks[event_names[event]] = [entry]
-    new_text = json.dumps({"name": "sidepulse", "description": KIRO_MANAGED_DESCRIPTION, "hooks": hooks}, indent=2) + "\n"
-    changed = new_text != original
-    backup = None
-    if changed and not dry_run:
-        config.parent.mkdir(parents=True, exist_ok=True)
-        backup = backup_file(config) if config.exists() else None
-        config.write_text(new_text)
-        target_log.parent.mkdir(parents=True, exist_ok=True)
-        target_log.touch(exist_ok=True)
-    return InstallResult("kiro", config, target_log, changed, backup, dry_run)
-    return InstallResult("opencode", config, target_log, changed, backup, dry_run)
 
 
 def opencode_plugin_source(log_path: Path) -> str:
@@ -721,25 +691,6 @@ def uninstall_cursor_hooks(
                 pass
 
     return InstallResult("cursor", config, target_log, changed, backup, dry_run)
-    config = config_path or default_kiro_agent_config_path()
-    target_log = (log_path or detect_log_path("kiro")).expanduser()
-    original = config.read_text() if config.exists() else ""
-    managed = False
-    if original:
-        try:
-            managed = json.loads(original).get("description") == KIRO_MANAGED_DESCRIPTION
-        except json.JSONDecodeError:
-            pass
-    config = config_path or default_opencode_plugin_path()
-    target_log = (log_path or detect_log_path("opencode")).expanduser()
-    original = config.read_text() if config.exists() else ""
-    managed = "sidepulse-opencode-plugin" in original
-    backup = None
-    if managed and not dry_run:
-        backup = backup_file(config)
-        config.unlink()
-    return InstallResult("kiro", config, target_log, managed, backup, dry_run)
-    return InstallResult("opencode", config, target_log, managed, backup, dry_run)
 
 
 def hook_command(

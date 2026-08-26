@@ -252,7 +252,6 @@ Set up this Mac explicitly after package install:
 sidepulse setup
 ```
 
-`sidepulse setup` installs or refreshes Codex, Claude, Grok, and Cursor hooks, installs
 `sidepulse setup` installs or refreshes Codex, Claude, Grok, and OpenCode hooks, installs
 SidePulse Pro Eject Prevention, writes the status-bar LaunchAgent, starts both helpers
 immediately, and enables them at login. This is intentionally an explicit

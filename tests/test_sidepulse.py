@@ -80,8 +80,6 @@ from sidepulse.lid_sleep import (
     sleep_helper_sudoers_rule,
 )
 from sidepulse.models import AgentMode, AgentStatus, AggregateStatus, HookEvent
-from sidepulse.origin import ProcessInfo, origin_from_processes
-from sidepulse.models import AgentMode, AgentStatus, AggregateStatus
 from sidepulse.origin import ProcessInfo, origin_from_environment, origin_from_processes
 from sidepulse.providers import (
     detect_grok_config,
@@ -128,7 +126,6 @@ from sidepulse.settings import (
     TERMINAL_APP_GHOSTTY,
     TERMINAL_APP_ITERM,
     TERMINAL_APP_KITTY,
-    TERMINAL_APP_TERMINAL,
     TERMINAL_APP_WARP,
     TERMINAL_APP_WEZTERM,
     AgentMonitorSettings,

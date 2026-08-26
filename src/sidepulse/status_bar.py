@@ -116,9 +116,6 @@ from .install import (
     uninstall_grok_hooks,
     uninstall_kiro_hooks,
     install_opencode_hooks,
-    uninstall_claude_hooks,
-    uninstall_codex_hooks,
-    uninstall_grok_hooks,
     uninstall_opencode_hooks,
 )
 from .led_status import (

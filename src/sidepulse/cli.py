@@ -48,13 +48,6 @@ from .lid_sleep import (
 from .models import AgentStatus
 from .providers import (
     HOOK_PROVIDERS,
-    detect_claude_config,
-    detect_codex_config,
-    detect_cursor_config,
-    detect_grok_config,
-    detect_antigravity_config,
-    detect_kiro_config,
-    detect_opencode_config,
     detect_provider_configs,
     detect_log_path,
     default_log_path,
