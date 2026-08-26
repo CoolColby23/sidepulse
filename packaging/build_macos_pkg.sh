@@ -55,12 +55,25 @@ xcrun swiftc -parse-as-library -O \
     /usr/libexec/PlistBuddy -c "Set :NSScreenCaptureUsageDescription SidePulse uses system audio levels to animate LEDs when the optional Idle Music Visualizer is enabled." "$APP_PATH/Contents/Info.plist"
 
 if [ -n "$APP_SIGN_IDENTITY" ]; then
+    # Sign all nested code first, then restore the helper's explicit identity.
+    # A final shallow app signature seals that helper without --deep changing
+    # its identifier back to the executable filename.
     codesign --force --deep --options runtime --timestamp \
+        --entitlements "$ROOT_DIR/packaging/entitlements.plist" \
+        --sign "$APP_SIGN_IDENTITY" "$APP_PATH"
+    codesign --force --options runtime --timestamp \
+        --identifier io.sidepulse.system-audio-meter \
+        --sign "$APP_SIGN_IDENTITY" "$APP_PATH/Contents/Frameworks/system-audio-meter"
+    codesign --force --options runtime --timestamp \
         --entitlements "$ROOT_DIR/packaging/entitlements.plist" \
         --sign "$APP_SIGN_IDENTITY" "$APP_PATH"
     codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 else
     codesign --force --deep --sign - "$APP_PATH"
+    codesign --force --sign - \
+        --identifier io.sidepulse.system-audio-meter \
+        "$APP_PATH/Contents/Frameworks/system-audio-meter"
+    codesign --force --sign - "$APP_PATH"
 fi
 
 if [ "$APP_ONLY" = "1" ]; then
