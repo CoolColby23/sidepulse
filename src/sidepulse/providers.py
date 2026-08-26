@@ -393,7 +393,12 @@ def detect_cursor_config(home: Path | None = None) -> ProviderConfig:
                 entry
                 for entry in entries
                 if isinstance(entry, dict)
-                and "sidepulse.cursor_hook" in str(entry.get("command") or "")
+                and (
+                    "sidepulse.cursor_hook" in str(entry.get("command") or "")
+                    or "agent-monitor publish-status" in str(entry.get("command") or "")
+                    or "agent-monitor hook-log" in str(entry.get("command") or "")
+                    or "hook_entry.py" in str(entry.get("command") or "")
+                )
             ]
             if managed_entries:
                 hook_events.append(event_name)

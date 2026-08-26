@@ -867,17 +867,35 @@ def cursor_hook_command(
     python_executable: str | None = None,
 ) -> str:
     executable = python_executable or sys.executable or "python3"
-    return " ".join(
+    if getattr(sys, "frozen", False) and python_executable is None:
+        command = " ".join(
+            [
+                shlex.quote(executable),
+                "agent-monitor",
+                "hook-log",
+                "--provider",
+                "cursor",
+                "--event",
+                shlex.quote(event_name),
+                "--log",
+                shlex.quote(str(log_path.expanduser())),
+            ]
+        )
+        return fail_open_command(command)
+    entry_point = Path(__file__).with_name("hook_entry.py")
+    command = " ".join(
         [
             shlex.quote(executable),
-            "-m",
-            "sidepulse.cursor_hook",
+            shlex.quote(str(entry_point)),
+            "--provider",
+            "cursor",
             "--event",
             shlex.quote(event_name),
             "--log",
             shlex.quote(str(log_path.expanduser())),
         ]
     )
+    return fail_open_command(command)
 
 
 def antigravity_hook_entry(event_name: str, command: str) -> dict[str, Any]:
@@ -897,7 +915,11 @@ def remove_cursor_hook_entries(entries: list[Any]) -> list[Any]:
         for entry in entries
         if not (
             isinstance(entry, dict)
-            and "sidepulse.cursor_hook" in str(entry.get("command") or "")
+            and (
+                "sidepulse.cursor_hook" in str(entry.get("command") or "")
+                or "agent-monitor publish-status" in str(entry.get("command") or "")
+                or is_sidepulse_hook_command(str(entry.get("command") or ""))
+            )
         )
     ]
 

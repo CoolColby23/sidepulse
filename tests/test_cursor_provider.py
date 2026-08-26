@@ -38,7 +38,12 @@ class CursorProviderTests(unittest.TestCase):
             data = json.loads(config.read_text())
             stop_commands = [entry["command"] for entry in data["hooks"]["stop"]]
             self.assertIn("python notify.py", stop_commands)
-            self.assertTrue(any("sidepulse.cursor_hook" in item for item in stop_commands))
+            # Cursor routes through the shared hook_entry dispatcher, like every
+            # other provider, so the hook keeps working when sidepulse is not on
+            # the interpreter's import path.
+            self.assertTrue(any("hook_entry.py" in item for item in stop_commands))
+            self.assertTrue(any("--provider cursor" in item for item in stop_commands))
+            self.assertTrue(any("--event stop" in item for item in stop_commands))
             detected = detect_cursor_config(home)
             self.assertTrue(detected.hooks_enabled)
             self.assertEqual(detected.log_paths, (log,))

@@ -175,6 +175,7 @@ def add_hook_log_parser(subparsers: argparse._SubParsersAction) -> None:
     hook_log = subparsers.add_parser("hook-log", help="Internal hook logging entry point.")
     hook_log.add_argument("--provider", choices=HOOK_PROVIDERS, required=True)
     hook_log.add_argument("--log", type=Path, required=True)
+    hook_log.add_argument("--event", help="Provider-native lifecycle event name (used by cursor).")
     hook_log.set_defaults(func=cmd_hook_log)
 
 
@@ -1067,7 +1068,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 
 def cmd_hook_log(args: argparse.Namespace) -> int:
-    return hook_log_main(args.provider, args.log)
+    return hook_log_main(args.provider, args.log, event=getattr(args, "event", None))
 
 
 def monitor_from_args(args: argparse.Namespace) -> AgentMonitor:

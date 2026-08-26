@@ -24,7 +24,14 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, IndexError):
         return 0
 
-    return _load_hook_main()(provider, log_path)
+    event = None
+    if "--event" in args:
+        try:
+            event = args[args.index("--event") + 1]
+        except IndexError:
+            event = None
+
+    return _load_hook_main()(provider, log_path, event=event)
 
 
 if __name__ == "__main__":
