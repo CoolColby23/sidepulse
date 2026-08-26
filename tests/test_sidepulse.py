@@ -1749,11 +1749,13 @@ class AgentMonitorTests(unittest.TestCase):
                 brightness=255,
             )
             reset_ids: list[str] = []
+            audio_syncs: list[bool] = []
             devices: list[status_bar.StatusBarDevice] = []
             target = SimpleNamespace(
                 last_connected_device_signature=None,
                 status_bar_devices=lambda: devices,
                 reset_led_controllers_for_device=lambda device_id: reset_ids.append(device_id),
+                sync_system_audio_meter=lambda: audio_syncs.append(True),
             )
 
             self.assertFalse(status_bar.StatusBarController.observe_connected_devices(target))
@@ -1761,6 +1763,7 @@ class AgentMonitorTests(unittest.TestCase):
             devices.append(device)
             self.assertTrue(status_bar.StatusBarController.observe_connected_devices(target))
             self.assertEqual(reset_ids, ["/Volumes/SidePulsePro"])
+            self.assertEqual(audio_syncs, [True])
 
             self.assertFalse(status_bar.StatusBarController.observe_connected_devices(target))
             self.assertEqual(reset_ids, ["/Volumes/SidePulsePro"])

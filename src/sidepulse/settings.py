@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -210,6 +211,15 @@ class AgentMonitorSettings:
             if device.device_id == device_id:
                 return normalize_idle_preset(device.idle_preset, self.idle_preset)
         return self.idle_preset
+
+    def music_visualizer_used_by(self, device_ids: Iterable[str]) -> bool:
+        """Return whether any currently available device needs audio capture."""
+        if not self.music_visualizer_enabled:
+            return False
+        return any(
+            self.idle_preset_for_device(device_id) == IDLE_PRESET_MUSIC
+            for device_id in device_ids
+        )
 
     def with_device_display(
         self,
