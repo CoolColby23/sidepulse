@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import copy
+import hmac
 import html
 import json
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -45,7 +47,15 @@ RESERVED_ENVELOPE_KEYS = {
 }
 
 
-app = FastAPI(title="SidePulse Push Server", version="1.0")
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    yield
+    client = getattr(application.state, "apns_client", None)
+    if client is not None and hasattr(client, "aclose"):
+        await client.aclose()
+
+
+app = FastAPI(title="SidePulse Push Server", version="1.0", lifespan=lifespan)
 
 
 async def require_bearer_auth(authorization: str | None = Header(default=None)) -> None:
@@ -53,17 +63,10 @@ async def require_bearer_auth(authorization: str | None = Header(default=None)) 
     if not shared_secret:
         return
 
-    if authorization == f"Bearer {shared_secret}":
+    if bearer_secret_matches(authorization, shared_secret):
         return
 
     raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    client = getattr(app.state, "apns_client", None)
-    if client is not None and hasattr(client, "aclose"):
-        await client.aclose()
 
 
 @app.get("/health")
@@ -151,7 +154,9 @@ def require_legacy_auth(key: str | None, authorization: str | None) -> None:
     if not shared_secret:
         return
 
-    if authorization == f"Bearer {shared_secret}" or key == shared_secret:
+    if bearer_secret_matches(authorization, shared_secret) or (
+        key is not None and hmac.compare_digest(key, shared_secret)
+    ):
         return
 
     raise HTTPException(status_code=401, detail="Unauthorized")
@@ -159,6 +164,12 @@ def require_legacy_auth(key: str | None, authorization: str | None) -> None:
 
 def shared_secret_from_env() -> str:
     return os.environ.get("SIDEPULSE_SHARED_SECRET", "")
+
+
+def bearer_secret_matches(authorization: str | None, shared_secret: str) -> bool:
+    if authorization is None:
+        return False
+    return hmac.compare_digest(authorization, f"Bearer {shared_secret}")
 
 
 def resolve_device_token(value: Any) -> str | None:
@@ -327,8 +338,6 @@ def response_payload(response: APNsResponse, *, extra: dict[str, Any] | None = N
 
 
 def index_html() -> str:
-    default_token = html.escape(os.environ.get("SIDEPULSE_DEVICE_TOKEN", ""))
-    default_secret = html.escape(shared_secret_from_env())
     options = "\n".join(
         f'<option value="{html.escape(name)}">{html.escape(name)}</option>' for name in pattern_names()
     )
@@ -350,9 +359,9 @@ def index_html() -> str:
 <body>
   <h1>SidePulse Push Server</h1>
   <label>Device token</label>
-  <input id="deviceToken" value="{default_token}" autocomplete="off">
+  <input id="deviceToken" value="" autocomplete="off">
   <label>Bearer secret</label>
-  <input id="secret" value="{default_secret}" autocomplete="off">
+  <input id="secret" type="password" value="" autocomplete="off">
   <label>Pattern</label>
   <select id="pattern">{options}</select>
   <label>Optional raw LEDS.LED</label>
