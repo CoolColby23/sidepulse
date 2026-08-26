@@ -11,12 +11,35 @@ from sidepulse.ambient import (
 from sidepulse.collector import COMPLETED_VISIBLE_SECONDS
 from sidepulse.device_writer import validate_led_text
 from sidepulse.models import AgentMode
-from sidepulse.settings import AgentMonitorSettings
+from sidepulse.settings import (
+    IDLE_PRESET_BREATHING,
+    IDLE_PRESET_MUSIC,
+    AgentMonitorSettings,
+    DeviceDisplaySetting,
+)
 
 
 class AmbientFeatureTests(unittest.TestCase):
     def test_music_visualizer_is_opt_in(self) -> None:
         self.assertFalse(AgentMonitorSettings().music_visualizer_enabled)
+
+    def test_music_capture_only_runs_for_an_available_music_device(self) -> None:
+        settings = AgentMonitorSettings(
+            music_visualizer_enabled=True,
+            idle_preset=IDLE_PRESET_BREATHING,
+            devices=(
+                DeviceDisplaySetting(
+                    device_id="music-device",
+                    name="Music",
+                    path="/Volumes/Music",
+                    idle_preset=IDLE_PRESET_MUSIC,
+                ),
+            ),
+        )
+
+        self.assertFalse(settings.music_visualizer_used_by(()))
+        self.assertFalse(settings.music_visualizer_used_by(("other-device",)))
+        self.assertTrue(settings.music_visualizer_used_by(("music-device",)))
 
     def test_completed_status_clears_after_fifteen_seconds(self) -> None:
         self.assertEqual(COMPLETED_VISIBLE_SECONDS, 30.0)

@@ -830,7 +830,12 @@ class StatusBarController(NSObject):
         open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
 
     def sync_system_audio_meter(self) -> None:
-        if self.settings.music_visualizer_enabled:
+        connected_device_ids = (
+            device.device_id
+            for device in self.status_bar_devices(remember=False)
+            if device.connected
+        )
+        if self.settings.music_visualizer_used_by(connected_device_ids):
             if not self.system_audio_meter.start():
                 log_status_bar(f"system audio unavailable: {self.system_audio_meter.last_error}")
         else:
@@ -1940,6 +1945,7 @@ class StatusBarController(NSObject):
             log_status_bar(f"device connected: {', '.join(connected_names)}")
         if disconnected_ids:
             log_status_bar(f"device disconnected: {', '.join(disconnected_ids)}")
+        self.sync_system_audio_meter()
         return True
 
     def remember_connected_devices(self, devices: list[StatusBarDevice]) -> None:
