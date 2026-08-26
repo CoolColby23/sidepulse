@@ -6075,7 +6075,7 @@ class AgentMonitorTests(unittest.TestCase):
             updated_at=now - timedelta(seconds=30),
             event_name="PreToolUse",
             session_id="claude-native-id",
-            origin="T3 Code",
+            origin="Claude Code CLI",
         )
         local_row = AgentStatus(
             provider="claude",
@@ -6103,6 +6103,9 @@ class AgentMonitorTests(unittest.TestCase):
                         "provider": "claudeAgent",
                         "threadId": thread_id,
                         "createdAt": started_at,
+                        "raw": {
+                            "payload": {"session_id": "claude-native-id"},
+                        },
                         "payload": {},
                     }
                 )
@@ -6123,6 +6126,28 @@ class AgentMonitorTests(unittest.TestCase):
             keys,
             "the hosted agent's own hook row duplicates the canonical T3 row",
         )
+
+    def test_t3code_native_provider_session_id_is_preserved(self) -> None:
+        record = collector_module.parse_t3code_event_line(
+            "[2026-08-25T14:30:08Z] CANON: "
+            + json.dumps(
+                {
+                    "type": "session.state.changed",
+                    "provider": "claudeAgent",
+                    "threadId": "t3-thread-id",
+                    "createdAt": "2026-08-25T14:30:08Z",
+                    "raw": {
+                        "payload": {"session_id": "claude-native-id"},
+                    },
+                    "payload": {"state": "running"},
+                }
+            )
+        )
+
+        self.assertIsNotNone(record)
+        status = collector_module.status_from_event(record)
+        self.assertIsNotNone(status)
+        self.assertEqual(status.provider_session_id, "claude-native-id")
 
     def test_t3code_reconcile_leaves_hook_rows_when_no_canonical_events(self) -> None:
         from sidepulse.status_bar import reconcile_t3code_sessions

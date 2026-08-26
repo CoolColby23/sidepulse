@@ -71,6 +71,7 @@ class StatusMetadata:
     cwd: str | None = None
     title: str | None = None
     origin: str | None = None
+    provider_session_id: str | None = None
     context_percent: float | None = None
 
 
@@ -529,8 +530,13 @@ class LiveAgentMonitor:
         changed = 0
         with self.lock:
             canonical_keys: set[str] = set()
+            canonical_provider_sessions: set[tuple[str, str]] = set()
             for status in statuses:
                 canonical_keys.add(status.agent_id)
+                if status.provider_session_id:
+                    canonical_provider_sessions.add(
+                        (status.provider, status.provider_session_id)
+                    )
                 previous = self.statuses_by_key.get(status.agent_id)
                 if previous is not None and previous.updated_at >= status.updated_at:
                     continue
@@ -541,7 +547,15 @@ class LiveAgentMonitor:
                 for key, status in list(self.statuses_by_key.items()):
                     if key in canonical_keys:
                         continue
-                    if (status.origin or "").strip().casefold() == wanted:
+                    same_provider_session = bool(
+                        status.session_id
+                        and (status.provider, status.session_id)
+                        in canonical_provider_sessions
+                    )
+                    if (
+                        (status.origin or "").strip().casefold() == wanted
+                        or same_provider_session
+                    ):
                         del self.statuses_by_key[key]
                         changed += 1
             if changed:
@@ -705,6 +719,7 @@ def parse_t3code_event_line(line: str) -> HookEvent | None:
 
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     logged_at = parse_datetime(event.get("createdAt"), parse_datetime(match.group(1)))
+    provider_session_id = t3code_provider_session_id(event, payload)
 
     # Some canonical events describe the session rather than a state change:
     # they carry no mode of their own but tell the menu where the session is
@@ -723,6 +738,8 @@ def parse_t3code_event_line(line: str) -> HookEvent | None:
         }
         if context_percent is not None:
             raw["t3code_context_percent"] = context_percent
+        if provider_session_id is not None:
+            raw["t3code_provider_session_id"] = provider_session_id
         return HookEvent(
             provider=provider,
             logged_at=logged_at,
@@ -752,6 +769,8 @@ def parse_t3code_event_line(line: str) -> HookEvent | None:
         "t3code_event_type": event_type,
         "t3code_payload": summarize_t3code_payload(payload),
     }
+    if provider_session_id is not None:
+        raw["t3code_provider_session_id"] = provider_session_id
     return HookEvent(
         provider=provider,
         logged_at=logged_at,
@@ -892,6 +911,23 @@ def t3code_session_cwd(event_type: str, payload: dict[str, Any]) -> str | None:
     if not isinstance(config, dict):
         return None
     return _string_or_none(config.get("cwd"))
+
+
+def t3code_provider_session_id(
+    event: dict[str, Any],
+    payload: dict[str, Any],
+) -> str | None:
+    """Extract the provider's native session id from a canonical T3 event."""
+    containers: list[object] = [payload, payload.get("detail"), event.get("raw")]
+    raw = event.get("raw")
+    if isinstance(raw, dict):
+        containers.append(raw.get("payload"))
+    for container in containers:
+        if isinstance(container, dict):
+            session_id = _string_or_none(container.get("session_id"))
+            if session_id:
+                return session_id
+    return None
 
 
 def t3code_context_percent(event_type: str, payload: dict[str, Any]) -> float | None:
@@ -1422,6 +1458,10 @@ def metadata_for_record(
         cwd=status_metadata.cwd or session_metadata.cwd,
         title=status_metadata.title or session_metadata.title,
         origin=status_metadata.origin or session_metadata.origin,
+        provider_session_id=(
+            status_metadata.provider_session_id
+            or session_metadata.provider_session_id
+        ),
         context_percent=(
             status_metadata.context_percent
             if status_metadata.context_percent is not None
@@ -1441,6 +1481,10 @@ def update_metadata(metadata: StatusMetadata, record: HookEvent) -> None:
     origin = record.origin or origin_label_from_payload(record.provider, record.raw)
     if origin:
         metadata.origin = origin
+
+    provider_session_id = _string_or_none(record.raw.get("t3code_provider_session_id"))
+    if provider_session_id:
+        metadata.provider_session_id = provider_session_id
 
     context_percent = record.raw.get("t3code_context_percent")
     if isinstance(context_percent, (int, float)):
@@ -1481,6 +1525,10 @@ def status_from_event(record: HookEvent, metadata: StatusMetadata | None = None)
         updated_at=record.logged_at,
         event_name=record.event_name,
         session_id=record.session_id,
+        provider_session_id=(
+            metadata.provider_session_id
+            or _string_or_none(record.raw.get("t3code_provider_session_id"))
+        ),
         cwd=record.cwd or metadata.cwd,
         tool_name=record.tool_name,
         message=record.message,
@@ -1778,6 +1826,7 @@ def agent_status_from_dict(data: object) -> AgentStatus | None:
             updated_at=updated_at,
             event_name=str(data["event_name"]),
             session_id=session_id,
+            provider_session_id=_string_or_none(data.get("provider_session_id")),
             cwd=cwd,
             tool_name=_string_or_none(data.get("tool_name")),
             message=_string_or_none(data.get("message")),

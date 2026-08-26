@@ -73,6 +73,7 @@ class AgentStatus:
     updated_at: datetime
     event_name: str
     session_id: str | None = None
+    provider_session_id: str | None = None
     cwd: str | None = None
     tool_name: str | None = None
     message: str | None = None
@@ -104,6 +105,7 @@ class AgentStatus:
             "age_seconds": round(self.age_seconds(now), 3),
             "event_name": self.event_name,
             "session_id": self.session_id,
+            "provider_session_id": self.provider_session_id,
             "cwd": self.cwd,
             "tool_name": self.tool_name,
             "message": self.message,
