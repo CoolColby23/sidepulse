@@ -95,6 +95,21 @@ def default_state_dir(home: Path | None = None) -> Path:
     return base / ".local" / "state" / "sidepulse" / "agent-monitor"
 
 
+def candidate_state_dirs(home: Path | None = None) -> tuple[Path, ...]:
+    """Every state dir a peer process may have resolved, most likely first.
+
+    ``default_state_dir`` reads ``XDG_STATE_HOME`` from the calling process. Hooks run in
+    the user's shell, while the status bar app runs from a LaunchAgent whose plist forwards
+    only ``PATH`` and ``PYTHONUNBUFFERED``. Whenever the user exports ``XDG_STATE_HOME``,
+    the two processes resolve different directories and never meet.
+    """
+    dirs = [default_state_dir(home)]
+    fallback = (home or Path.home()) / ".local" / "state" / "sidepulse" / "agent-monitor"
+    if fallback not in dirs:
+        dirs.append(fallback)
+    return tuple(dirs)
+
+
 def default_log_path(provider: str, home: Path | None = None) -> Path:
     suffix = "jsonl"
     return default_state_dir(home) / f"{provider}.{suffix}"
