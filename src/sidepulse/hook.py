@@ -106,10 +106,15 @@ def hook_event_socket_disabled() -> bool:
 
 
 def hook_log_main(provider: str, log_path: Path, event: str | None = None) -> int:
+    response_text = None
     try:
         payload_text = sys.stdin.read()
-        if provider == "cursor" and event:
-            from .cursor_hook import normalize_payload
+        if provider in {"cursor", "antigravity"} and event:
+            if provider == "cursor":
+                from .cursor_hook import normalize_payload
+            else:
+                from .antigravity_hook import normalize_payload, response_for_event
+                response_text = json.dumps(response_for_event(event), separators=(",", ":"))
 
             try:
                 raw = json.loads(payload_text or "{}")
@@ -129,5 +134,13 @@ def hook_log_main(provider: str, log_path: Path, event: str | None = None) -> in
         write_hook_line(actual_log_path, line)
         write_hook_status_audit(actual_provider, line)
     except Exception:
+        if provider == "antigravity" and event and response_text is None:
+            from .antigravity_hook import response_for_event
+
+            response_text = json.dumps(response_for_event(event), separators=(",", ":"))
+        if response_text is not None:
+            sys.stdout.write(response_text + "\n")
         return 0
+    if response_text is not None:
+        sys.stdout.write(response_text + "\n")
     return 0
