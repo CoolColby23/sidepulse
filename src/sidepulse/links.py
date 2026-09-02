@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import secrets
 import socket
 import threading
 import time
@@ -23,6 +24,7 @@ DEFAULT_BRIDGE_SERVER = "https://bridge.sidepulse.io"
 PAIRING_TIMEOUT_SECONDS = 5 * 60
 IOS_BUNDLE_ID = "io.sidepulse.ios"
 APNS_TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+PAIRING_CHANNEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 class LinkError(RuntimeError):
@@ -143,16 +145,20 @@ def store_ios_link(link: IOSLink, path: Path | None = None) -> tuple[IOSLink, ..
     return tuple(updated)
 
 
+def new_pairing_channel() -> str:
+    return secrets.token_urlsafe(8)
+
+
 def pairing_url(server: str, channel: str, sender: str | None = None) -> str:
     normalized_server = normalize_server(server)
-    try:
-        normalized_channel = str(uuid.UUID(channel))
-    except ValueError as exc:
-        raise LinkError("Pairing channel must be a UUID.") from exc
+    if not PAIRING_CHANNEL_PATTERN.fullmatch(channel):
+        raise LinkError("Pairing channel must be an 11-character Base64URL token.")
+    if normalized_server == DEFAULT_BRIDGE_SERVER:
+        return f"sidepulse://p/{channel}"
     query = {
         "v": "1",
         "server": normalized_server,
-        "channel": normalized_channel,
+        "channel": channel,
     }
     clean_sender = (sender or socket.gethostname()).strip()[:80]
     if clean_sender:

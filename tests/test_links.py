@@ -21,6 +21,7 @@ from sidepulse.links import (  # noqa: E402
     LinkError,
     iter_sse_messages,
     load_ios_links,
+    new_pairing_channel,
     normalize_apns_token,
     pairing_url,
     parse_ios_registration,
@@ -58,25 +59,36 @@ class LinkStorageTests(unittest.TestCase):
             self.assertEqual(len(stored), 1)
             self.assertEqual(stored[0].name, "New name")
 
-    def test_pairing_url_contains_a_uuid_channel_and_no_nonce(self) -> None:
-        channel = "6f1c2a9e-8f4b-4c1d-9b3a-2e5d7c8f0a11"
+    def test_pairing_channel_is_an_eleven_character_base64url_secret(self) -> None:
+        channels = {new_pairing_channel() for _ in range(100)}
+        self.assertEqual(len(channels), 100)
+        self.assertTrue(all(len(channel) == 11 for channel in channels))
+        alphabet = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        self.assertTrue(all(set(channel) <= alphabet for channel in channels))
+
+    def test_default_pairing_url_contains_only_the_compact_channel(self) -> None:
+        channel = "7kP2_xQ9mLs"
         url = pairing_url("https://bridge.sidepulse.io/", channel, "Studio Mac")
+        self.assertEqual(url, "sidepulse://p/7kP2_xQ9mLs")
+
+    def test_custom_server_pairing_url_keeps_connection_details(self) -> None:
+        url = pairing_url("https://bridge.example.com", "7kP2_xQ9mLs", "Studio Mac")
         self.assertIn("sidepulse://pair?", url)
-        self.assertIn("channel=6f1c2a9e-8f4b-4c1d-9b3a-2e5d7c8f0a11", url)
+        self.assertIn("server=https%3A%2F%2Fbridge.example.com", url)
+        self.assertIn("channel=7kP2_xQ9mLs", url)
         self.assertIn("sender=Studio+Mac", url)
-        self.assertNotIn("nonce", url)
 
     def test_pairing_qr_renders_without_printing_the_raw_link(self) -> None:
         url = pairing_url(
             "https://bridge.sidepulse.io",
-            "6f1c2a9e-8f4b-4c1d-9b3a-2e5d7c8f0a11",
+            "7kP2_xQ9mLs",
             "Studio Mac",
         )
         rendered = render_terminal_qr(url)
         lines = rendered.splitlines()
         self.assertTrue(any(character in rendered for character in "▀▄█"))
-        self.assertLessEqual(len(lines), 30)
-        self.assertLessEqual(max(map(len, lines)), 60)
+        self.assertLessEqual(len(lines), 20)
+        self.assertLessEqual(max(map(len, lines)), 40)
         self.assertNotIn("sidepulse://", rendered)
 
     def test_sse_parser_returns_complete_data_events(self) -> None:

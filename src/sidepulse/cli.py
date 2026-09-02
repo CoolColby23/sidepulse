@@ -48,6 +48,7 @@ from .links import (
     bridge_server,
     listen_for_ios_registration,
     load_ios_links,
+    new_pairing_channel,
     normalize_apns_token,
     pairing_url,
     render_terminal_qr,
@@ -368,7 +369,7 @@ def cmd_sidepulse_write_ios(args: argparse.Namespace) -> int:
 def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
     try:
         server = bridge_server()
-        channel = str(uuid.uuid4())
+        channel = new_pairing_channel()
         url = pairing_url(server, channel)
         qr = render_terminal_qr(url)
     except LinkError as exc:
