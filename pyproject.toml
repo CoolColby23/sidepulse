@@ -28,6 +28,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
+    "qrcode>=8,<9",
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=10; sys_platform == 'darwin'",
     "pyobjc-framework-WebKit>=10; sys_platform == 'darwin'",

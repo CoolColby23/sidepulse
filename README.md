@@ -72,6 +72,20 @@ sidepulse write "off" --device /Volumes/SidePulsePro/LEDS.LED
 The writer decodes simple escapes such as `\n`, then enforces the controller's
 512-byte and 20-line limits before writing the LED control file.
 
+### Link an iPhone
+
+Run one command and either scan the terminal QR code with the SidePulse iOS app
+or paste the 64-character push token shown by the app:
+
+```sh
+sidepulse link
+```
+
+Linked phones are stored locally. `sidepulse write` still prefers mounted
+SidePulse hardware; when no local device is mounted, it sends the validated LED
+program silently to every linked iPhone through `https://bridge.sidepulse.io`.
+Set `SIDEPULSE_SERVER` to use another bridge origin.
+
 ## Battery LEDs
 
 Show the current Mac battery state:

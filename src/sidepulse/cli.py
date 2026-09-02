@@ -3,10 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 
 from .battery import (
@@ -17,7 +21,14 @@ from .battery import (
     render_battery_snapshot,
 )
 from .collector import AgentMonitor, SourceSpec, default_sources
-from .device_writer import DEFAULT_FILE_NAME, DeviceWriteError, write_led_program
+from .device_writer import (
+    DEFAULT_FILE_NAME,
+    DeviceWriteError,
+    discover_devices,
+    normalize_led_text,
+    validate_led_text,
+    write_led_program,
+)
 from .hook import hook_log_main
 from .install import (
     install_claude_hooks,
@@ -30,6 +41,19 @@ from .install import (
     uninstall_grok_hooks,
 )
 from .led_status import AgentLedController, LedStatusWrite
+from .links import (
+    IOSLink,
+    LinkError,
+    PAIRING_TIMEOUT_SECONDS,
+    bridge_server,
+    listen_for_ios_registration,
+    load_ios_links,
+    normalize_apns_token,
+    pairing_url,
+    render_terminal_qr,
+    send_ios_program,
+    store_ios_link,
+)
 from .lid_sleep import (
     install_sleep_helper,
     sleep_helper_install_command,
@@ -130,6 +154,12 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     )
     write.add_argument("--dry-run", action="store_true", help="Show the target without writing.")
     write.set_defaults(func=cmd_sidepulse_write)
+
+    link = subparsers.add_parser(
+        "link",
+        help="Link an iPhone by scanning a QR code or pasting its push token.",
+    )
+    link.set_defaults(func=cmd_sidepulse_link)
 
     add_sidepulse_status_bar_parser(subparsers)
     add_sidepulse_sdejectguard_parser(subparsers)
@@ -279,6 +309,9 @@ def add_sidepulse_battery_parser(subparsers: argparse._SubParsersAction) -> None
 
 
 def cmd_sidepulse_write(args: argparse.Namespace) -> int:
+    if args.device is None and not discover_devices(file_name=args.file_name):
+        return cmd_sidepulse_write_ios(args)
+
     try:
         target = write_led_program(
             args.text,
@@ -295,6 +328,131 @@ def cmd_sidepulse_write(args: argparse.Namespace) -> int:
 
     action = "would write" if args.dry_run else "wrote"
     print(f"{action}: {target}")
+    return 0
+
+
+def cmd_sidepulse_write_ios(args: argparse.Namespace) -> int:
+    try:
+        program = normalize_led_text(args.text)
+        validate_led_text(program)
+    except DeviceWriteError as exc:
+        print(f"sidepulse write: {exc}", file=sys.stderr)
+        return 2
+
+    links = load_ios_links()
+    if not links:
+        print(
+            "sidepulse write: No SidePulse device found. "
+            "Run `sidepulse link` to connect your phone.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.dry_run:
+        for link in links:
+            print(f"would send: {link.name}")
+        return 0
+
+    event_id = str(uuid.uuid4())
+    failed = False
+    for link in links:
+        try:
+            send_ios_program(link, program, event_id=event_id)
+            print(f"sent: {link.name}")
+        except LinkError as exc:
+            failed = True
+            print(f"sidepulse write: {link.name}: {exc}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
+    try:
+        server = bridge_server()
+        channel = str(uuid.uuid4())
+        url = pairing_url(server, channel)
+        qr = render_terminal_qr(url)
+    except LinkError as exc:
+        print(f"sidepulse link: {exc}", file=sys.stderr)
+        return 1
+
+    results: queue.Queue[IOSLink] = queue.Queue()
+    stop = threading.Event()
+    deadline = time.monotonic() + PAIRING_TIMEOUT_SECONDS
+    listener = threading.Thread(
+        target=listen_for_ios_registration,
+        args=(server, channel, results, stop),
+        kwargs={"deadline": deadline},
+        daemon=True,
+    )
+    listener.start()
+
+    existing = load_ios_links()
+    if existing:
+        print("Linked phones: " + ", ".join(link.name for link in existing))
+        print()
+    print("Link your iPhone")
+    print()
+    print("Scan this QR code with your phone:")
+    print()
+    print(qr)
+    print()
+    print("Or paste the push token shown in the SidePulse app.")
+
+    input_enabled = True
+    prompt_visible = False
+    try:
+        while time.monotonic() < deadline:
+            try:
+                link = results.get_nowait()
+                break
+            except queue.Empty:
+                pass
+
+            if input_enabled and not prompt_visible:
+                print("Push token: ", end="", flush=True)
+                prompt_visible = True
+
+            readable = []
+            if input_enabled:
+                try:
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.2)
+                except (OSError, ValueError):
+                    input_enabled = False
+            else:
+                time.sleep(0.2)
+
+            if readable:
+                value = sys.stdin.readline()
+                if not value:
+                    input_enabled = False
+                    continue
+                try:
+                    token = normalize_apns_token(value)
+                except LinkError as exc:
+                    print(f"Invalid token: {exc}")
+                    prompt_visible = False
+                    continue
+                link = IOSLink(
+                    name="iPhone",
+                    token=token,
+                    server=server,
+                    linked_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                )
+                break
+        else:
+            print("\nPairing timed out. Run `sidepulse link` to try again.", file=sys.stderr)
+            return 1
+    finally:
+        stop.set()
+
+    if prompt_visible:
+        print()
+    try:
+        store_ios_link(link)
+    except OSError as exc:
+        print(f"sidepulse link: Could not save the phone: {exc}", file=sys.stderr)
+        return 1
+    print(f"Linked {link.name}. `sidepulse write` will use it when no local device is mounted.")
     return 0
 
 
