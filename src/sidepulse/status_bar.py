@@ -80,7 +80,7 @@ from .audit import (
     read_status_history_records,
     status_history_record,
 )
-from .collector import LiveAgentMonitor, SourceSpec
+from .collector import LiveAgentMonitor, SourceSpec, default_sources
 from .device_writer import (
     DEFAULT_FILE_NAME,
     MOUNT_ROOT,
@@ -1050,6 +1050,7 @@ class StatusBarController(NSObject):
         socket_path = default_event_socket_path()
         return LiveAgentMonitor(
             sources=(SourceSpec("event-bus", socket_path),),
+            recovery_sources=default_sources(self.settings),
             stale_after_seconds=self.settings.idle_timeout_seconds,
             latest_state_path=default_latest_state_path(),
         )
