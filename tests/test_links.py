@@ -73,7 +73,10 @@ class LinkStorageTests(unittest.TestCase):
             "Studio Mac",
         )
         rendered = render_terminal_qr(url)
-        self.assertIn("██", rendered)
+        lines = rendered.splitlines()
+        self.assertTrue(any(character in rendered for character in "▀▄█"))
+        self.assertLessEqual(len(lines), 30)
+        self.assertLessEqual(max(map(len, lines)), 60)
         self.assertNotIn("sidepulse://", rendered)
 
     def test_sse_parser_returns_complete_data_events(self) -> None:

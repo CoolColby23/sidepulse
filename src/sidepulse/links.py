@@ -171,7 +171,18 @@ def render_terminal_qr(value: str) -> str:
     code.add_data(value)
     code.make(fit=True)
     matrix = code.get_matrix()
-    return "\n".join("".join("██" if cell else "  " for cell in row) for row in matrix)
+    pixels = {
+        (False, False): " ",
+        (True, False): "▀",
+        (False, True): "▄",
+        (True, True): "█",
+    }
+    lines: list[str] = []
+    for row_index in range(0, len(matrix), 2):
+        top = matrix[row_index]
+        bottom = matrix[row_index + 1] if row_index + 1 < len(matrix) else [False] * len(top)
+        lines.append("".join(pixels[(top_cell, bottom_cell)] for top_cell, bottom_cell in zip(top, bottom)))
+    return "\n".join(lines)
 
 
 def parse_ios_registration(value: str, *, server: str) -> IOSLink:
