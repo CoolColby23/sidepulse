@@ -8,7 +8,6 @@ import select
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -52,7 +51,6 @@ from .links import (
     new_pairing_channel,
     normalize_apns_token,
     pairing_url,
-    render_pairing_qr_page,
     render_terminal_qr,
     send_ios_program,
     store_ios_link,
@@ -373,7 +371,6 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
         server = bridge_server()
         channel = new_pairing_channel()
         url = pairing_url(server, channel)
-        qr_page = render_pairing_qr_page(url)
         qr = render_terminal_qr(
             url,
             ansi=sys.stdout.isatty()
@@ -395,42 +392,16 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
     )
     listener.start()
 
-    pairing_page_path: Path | None = None
-    if sys.platform == "darwin" and sys.stdout.isatty() and "SSH_TTY" not in os.environ:
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                prefix="sidepulse-link-",
-                suffix=".html",
-                delete=False,
-            ) as pairing_page:
-                pairing_page.write(qr_page)
-                pairing_page_path = Path(pairing_page.name)
-            subprocess.run(
-                ["open", str(pairing_page_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except (OSError, subprocess.CalledProcessError):
-            if pairing_page_path is not None:
-                pairing_page_path.unlink(missing_ok=True)
-            pairing_page_path = None
-
     existing = load_ios_links()
     if existing:
         print("Linked phones: " + ", ".join(link.name for link in existing))
         print()
     print("Link your iPhone")
     print()
-    if pairing_page_path is not None:
-        print("Scan the QR code opened in your browser.")
-    else:
-        print("Scan this QR code with your phone:")
-        print()
-        print(qr)
-        print()
+    print("Scan this QR code with your phone:")
+    print()
+    print(qr)
+    print()
     print("Or paste the push token shown in the SidePulse app.")
 
     input_enabled = True
@@ -479,8 +450,6 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
             return 1
     finally:
         stop.set()
-        if pairing_page_path is not None:
-            pairing_page_path.unlink(missing_ok=True)
 
     if prompt_visible:
         print()

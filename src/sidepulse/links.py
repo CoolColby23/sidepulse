@@ -181,99 +181,25 @@ def _qr_matrix(value: str, *, border: int) -> list[list[bool]]:
 
 def render_terminal_qr(value: str, *, ansi: bool = False) -> str:
     matrix = _qr_matrix(value, border=2)
-    pixels = {
-        (False, False): " ",
-        (True, False): "▀",
-        (False, True): "▄",
-        (True, True): "█",
-    }
-    ansi_pixels = {
-        (False, False): ("\033[107m", " "),
-        (True, False): ("\033[30;107m", "▀"),
-        (False, True): ("\033[97;40m", "▀"),
-        (True, True): ("\033[40m", " "),
-    }
+    pixels = {False: "  ", True: "██"}
+    ansi_pixels = {False: "\033[107m", True: "\033[40m"}
     lines: list[str] = []
-    for row_index in range(0, len(matrix), 2):
-        top = matrix[row_index]
-        bottom = matrix[row_index + 1] if row_index + 1 < len(matrix) else [False] * len(top)
-        pairs = list(zip(top, bottom))
+    for row in matrix:
         if not ansi:
-            lines.append("".join(pixels[pair] for pair in pairs))
+            lines.append("".join(pixels[cell] for cell in row))
             continue
 
         parts: list[str] = []
         active_style = ""
-        for pair in pairs:
-            style, character = ansi_pixels[pair]
+        for cell in row:
+            style = ansi_pixels[cell]
             if style != active_style:
                 parts.append(style)
                 active_style = style
-            parts.append(character)
+            parts.append("  ")
         parts.append("\033[0m")
         lines.append("".join(parts))
     return "\n".join(lines)
-
-
-def render_pairing_qr_page(value: str) -> str:
-    matrix = _qr_matrix(value, border=4)
-    size = len(matrix)
-    path_parts: list[str] = []
-    for row_index, row in enumerate(matrix):
-        column = 0
-        while column < size:
-            if not row[column]:
-                column += 1
-                continue
-            run_start = column
-            while column < size and row[column]:
-                column += 1
-            path_parts.append(
-                f"M{run_start} {row_index}h{column - run_start}v1H{run_start}z"
-            )
-    qr_pixels = size * 12
-    qr_path = "".join(path_parts)
-    return f"""<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Link SidePulse</title>
-<style>
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0;
-    min-height: 100vh;
-    display: grid;
-    place-items: center;
-    background: #f5f5f7;
-    color: #1d1d1f;
-    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-  }}
-  main {{
-    width: min(92vw, 500px);
-    padding: 28px;
-    border: 1px solid #dedee3;
-    border-radius: 24px;
-    background: white;
-    box-shadow: 0 16px 48px rgb(0 0 0 / 10%);
-    text-align: center;
-  }}
-  h1 {{ margin: 0 0 6px; font-size: 24px; letter-spacing: -0.02em; }}
-  p {{ margin: 0 0 20px; color: #6e6e73; font-size: 15px; }}
-  svg {{ display: block; width: 100%; height: auto; }}
-</style>
-<main>
-  <h1>Link your iPhone</h1>
-  <p>Scan with your iPhone Camera.</p>
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}"
-       width="{qr_pixels}" height="{qr_pixels}" shape-rendering="crispEdges"
-       role="img" aria-label="SidePulse pairing QR code">
-    <rect width="{size}" height="{size}" fill="#fff"/>
-    <path d="{qr_path}" fill="#000"/>
-  </svg>
-</main>
-</html>
-"""
 
 
 def parse_ios_registration(value: str, *, server: str) -> IOSLink:
