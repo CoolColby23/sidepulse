@@ -166,7 +166,7 @@ def pairing_url(server: str, channel: str, sender: str | None = None) -> str:
     return "sidepulse://pair?" + urllib.parse.urlencode(query)
 
 
-def render_terminal_qr(value: str) -> str:
+def render_terminal_qr(value: str, *, ansi: bool = False) -> str:
     try:
         import qrcode
         from qrcode.constants import ERROR_CORRECT_M
@@ -183,11 +183,31 @@ def render_terminal_qr(value: str) -> str:
         (False, True): "▄",
         (True, True): "█",
     }
+    ansi_pixels = {
+        (False, False): ("\033[107m", " "),
+        (True, False): ("\033[30;107m", "▀"),
+        (False, True): ("\033[97;40m", "▀"),
+        (True, True): ("\033[40m", " "),
+    }
     lines: list[str] = []
     for row_index in range(0, len(matrix), 2):
         top = matrix[row_index]
         bottom = matrix[row_index + 1] if row_index + 1 < len(matrix) else [False] * len(top)
-        lines.append("".join(pixels[(top_cell, bottom_cell)] for top_cell, bottom_cell in zip(top, bottom)))
+        pairs = list(zip(top, bottom))
+        if not ansi:
+            lines.append("".join(pixels[pair] for pair in pairs))
+            continue
+
+        parts: list[str] = []
+        active_style = ""
+        for pair in pairs:
+            style, character = ansi_pixels[pair]
+            if style != active_style:
+                parts.append(style)
+                active_style = style
+            parts.append(character)
+        parts.append("\033[0m")
+        lines.append("".join(parts))
     return "\n".join(lines)
 
 

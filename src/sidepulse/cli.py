@@ -371,7 +371,12 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
         server = bridge_server()
         channel = new_pairing_channel()
         url = pairing_url(server, channel)
-        qr = render_terminal_qr(url)
+        qr = render_terminal_qr(
+            url,
+            ansi=sys.stdout.isatty()
+            and os.environ.get("TERM") != "dumb"
+            and "NO_COLOR" not in os.environ,
+        )
     except LinkError as exc:
         print(f"sidepulse link: {exc}", file=sys.stderr)
         return 1

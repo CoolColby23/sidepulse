@@ -91,6 +91,12 @@ class LinkStorageTests(unittest.TestCase):
         self.assertLessEqual(max(map(len, lines)), 40)
         self.assertNotIn("sidepulse://", rendered)
 
+    def test_pairing_qr_uses_solid_backgrounds_in_ansi_terminals(self) -> None:
+        rendered = render_terminal_qr("sidepulse://p/7kP2_xQ9mLs", ansi=True)
+        self.assertIn("\033[107m", rendered)
+        self.assertIn("\033[40m", rendered)
+        self.assertTrue(all(line.endswith("\033[0m") for line in rendered.splitlines()))
+
     def test_sse_parser_returns_complete_data_events(self) -> None:
         response = iter(
             [
