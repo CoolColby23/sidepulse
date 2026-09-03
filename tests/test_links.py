@@ -25,6 +25,7 @@ from sidepulse.links import (  # noqa: E402
     normalize_apns_token,
     pairing_url,
     parse_ios_registration,
+    render_pairing_qr_page,
     render_terminal_qr,
     save_ios_links,
     store_ios_link,
@@ -96,6 +97,13 @@ class LinkStorageTests(unittest.TestCase):
         self.assertIn("\033[107m", rendered)
         self.assertIn("\033[40m", rendered)
         self.assertTrue(all(line.endswith("\033[0m") for line in rendered.splitlines()))
+
+    def test_pairing_qr_page_is_vector_and_does_not_expose_the_link(self) -> None:
+        rendered = render_pairing_qr_page("sidepulse://p/7kP2_xQ9mLs")
+        self.assertIn("<svg", rendered)
+        self.assertIn('shape-rendering="crispEdges"', rendered)
+        self.assertIn("<path", rendered)
+        self.assertNotIn("sidepulse://", rendered)
 
     def test_sse_parser_returns_complete_data_events(self) -> None:
         response = iter(
