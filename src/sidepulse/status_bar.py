@@ -112,6 +112,7 @@ from .led_status import (
     program_for_agent_mode,
     write_mode_to_leds,
 )
+from .links import IOSLink, load_ios_links
 from .virtual_device import (
     FRAME_INTERVAL,
     VIRTUAL_DEVICE_ID,
@@ -558,6 +559,7 @@ class StatusBarController(NSObject):
         self.last_led_error = None
         self.last_led_display_kind = LED_DISPLAY_AGENT
         self.last_connected_device_signature = None
+        self.last_linked_phone_signature = None
         self.keep_awake = KeepAwakeController()
         self.closed_lid_awake = ClosedLidAwakeController(
             use_system_disable=sleep_helper_installed(),
@@ -657,6 +659,7 @@ class StatusBarController(NSObject):
         battery_snapshot = self.read_battery_snapshot()
         state = state_for_mode(snapshot.aggregate.mode)
         self.observe_connected_devices()
+        self.observe_linked_phones()
         self.set_status(state)
         self.sync_keep_awake(snapshot.aggregate.mode, battery_snapshot)
         mac_sleep_snapshot = self.read_mac_sleep_snapshot()
@@ -2577,6 +2580,30 @@ class StatusBarController(NSObject):
             self.remember_connected_devices(entries)
         return entries
 
+    def linked_phone_links(self) -> tuple[IOSLink, ...]:
+        try:
+            return load_ios_links()
+        except Exception as exc:
+            log_status_bar(f"linked phone discovery error: {exc}")
+            return ()
+
+    def observe_linked_phones(self) -> bool:
+        links = self.linked_phone_links()
+        signature = linked_phone_signature(links)
+        previous = self.last_linked_phone_signature
+        self.last_linked_phone_signature = signature
+        if previous is None or previous == signature:
+            return False
+        previous_ids = {entry[0] for entry in previous}
+        current_ids = {entry[0] for entry in signature}
+        linked_names = [link.name for link in links if link.link_id not in previous_ids]
+        unlinked_ids = sorted(previous_ids - current_ids)
+        if linked_names:
+            log_status_bar(f"phone linked: {', '.join(linked_names)}")
+        if unlinked_ids:
+            log_status_bar(f"phone unlinked: {', '.join(unlinked_ids)}")
+        return True
+
     def observe_connected_devices(self) -> bool:
         devices = self.status_bar_devices()
         signature = device_connection_signature(devices)
@@ -3053,7 +3080,10 @@ class StatusBarController(NSObject):
         self.poll_devices_once()
 
     def poll_devices_once(self) -> None:
-        if not self.observe_connected_devices():
+        local_changed = self.observe_connected_devices()
+        observe_linked = getattr(self, "observe_linked_phones", None)
+        linked_changed = bool(observe_linked()) if callable(observe_linked) else False
+        if not local_changed and not linked_changed:
             return
         if self.last_snapshot is not None:
             self.refresh_(None)
@@ -3201,10 +3231,12 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Devices"))
     devices = target.status_bar_devices()
-    if devices:
-        for device in devices:
-            menu.addItem_(build_device_menu_item(device, target))
-    else:
+    linked_phones = linked_phone_links_for_target(target)
+    for device in devices:
+        menu.addItem_(build_device_menu_item(device, target))
+    for link in linked_phones:
+        menu.addItem_(build_linked_phone_menu_item(link))
+    if not devices and not linked_phones:
         menu.addItem_(disabled_menu_item("No devices"))
     if SCREEN_BAR_FEATURE_ENABLED and not target.settings.virtual_status_device_enabled:
         virtual_toggle = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -3322,6 +3354,32 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
         remove.setRepresentedObject_(device.device_id)
         submenu.addItem_(remove)
 
+    item.setSubmenu_(submenu)
+    return item
+
+
+def linked_phone_links_for_target(target) -> tuple[IOSLink, ...]:
+    loader = getattr(target, "linked_phone_links", None)
+    if not callable(loader):
+        return ()
+    try:
+        return tuple(loader())
+    except Exception as exc:
+        log_status_bar(f"linked phone menu error: {exc}")
+        return ()
+
+
+def build_linked_phone_menu_item(link: IOSLink) -> NSMenuItem:
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(link.name, None, "")
+    item.setState_(1)
+    item.setToolTip_(f"Linked iPhone {link.link_id}")
+
+    submenu = NSMenu.alloc().init()
+    submenu.addItem_(disabled_menu_item("Linked iPhone"))
+    submenu.addItem_(disabled_menu_item(f"ID {link.link_id}"))
+    submenu.addItem_(disabled_menu_item(link.server))
+    submenu.addItem_(NSMenuItem.separatorItem())
+    submenu.addItem_(disabled_menu_item("Used by sidepulse push"))
     item.setSubmenu_(submenu)
     return item
 
@@ -5234,6 +5292,12 @@ def device_connection_signature(
             if device.connected
         )
     )
+
+
+def linked_phone_signature(
+    links: tuple[IOSLink, ...],
+) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted((link.link_id, link.name, link.server) for link in links))
 
 
 def device_mount_key(root: Path) -> str:

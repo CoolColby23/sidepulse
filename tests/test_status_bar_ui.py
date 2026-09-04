@@ -248,6 +248,9 @@ class MenuBuildTests(StatusBarTestCase):
         patcher = patch.object(sb, "discover_devices", return_value=[])
         self.discover_devices = patcher.start()
         self.addCleanup(patcher.stop)
+        link_patcher = patch.object(sb, "load_ios_links", return_value=())
+        self.load_ios_links = link_patcher.start()
+        self.addCleanup(link_patcher.stop)
 
     def assert_menu_is_wired(self, menu: NSMenu):
         for item in walk_menu(menu):
@@ -330,6 +333,31 @@ class MenuBuildTests(StatusBarTestCase):
         titles = [item.title() for item in walk_menu(menu)]
         for expected in ("Setup...", "Settings...", "Quit"):
             self.assertIn(expected, titles)
+
+    def test_menu_shows_linked_iphone_as_connected_device(self):
+        link = sb.IOSLink(
+            "Peter's iPhone",
+            "a" * 64,
+            server="https://bridge.sidepulse.io",
+        )
+        self.load_ios_links.return_value = (link,)
+
+        menu = sb.build_menu(make_snapshot(), sb.STATE_IDLE, self.controller)
+        item = next(
+            menu.itemAtIndex_(index)
+            for index in range(menu.numberOfItems())
+            if menu.itemAtIndex_(index).title() == "Peter's iPhone"
+        )
+
+        self.assertEqual(item.state(), 1)
+        submenu_titles = [
+            item.submenu().itemAtIndex_(index).title()
+            for index in range(item.submenu().numberOfItems())
+            if item.submenu().itemAtIndex_(index).title()
+        ]
+        self.assertIn("Linked iPhone", submenu_titles)
+        self.assertIn("ID aaaaaaaaaaaa", submenu_titles)
+        self.assertIn("Used by sidepulse push", submenu_titles)
 
     def test_recent_statuses_are_capped(self):
         """The menu must not grow unbounded with session count."""

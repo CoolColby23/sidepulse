@@ -1752,6 +1752,24 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(calls, [None])
 
+    def test_status_bar_poll_devices_refreshes_on_link_change(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        calls: list[object] = []
+        target = SimpleNamespace(
+            observe_connected_devices=lambda: False,
+            observe_linked_phones=lambda: True,
+            last_snapshot=object(),
+            refresh_=lambda sender: calls.append(sender),
+        )
+
+        status_bar.StatusBarController.poll_devices_once(target)
+
+        self.assertEqual(calls, [None])
+
     def test_status_bar_sync_skips_custom_device_display(self) -> None:
         try:
             from sidepulse import status_bar
