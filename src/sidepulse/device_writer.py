@@ -36,6 +36,21 @@ def write_led_program(
     dry_run: bool = False,
 ) -> Path:
     program = normalize_led_text(text)
+    return write_normalized_led_program(
+        program,
+        device_path=device_path,
+        file_name=file_name,
+        dry_run=dry_run,
+    )
+
+
+def write_normalized_led_program(
+    program: str,
+    *,
+    device_path: Path | None = None,
+    file_name: str = DEFAULT_FILE_NAME,
+    dry_run: bool = False,
+) -> Path:
     validate_led_text(program)
     target = resolve_target_path(device_path=device_path, file_name=file_name)
 

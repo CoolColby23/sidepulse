@@ -271,13 +271,41 @@ def listen_for_ios_registration(
                 continue
 
 
-def send_ios_program(link: IOSLink, program: str, *, event_id: str | None = None) -> str:
-    payload = {
-        "leds": program,
-        "data": {
-            "sidepulse_event_id": event_id or str(uuid.uuid4()),
-        },
+def send_ios_program(
+    link: IOSLink,
+    program: str | None = None,
+    *,
+    event_id: str | None = None,
+    title: str | None = None,
+    message: str | None = None,
+    data: dict[str, object] | None = None,
+) -> str:
+    clean_title = title.strip() if title else ""
+    clean_message = message.strip() if message else ""
+    if program is None and not clean_title and not clean_message:
+        raise LinkError("A remote write must contain LEDs, a title, or a message.")
+
+    custom_data = dict(data or {})
+    custom_data["sidepulse_event_id"] = event_id or str(uuid.uuid4())
+    aps: dict[str, object] = {"content-available": 1}
+    if clean_title or clean_message:
+        alert: dict[str, str] = {}
+        if clean_title:
+            alert["title"] = clean_title
+        if clean_message:
+            alert["body"] = clean_message
+        aps["alert"] = alert
+
+    payload: dict[str, object] = {
+        "aps": aps,
+        "data": custom_data,
     }
+    if program is not None:
+        payload["leds"] = program
+    if clean_title:
+        payload["title"] = clean_title
+    if clean_message:
+        payload["body"] = clean_message
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     url = f"{normalize_server(link.server)}/api/leds/apns_{link.token}"
     request = urllib.request.Request(

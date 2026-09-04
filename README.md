@@ -54,15 +54,49 @@ python3 -m pip install -e .
 sidepulse setup
 ```
 
-Write an LED program directly to a mounted SidePulse Pro or SidePulse Dot device:
+Send an LED program to SidePulse:
 
 ```sh
 sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat"
 ```
 
+`sidepulse write` prefers mounted hardware and falls back to a linked phone.
+`sidepulse push` accepts the same options but prefers a linked phone, which is
+useful for hooks and remote notifications:
+
+```sh
+sidepulse push "off\n#00ff66 pulse\nrepeat" \
+  --title "Build complete" \
+  --message "All tests passed"
+```
+
+The LED program is optional when a title or message is present:
+
+```sh
+sidepulse push --title "Agent needs input" --message "Choose a deployment region"
+```
+
+Choose a destination by its displayed name or short ID. If multiple compatible
+destinations are available, SidePulse asks for `--to` instead of silently
+broadcasting. Use `--all` when broadcasting is intentional:
+
+```sh
+sidepulse write "off" --to "Peter's iPhone"
+sidepulse push "off" --to a1b2c3d4
+sidepulse write "off" --all
+```
+
+Both commands accept `-` for stdin. `sidepulse write` also reads piped stdin when
+no LED argument or notification text was supplied:
+
+```sh
+printf 'off\n#ff3a00 pulse\nrepeat' | sidepulse write
+sidepulse push - --title "Deploying" < deploy.LED
+```
+
 The CLI auto-detects mounted devices under `/Volumes` by looking for a
-SidePulse Pro/SidePulse Dot-style volume name or an existing `LEDS.LED`. If more than
-one device is possible, pass the mounted folder or file explicitly:
+SidePulse Pro/SidePulse Dot-style volume name or an existing `LEDS.LED`. For a
+specific local path, the existing `--device` option remains available:
 
 ```sh
 sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat" --device /Volumes/SidePulsePro
@@ -81,10 +115,11 @@ or paste the 64-character push token shown by the app:
 sidepulse link
 ```
 
-Linked phones are stored locally. `sidepulse write` still prefers mounted
-SidePulse hardware; when no local device is mounted, it sends the validated LED
-program silently to every linked iPhone through `https://bridge.sidepulse.io`.
-Set `SIDEPULSE_SERVER` to use another bridge origin.
+Linked phones are stored locally. Remote LED-only writes are silent. Adding
+`--title` or `--message` produces one visible notification containing the same
+LED program and event metadata. Remote payloads also include the sending
+computer's name and available battery state. Set `SIDEPULSE_SERVER` to use
+another bridge origin.
 
 ## Battery LEDs
 

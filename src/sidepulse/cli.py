@@ -6,6 +6,7 @@ import os
 import queue
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -27,7 +28,7 @@ from .device_writer import (
     discover_devices,
     normalize_led_text,
     validate_led_text,
-    write_led_program,
+    write_normalized_led_program,
 )
 from .hook import hook_log_main
 from .install import (
@@ -140,21 +141,17 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
 
     write = subparsers.add_parser(
         "write",
-        help=f"Write an LED program to {DEFAULT_FILE_NAME} on a mounted SidePulse Pro or SidePulse Dot device.",
+        help="Send an LED program, notification, or both to SidePulse.",
     )
-    write.add_argument("text", help=r"LED program text. Backslash escapes like \n are decoded.")
-    write.add_argument(
-        "--device",
-        type=Path,
-        help="Mounted device folder or LED program file path. Defaults to auto-detecting /Volumes.",
-    )
-    write.add_argument(
-        "--file-name",
-        default=DEFAULT_FILE_NAME,
-        help=f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}.",
-    )
-    write.add_argument("--dry-run", action="store_true", help="Show the target without writing.")
+    add_sidepulse_delivery_arguments(write)
     write.set_defaults(func=cmd_sidepulse_write)
+
+    push = subparsers.add_parser(
+        "push",
+        help="Send an LED program, notification, or both, preferring a linked phone.",
+    )
+    add_sidepulse_delivery_arguments(push)
+    push.set_defaults(func=cmd_sidepulse_push)
 
     link = subparsers.add_parser(
         "link",
@@ -170,6 +167,29 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     # accept it.
     add_hook_log_parser(subparsers)
     return parser
+
+
+def add_sidepulse_delivery_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "text",
+        nargs="?",
+        help=r"LED program text. Backslash escapes like \n are decoded. Use - to read stdin.",
+    )
+    parser.add_argument("--title", help="Notification title.")
+    parser.add_argument("--message", help="Notification message.")
+    parser.add_argument("--to", help="Destination name or ID. Use 'local' or 'phone' when unambiguous.")
+    parser.add_argument("--all", action="store_true", help="Send to every compatible destination.")
+    parser.add_argument(
+        "--device",
+        type=Path,
+        help="Mounted device folder or LED program file path. Cannot be combined with --to or --all.",
+    )
+    parser.add_argument(
+        "--file-name",
+        default=DEFAULT_FILE_NAME,
+        help=f"Target file name when --device is a folder. Default: {DEFAULT_FILE_NAME}.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Show the target without writing or sending.")
 
 
 def add_hook_log_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -310,60 +330,271 @@ def add_sidepulse_battery_parser(subparsers: argparse._SubParsersAction) -> None
 
 
 def cmd_sidepulse_write(args: argparse.Namespace) -> int:
-    if args.device is None and not discover_devices(file_name=args.file_name):
-        return cmd_sidepulse_write_ios(args)
+    return _cmd_sidepulse_delivery(args, command="write", prefer_phone=False)
 
+
+def cmd_sidepulse_push(args: argparse.Namespace) -> int:
+    return _cmd_sidepulse_delivery(args, command="push", prefer_phone=True)
+
+
+def _cmd_sidepulse_delivery(
+    args: argparse.Namespace,
+    *,
+    command: str,
+    prefer_phone: bool,
+) -> int:
+    prefix = f"sidepulse {command}"
+    if args.to and args.all:
+        print(f"{prefix}: Use either --to or --all, not both.", file=sys.stderr)
+        return 2
+    if args.device is not None and (args.to or args.all):
+        print(f"{prefix}: --device cannot be combined with --to or --all.", file=sys.stderr)
+        return 2
+
+    title = _clean_notification_text(args.title)
+    message = _clean_notification_text(args.message)
+    has_notification = title is not None or message is not None
     try:
-        target = write_led_program(
-            args.text,
+        program = _program_from_args(args.text, allow_implicit_stdin=not has_notification)
+        if program is not None:
+            validate_led_text(program)
+    except DeviceWriteError as exc:
+        print(f"{prefix}: {exc}", file=sys.stderr)
+        return 2
+
+    if program is None and not has_notification:
+        print(
+            f"{prefix}: Provide an LED program, --title, or --message.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.device is not None:
+        if has_notification:
+            print(
+                f"{prefix}: A local SidePulse cannot display notifications. "
+                "Choose a linked phone with --to.",
+                file=sys.stderr,
+            )
+            return 2
+        return _write_explicit_local(args, program, prefix=prefix)
+
+    local_devices = discover_devices(file_name=args.file_name)
+    phone_links = load_ios_links()
+    try:
+        local_targets, phone_targets = _select_delivery_targets(
+            requested=args.to,
+            send_all=args.all,
+            program=program,
+            has_notification=has_notification,
+            prefer_phone=prefer_phone,
+            local_devices=local_devices,
+            phone_links=phone_links,
+        )
+    except DeviceWriteError as exc:
+        print(f"{prefix}: {exc}", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        for candidate in local_targets:
+            print(f"would write: {candidate.target}")
+        for link in phone_targets:
+            print(f"would send: {link.name} ({link.link_id})")
+        return 0
+
+    event_id = str(uuid.uuid4())
+    event_data = _remote_event_data(event_id) if phone_targets else None
+    failed = False
+    for candidate in local_targets:
+        try:
+            target = write_normalized_led_program(
+                program or "",
+                device_path=candidate.target,
+                file_name=args.file_name,
+            )
+            print(f"wrote: {target}")
+        except (DeviceWriteError, OSError) as exc:
+            failed = True
+            print(f"{prefix}: {candidate.root}: {exc}", file=sys.stderr)
+
+    for link in phone_targets:
+        try:
+            send_ios_program(
+                link,
+                program,
+                event_id=event_id,
+                title=title,
+                message=message,
+                data=event_data,
+            )
+            print(f"sent: {link.name} ({link.link_id})")
+        except LinkError as exc:
+            failed = True
+            print(f"{prefix}: {link.name}: {exc}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+def _clean_notification_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _program_from_args(text: str | None, *, allow_implicit_stdin: bool) -> str | None:
+    if text == "-":
+        return normalize_led_text(sys.stdin.read())
+    if text is not None:
+        return normalize_led_text(text)
+    if allow_implicit_stdin:
+        piped = _read_available_stdin()
+        if piped is not None:
+            return normalize_led_text(piped)
+    return None
+
+
+def _read_available_stdin() -> str | None:
+    try:
+        if sys.stdin.isatty():
+            return None
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        if readable:
+            return sys.stdin.read()
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _write_explicit_local(args: argparse.Namespace, program: str | None, *, prefix: str) -> int:
+    if program is None:
+        print(f"{prefix}: A local SidePulse requires an LED program.", file=sys.stderr)
+        return 2
+    try:
+        target = write_normalized_led_program(
+            program,
             device_path=args.device,
             file_name=args.file_name,
             dry_run=args.dry_run,
         )
     except DeviceWriteError as exc:
-        print(f"sidepulse write: {exc}", file=sys.stderr)
+        print(f"{prefix}: {exc}", file=sys.stderr)
         return 2
     except OSError as exc:
-        print(f"sidepulse write: {exc}", file=sys.stderr)
+        print(f"{prefix}: {exc}", file=sys.stderr)
         return 1
-
     action = "would write" if args.dry_run else "wrote"
     print(f"{action}: {target}")
     return 0
 
 
-def cmd_sidepulse_write_ios(args: argparse.Namespace) -> int:
-    try:
-        program = normalize_led_text(args.text)
-        validate_led_text(program)
-    except DeviceWriteError as exc:
-        print(f"sidepulse write: {exc}", file=sys.stderr)
-        return 2
+def _select_delivery_targets(
+    *,
+    requested: str | None,
+    send_all: bool,
+    program: str | None,
+    has_notification: bool,
+    prefer_phone: bool,
+    local_devices,
+    phone_links: tuple[IOSLink, ...],
+):
+    if send_all:
+        if has_notification and not phone_links:
+            raise DeviceWriteError(
+                "No linked phone can display the notification. Run `sidepulse link`."
+            )
+        local_targets = list(local_devices) if program is not None else []
+        phone_targets = list(phone_links)
+        if not local_targets and not phone_targets:
+            raise DeviceWriteError("No destinations found. Run `sidepulse link` to connect your phone.")
+        return local_targets, phone_targets
 
-    links = load_ios_links()
-    if not links:
-        print(
-            "sidepulse write: No SidePulse device found. "
-            "Run `sidepulse link` to connect your phone.",
-            file=sys.stderr,
+    if requested:
+        matches = _matching_destinations(requested, local_devices, phone_links)
+        if not matches:
+            available = _format_destinations(local_devices, phone_links)
+            suffix = f"\nAvailable destinations:\n{available}" if available else ""
+            raise DeviceWriteError(f"No destination matches {requested!r}.{suffix}")
+        if len(matches) > 1:
+            rendered = "\n".join(f"  {label}" for _, _, label in matches)
+            raise DeviceWriteError(
+                f"Destination {requested!r} is ambiguous:\n{rendered}\nUse its ID with --to."
+            )
+        kind, target, _ = matches[0]
+        if kind == "local":
+            if has_notification:
+                raise DeviceWriteError(
+                    "A local SidePulse cannot display notifications. Choose a linked phone with --to."
+                )
+            if program is None:
+                raise DeviceWriteError("A local SidePulse requires an LED program.")
+            return [target], []
+        return [], [target]
+
+    targets_are_phones = has_notification or (prefer_phone and bool(phone_links)) or not local_devices
+    compatible = list(phone_links) if targets_are_phones else list(local_devices)
+    if not compatible:
+        if has_notification:
+            raise DeviceWriteError("No linked phone found. Run `sidepulse link`.")
+        raise DeviceWriteError("No SidePulse destination found. Run `sidepulse link` to connect your phone.")
+    if len(compatible) > 1:
+        if targets_are_phones:
+            rendered = _format_destinations([], compatible)
+        else:
+            rendered = _format_destinations(compatible, ())
+        raise DeviceWriteError(
+            "More than one destination is available:\n"
+            f"{rendered}\nChoose one with --to, or use --all."
         )
-        return 2
+    if targets_are_phones:
+        return [], compatible
+    return compatible, []
 
-    if args.dry_run:
-        for link in links:
-            print(f"would send: {link.name}")
-        return 0
 
-    event_id = str(uuid.uuid4())
-    failed = False
-    for link in links:
-        try:
-            send_ios_program(link, program, event_id=event_id)
-            print(f"sent: {link.name}")
-        except LinkError as exc:
-            failed = True
-            print(f"sidepulse write: {link.name}: {exc}", file=sys.stderr)
-    return 1 if failed else 0
+def _matching_destinations(requested: str, local_devices, phone_links: tuple[IOSLink, ...]):
+    query = requested.strip().casefold()
+    if not query:
+        return []
+    if query == "local":
+        return [("local", item, f"{item.root.name} ({item.root})") for item in local_devices]
+    if query == "phone":
+        return [("phone", item, f"{item.name} ({item.link_id})") for item in phone_links]
+
+    matches = []
+    for item in local_devices:
+        names = {item.root.name.casefold(), str(item.root).casefold(), str(item.target).casefold()}
+        if query in names:
+            matches.append(("local", item, f"{item.root.name} ({item.root})"))
+    for item in phone_links:
+        id_matches = query == item.link_id.casefold() or (
+            len(query) >= 4 and item.link_id.casefold().startswith(query)
+        )
+        if query == item.name.casefold() or id_matches:
+            matches.append(("phone", item, f"{item.name} ({item.link_id})"))
+    return matches
+
+
+def _format_destinations(local_devices, phone_links) -> str:
+    lines = [f"  {item.root.name} ({item.root})" for item in local_devices]
+    lines.extend(f"  {item.name} ({item.link_id})" for item in phone_links)
+    return "\n".join(lines)
+
+
+def _remote_event_data(event_id: str) -> dict[str, object]:
+    source: dict[str, object] = {"name": socket.gethostname()}
+    try:
+        battery = read_battery_snapshot()
+    except Exception:
+        battery = None
+    if battery is not None and battery.battery_present:
+        source["battery"] = {
+            "level": battery.percent,
+            "charging": battery.is_charging,
+            "plugged_in": battery.is_plugged,
+        }
+    return {
+        "sidepulse_event_id": event_id,
+        "source": source,
+    }
 
 
 def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
@@ -394,7 +625,10 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
 
     existing = load_ios_links()
     if existing:
-        print("Linked phones: " + ", ".join(link.name for link in existing))
+        print(
+            "Linked phones: "
+            + ", ".join(f"{link.name} ({link.link_id})" for link in existing)
+        )
         print()
     print("Link your iPhone")
     print()
@@ -458,7 +692,11 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"sidepulse link: Could not save the phone: {exc}", file=sys.stderr)
         return 1
-    print(f"Linked {link.name}. `sidepulse write` will use it when no local device is mounted.")
+    print(
+        f"Linked {link.name} ({link.link_id}). "
+        "`sidepulse write` uses it when no local device is mounted; "
+        "`sidepulse push` prefers it."
+    )
     return 0
 
 
