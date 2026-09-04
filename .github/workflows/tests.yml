@@ -31,6 +31,7 @@ jobs:
             sh scripts/setup.sh
           "$smoke_home/.local/bin/sidepulse" --help
           printf '%064d\n' 0 | "$smoke_home/.local/bin/sidepulse" link >/dev/null
+          "$smoke_home/.local/bin/sidepulse" link AbCdEfGhIjKlMnOpQrStUv
           "$smoke_home/.local/bin/sidepulse" push "off" --dry-run
           mkdir -p "$smoke_home/media/SidePulseDot"
           "$smoke_home/.local/bin/sidepulse" write "off" \

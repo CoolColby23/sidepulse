@@ -135,6 +135,15 @@ def hook_log_main(provider: str, log_path: Path, event: str | None = None) -> in
         try:
             if not hook_event_socket_disabled():
                 send_hook_event(actual_provider, line)
+                from .relay import candidate_relay_event_socket_paths
+
+                for relay_socket in candidate_relay_event_socket_paths():
+                    if send_hook_event(
+                        actual_provider,
+                        line,
+                        socket_path=relay_socket,
+                    ):
+                        break
         except Exception:
             pass
     except Exception:

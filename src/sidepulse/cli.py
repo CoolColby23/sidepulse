@@ -56,6 +56,11 @@ from .links import (
     send_ios_program,
     store_ios_link,
 )
+from .relay import (
+    configure_outbound_channel,
+    ensure_receiver_config,
+    relay_link_command,
+)
 from .lid_sleep import (
     install_sleep_helper,
     sleep_helper_install_command,
@@ -155,9 +160,22 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
 
     link = subparsers.add_parser(
         "link",
-        help="Link an iPhone by scanning a QR code or pasting its push token.",
+        help="Link an iPhone or connect this computer to a remote SidePulse receiver.",
     )
+    link.add_argument("relay_code", nargs="?", help="Relay code printed by the receiving Mac.")
     link.set_defaults(func=cmd_sidepulse_link)
+
+    service = subparsers.add_parser(
+        "service",
+        help="Manage the headless SidePulse background service.",
+    )
+    service.add_argument(
+        "service_command",
+        choices=("start", "stop", "status", "run"),
+        nargs="?",
+        default="status",
+    )
+    service.set_defaults(func=cmd_sidepulse_service)
 
     add_sidepulse_status_bar_parser(subparsers)
     add_sidepulse_sdejectguard_parser(subparsers)
@@ -597,8 +615,23 @@ def _remote_event_data(event_id: str) -> dict[str, object]:
     }
 
 
-def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
+def cmd_sidepulse_link(args: argparse.Namespace) -> int:
+    relay_code = getattr(args, "relay_code", None)
+    if relay_code:
+        try:
+            config = configure_outbound_channel(relay_code, server=bridge_server())
+        except LinkError as exc:
+            print(f"sidepulse link: {exc}", file=sys.stderr)
+            return 1
+        print(
+            "Linked this computer to the remote SidePulse receiver "
+            f"({config.outbound_channel[:12]})."
+        )
+        print("Agent events will be relayed by the SidePulse background service.")
+        return 0
+
     try:
+        relay_config = ensure_receiver_config()
         server = bridge_server()
         channel = new_pairing_channel()
         url = pairing_url(server, channel)
@@ -611,6 +644,13 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
     except LinkError as exc:
         print(f"sidepulse link: {exc}", file=sys.stderr)
         return 1
+
+    print("Link a remote computer")
+    print()
+    print("Run this command on the VM or other computer:")
+    print()
+    print(f"  {relay_link_command(relay_config)}")
+    print()
 
     results: queue.Queue[IOSLink] = queue.Queue()
     stop = threading.Event()
@@ -682,6 +722,9 @@ def cmd_sidepulse_link(_args: argparse.Namespace) -> int:
         else:
             print("\nPairing timed out. Run `sidepulse link` to try again.", file=sys.stderr)
             return 1
+    except KeyboardInterrupt:
+        print("\nLinking stopped.")
+        return 130
     finally:
         stop.set()
 
@@ -940,6 +983,23 @@ def cmd_sidepulse_setup(args: argparse.Namespace) -> int:
     results = install_hook_results(args)
     print_install_results(results, dry_run=args.dry_run)
 
+    from .service_launch import install_service
+
+    relay_config = None
+    if sys.platform == "darwin" and not args.dry_run:
+        relay_config = ensure_receiver_config()
+    service_result = install_service(start=True, dry_run=args.dry_run)
+    service_action = "would install" if args.dry_run else "installed"
+    if service_result.started:
+        service_action += " and started"
+    elif service_result.detail and not args.dry_run:
+        service_action += f"; not started ({service_result.detail})"
+    print(f"background service: {service_action}")
+    if str(service_result.path):
+        print(f"  config: {service_result.path}")
+    if relay_config is not None:
+        print(f"remote computer: {relay_link_command(relay_config)}")
+
     if sys.platform != "darwin":
         print("macOS integrations: skipped (CLI-only setup on this platform)")
         print("sidepulse: ready for linked phones and mounted SidePulse devices")
@@ -973,6 +1033,32 @@ def cmd_sidepulse_setup(args: argparse.Namespace) -> int:
     print(f"status-bar: {action}")
     print(f"  plist: {result.plist_path}")
     return 0
+
+
+def cmd_sidepulse_service(args: argparse.Namespace) -> int:
+    from .service_launch import install_service, service_is_running, stop_service
+
+    command = args.service_command
+    if command == "run":
+        from .service import run_service
+
+        return run_service()
+    if command == "stop":
+        stopped = stop_service()
+        print(f"background service: {'stopped' if stopped else 'not running'}")
+        return 0
+    if command == "start":
+        result = install_service(start=True)
+        action = "started" if result.started else "installed but not started"
+        print(f"background service: {action}")
+        print(f"  config: {result.path}")
+        if result.detail:
+            print(f"  {result.detail}")
+        return 0 if result.started else 1
+
+    running = service_is_running()
+    print(f"background service: {'running' if running else 'not running'}")
+    return 0 if running else 1
 
 
 def print_sd_eject_guard_result(result) -> None:

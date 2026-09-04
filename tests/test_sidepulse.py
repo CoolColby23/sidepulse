@@ -3747,7 +3747,6 @@ class AgentMonitorTests(unittest.TestCase):
             cleanup_removed=None,
             cleanup_skipped=None,
         )
-
         with patch(
             "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
             return_value=guard_result,
@@ -3880,9 +3879,21 @@ class AgentMonitorTests(unittest.TestCase):
             cleanup_removed=None,
             cleanup_skipped=None,
         )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/io.sidepulse.service.plist"),
+            changed=True,
+            started=True,
+            detail="",
+        )
+        relay_config = SimpleNamespace(
+            receiver_channel="receiver-code",
+            server="https://bridge.sidepulse.io",
+        )
 
         with (
             patch.object(cli_module.sys, "platform", "darwin"),
+            patch.object(cli_module, "ensure_receiver_config", return_value=relay_config),
+            patch("sidepulse.service_launch.install_service", return_value=service_result) as service,
             patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
             patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
             patch.object(
@@ -3909,6 +3920,7 @@ class AgentMonitorTests(unittest.TestCase):
         grok.assert_called_once()
         guard.assert_called_once_with(scope="auto", dry_run=False)
         launch.assert_called_once_with(start=True)
+        service.assert_called_once_with(start=True, dry_run=False)
 
     def test_sidepulse_setup_no_status_bar_still_installs_guard(self) -> None:
         parser = cli_module.build_sidepulse_parser()
@@ -3930,9 +3942,21 @@ class AgentMonitorTests(unittest.TestCase):
             cleanup_removed=None,
             cleanup_skipped=None,
         )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/io.sidepulse.service.plist"),
+            changed=False,
+            started=True,
+            detail="",
+        )
+        relay_config = SimpleNamespace(
+            receiver_channel="receiver-code",
+            server="https://bridge.sidepulse.io",
+        )
 
         with (
             patch.object(cli_module.sys, "platform", "darwin"),
+            patch.object(cli_module, "ensure_receiver_config", return_value=relay_config),
+            patch("sidepulse.service_launch.install_service", return_value=service_result),
             patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
@@ -3956,10 +3980,17 @@ class AgentMonitorTests(unittest.TestCase):
             changed=False,
             backup_path=None,
         )
+        service_result = SimpleNamespace(
+            path=Path("/tmp/sidepulse.service"),
+            changed=True,
+            started=False,
+            detail="systemd user manager unavailable",
+        )
 
         with (
             patch.object(cli_module.sys, "platform", "linux"),
             patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
+            patch("sidepulse.service_launch.install_service", return_value=service_result) as service,
             patch("sidepulse.sd_eject_guard_launch.install_sd_eject_guard") as guard,
             patch("sidepulse.status_bar_launch.install_launch_agent") as launch,
             patch("builtins.print") as output,
@@ -3969,6 +4000,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(result, 0)
         guard.assert_not_called()
         launch.assert_not_called()
+        service.assert_called_once_with(start=True, dry_run=False)
         rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
         self.assertIn("CLI-only setup", rendered)
         self.assertIn("linked phones and mounted SidePulse devices", rendered)

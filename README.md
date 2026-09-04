@@ -36,9 +36,10 @@ installs the menu-bar app and hardware helpers. On Linux, it automatically
 uses CLI-only mode for mounted SidePulse devices and iPhone linking/push. Run
 the same command again to upgrade to the newest version.
 
-Linux setup installs the CLI and agent hooks, but not an always-running relay
-service yet. Local writes and iPhone pushes work immediately. For continuous
-local agent-status mirroring, keep `sidepulse agent-monitor leds` running.
+Setup also installs a headless SidePulse service. It runs through a LaunchAgent
+on macOS and a user systemd service on Linux. If a Linux session has no systemd
+user manager, setup still installs the unit and prints that it could not start;
+`sidepulse service run` remains available as a foreground fallback.
 
 ### 2. Install into your own Python environment
 
@@ -131,6 +132,30 @@ Linked phones are stored locally. Remote LED-only writes are silent. Adding
 LED program and event metadata. Remote payloads also include the sending
 computer's name and available battery state. Set `SIDEPULSE_SERVER` to use
 another bridge origin.
+
+### Link a remote VM or computer
+
+The receiving Mac gets a persistent, random relay channel during setup. Run
+`sidepulse link` on the Mac to see the short command for another computer, then
+paste that command into the VM. It looks like this:
+
+```sh
+sidepulse link AbCdEfGhIjKlMnOpQrStUv
+```
+
+The VM stores that channel locally. Its agent hooks hand events to the
+background SidePulse service, which publishes them to the Mac. The Mac records
+the remote events alongside its local agent history and updates its connected
+SidePulse hardware or linked iPhone. The VM is an event source, so it does not
+appear in the Devices menu.
+
+The channel is a 128-bit capability token: possession grants access, so treat
+the command like a password. There is no separate one-time code. Check the
+service on either computer with:
+
+```sh
+sidepulse service status
+```
 
 ## Battery LEDs
 
