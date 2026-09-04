@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import socket
 import subprocess
 import threading
 import time
@@ -112,7 +113,7 @@ from .led_status import (
     program_for_agent_mode,
     write_mode_to_leds,
 )
-from .links import IOSLink, load_ios_links
+from .links import IOSLink, load_ios_links, send_ios_program
 from .virtual_device import (
     FRAME_INTERVAL,
     VIRTUAL_DEVICE_ID,
@@ -233,6 +234,9 @@ class StatusBarState:
     priority: int
 
 
+LINKED_PHONE_DEVICE_PREFIX = "ios/"
+
+
 @dataclass(frozen=True)
 class StatusBarDevice:
     device_id: str
@@ -243,6 +247,7 @@ class StatusBarDevice:
     display: str
     brightness: int = 255
     reason: str = ""
+    remote_link: IOSLink | None = None
 
 
 class AnimationProgramTextView(NSTextView):
@@ -552,6 +557,7 @@ class StatusBarController(NSObject):
         self.battery_led_controller = BatteryLedController()
         self.agent_led_controllers_by_device = {}
         self.battery_led_controllers_by_device = {}
+        self.remote_led_program_by_device = {}
         self.last_led_display_kind_by_device = {}
         self.device_errors = {}
         self.leds_enabled = True
@@ -559,7 +565,6 @@ class StatusBarController(NSObject):
         self.last_led_error = None
         self.last_led_display_kind = LED_DISPLAY_AGENT
         self.last_connected_device_signature = None
-        self.last_linked_phone_signature = None
         self.keep_awake = KeepAwakeController()
         self.closed_lid_awake = ClosedLidAwakeController(
             use_system_disable=sleep_helper_installed(),
@@ -659,7 +664,6 @@ class StatusBarController(NSObject):
         battery_snapshot = self.read_battery_snapshot()
         state = state_for_mode(snapshot.aggregate.mode)
         self.observe_connected_devices()
-        self.observe_linked_phones()
         self.set_status(state)
         self.sync_keep_awake(snapshot.aggregate.mode, battery_snapshot)
         mac_sleep_snapshot = self.read_mac_sleep_snapshot()
@@ -1686,7 +1690,15 @@ class StatusBarController(NSObject):
             self.virtual_status_device.hide()
             return None
         try:
-            target = write_led_program("off", device_path=device.target)
+            if device.remote_link is not None:
+                send_ios_program(
+                    device.remote_link,
+                    "off",
+                    data=remote_event_data(getattr(self, "last_battery_snapshot", None)),
+                )
+                target = f"linked phone {device.remote_link.link_id}"
+            else:
+                target = write_led_program("off", device_path=device.target)
         except Exception as exc:
             error = str(exc)
             self.device_errors[device.device_id] = error
@@ -2137,6 +2149,7 @@ class StatusBarController(NSObject):
             if (
                 device.connected
                 and device.device_id != VIRTUAL_DEVICE_ID
+                and device.remote_link is None
                 and device.display != LED_DISPLAY_CUSTOM
             )
         ]
@@ -2278,6 +2291,7 @@ class StatusBarController(NSObject):
                 if (
                     device.connected
                     and device.device_id != VIRTUAL_DEVICE_ID
+                    and device.remote_link is None
                     and device.display != LED_DISPLAY_CUSTOM
                 )
             ]
@@ -2486,6 +2500,7 @@ class StatusBarController(NSObject):
             controller.reset()
         for controller in self.battery_led_controllers_by_device.values():
             controller.reset()
+        self.remote_led_program_by_device.clear()
         self.last_led_display_kind_by_device.clear()
         self.last_led_error = None
 
@@ -2496,6 +2511,7 @@ class StatusBarController(NSObject):
         battery_controller = self.battery_led_controllers_by_device.get(device_id)
         if battery_controller is not None:
             battery_controller.reset()
+        self.remote_led_program_by_device.pop(device_id, None)
         self.last_led_display_kind_by_device.pop(device_id, None)
         self.device_errors.pop(device_id, None)
         self.last_led_error = None
@@ -2540,6 +2556,24 @@ class StatusBarController(NSObject):
                 reason=candidate.reason,
             )
 
+        for link in self.linked_phone_links():
+            device_id = linked_phone_device_id(link)
+            saved_display = self.settings.display_for_device(device_id)
+            entries_by_id[device_id] = StatusBarDevice(
+                device_id=device_id,
+                name=link.name,
+                root=Path(device_id),
+                target=Path(device_id),
+                connected=True,
+                display=(
+                    LED_DISPLAY_CUSTOM
+                    if saved_display == LED_DISPLAY_CUSTOM
+                    else LED_DISPLAY_AGENT
+                ),
+                reason=f"linked through {link.server}",
+                remote_link=link,
+            )
+
         for device in self.settings.devices:
             if device.device_id == VIRTUAL_DEVICE_ID:
                 if (
@@ -2556,6 +2590,8 @@ class StatusBarController(NSObject):
                         brightness=device.brightness,
                         reason="on-screen device",
                     )
+                continue
+            if device.device_id.startswith(LINKED_PHONE_DEVICE_PREFIX):
                 continue
             if device.device_id in entries_by_id:
                 continue
@@ -2586,23 +2622,6 @@ class StatusBarController(NSObject):
         except Exception as exc:
             log_status_bar(f"linked phone discovery error: {exc}")
             return ()
-
-    def observe_linked_phones(self) -> bool:
-        links = self.linked_phone_links()
-        signature = linked_phone_signature(links)
-        previous = self.last_linked_phone_signature
-        self.last_linked_phone_signature = signature
-        if previous is None or previous == signature:
-            return False
-        previous_ids = {entry[0] for entry in previous}
-        current_ids = {entry[0] for entry in signature}
-        linked_names = [link.name for link in links if link.link_id not in previous_ids]
-        unlinked_ids = sorted(previous_ids - current_ids)
-        if linked_names:
-            log_status_bar(f"phone linked: {', '.join(linked_names)}")
-        if unlinked_ids:
-            log_status_bar(f"phone unlinked: {', '.join(unlinked_ids)}")
-        return True
 
     def observe_connected_devices(self) -> bool:
         devices = self.status_bar_devices()
@@ -2638,7 +2657,7 @@ class StatusBarController(NSObject):
     def remember_connected_devices(self, devices: list[StatusBarDevice]) -> None:
         settings = self.settings
         for device in devices:
-            if not device.connected:
+            if not device.connected or device.remote_link is not None:
                 continue
             settings = settings.with_remembered_device(
                 device_id=device.device_id,
@@ -2787,6 +2806,53 @@ class StatusBarController(NSObject):
                 self.device_errors.pop(device.device_id, None)
                 continue
 
+            if device.remote_link is not None:
+                if device_display_kind == LED_DISPLAY_BATTERY and battery_snapshot is not None:
+                    program = program_for_battery(
+                        battery_snapshot,
+                        led_count=8,
+                        brightness=255,
+                    )
+                    label = f"{device.name} Battery {battery_snapshot.percent}%"
+                else:
+                    animation = self.settings.agent_animation(mode)
+                    try:
+                        program = program_for_agent_mode(
+                            mode,
+                            led_count=8,
+                            brightness=255,
+                            animation_style=animation.style,
+                            custom_program=animation.custom_program,
+                        )
+                    except DeviceWriteError as exc:
+                        active_errors[device.device_id] = str(exc)
+                        continue
+                    label = f"{device.name} {MODE_LABELS[mode]}"
+
+                if self.remote_led_program_by_device.get(device.device_id) == program:
+                    self.device_errors.pop(device.device_id, None)
+                    continue
+                try:
+                    send_ios_program(
+                        device.remote_link,
+                        program,
+                        data=remote_event_data(battery_snapshot),
+                    )
+                except Exception as exc:
+                    error = str(exc)
+                    active_errors[device.device_id] = error
+                    previous_error = self.device_errors.get(device.device_id)
+                    if error != previous_error:
+                        log_status_bar(f"linked phone error {device.name}: {error}")
+                    continue
+
+                self.remote_led_program_by_device[device.device_id] = program
+                self.device_errors.pop(device.device_id, None)
+                log_status_bar(
+                    f"leds={label} target=linked phone {device.remote_link.link_id}"
+                )
+                continue
+
             if device_display_kind == LED_DISPLAY_BATTERY and battery_snapshot is not None:
                 result = self.battery_controller_for_device(device).sync_snapshot(battery_snapshot)
                 label = (
@@ -2854,6 +2920,7 @@ class StatusBarController(NSObject):
             if (
                 device.connected
                 and device.device_id != VIRTUAL_DEVICE_ID
+                and device.remote_link is None
                 and device.display != LED_DISPLAY_CUSTOM
             )
         ]
@@ -2932,7 +2999,11 @@ class StatusBarController(NSObject):
         if not targets:
             targets = [
                 device.target for device in self.status_bar_devices()
-                if device.connected and device.device_id != VIRTUAL_DEVICE_ID
+                if (
+                    device.connected
+                    and device.device_id != VIRTUAL_DEVICE_ID
+                    and device.remote_link is None
+                )
             ]
         for target in targets:
             try:
@@ -3080,10 +3151,7 @@ class StatusBarController(NSObject):
         self.poll_devices_once()
 
     def poll_devices_once(self) -> None:
-        local_changed = self.observe_connected_devices()
-        observe_linked = getattr(self, "observe_linked_phones", None)
-        linked_changed = bool(observe_linked()) if callable(observe_linked) else False
-        if not local_changed and not linked_changed:
+        if not self.observe_connected_devices():
             return
         if self.last_snapshot is not None:
             self.refresh_(None)
@@ -3198,7 +3266,11 @@ class StatusBarController(NSObject):
         connected_targets = [
             device.target
             for device in self.status_bar_devices(remember=False)
-            if device.connected and device.device_id != VIRTUAL_DEVICE_ID
+            if (
+                device.connected
+                and device.device_id != VIRTUAL_DEVICE_ID
+                and device.remote_link is None
+            )
         ]
         if connected_targets:
             return connected_targets
@@ -3231,12 +3303,9 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
     menu.addItem_(NSMenuItem.separatorItem())
     menu.addItem_(disabled_menu_item("Devices"))
     devices = target.status_bar_devices()
-    linked_phones = linked_phone_links_for_target(target)
     for device in devices:
         menu.addItem_(build_device_menu_item(device, target))
-    for link in linked_phones:
-        menu.addItem_(build_linked_phone_menu_item(link))
-    if not devices and not linked_phones:
+    if not devices:
         menu.addItem_(disabled_menu_item("No devices"))
     if SCREEN_BAR_FEATURE_ENABLED and not target.settings.virtual_status_device_enabled:
         virtual_toggle = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -3307,15 +3376,16 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     agent.setState_(1 if device.display == LED_DISPLAY_AGENT else 0)
     submenu.addItem_(agent)
 
-    battery = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Battery Level",
-        "setDeviceDisplayBattery:",
-        "",
-    )
-    battery.setTarget_(target)
-    battery.setRepresentedObject_(device.device_id)
-    battery.setState_(1 if device.display == LED_DISPLAY_BATTERY else 0)
-    submenu.addItem_(battery)
+    if device.remote_link is None:
+        battery = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Battery Level",
+            "setDeviceDisplayBattery:",
+            "",
+        )
+        battery.setTarget_(target)
+        battery.setRepresentedObject_(device.device_id)
+        battery.setState_(1 if device.display == LED_DISPLAY_BATTERY else 0)
+        submenu.addItem_(battery)
 
     custom = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "Manual",
@@ -3327,10 +3397,16 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
     custom.setState_(1 if device.display == LED_DISPLAY_CUSTOM else 0)
     submenu.addItem_(custom)
 
-    if device.device_id != VIRTUAL_DEVICE_ID:
+    if device.device_id != VIRTUAL_DEVICE_ID and device.remote_link is None:
         submenu.addItem_(NSMenuItem.separatorItem())
         submenu.addItem_(disabled_menu_item(f"Brightness {brightness_percent(device.brightness)}%"))
         submenu.addItem_(build_brightness_slider_item(device, target))
+
+    if device.remote_link is not None:
+        submenu.addItem_(NSMenuItem.separatorItem())
+        submenu.addItem_(disabled_menu_item("Linked iPhone"))
+        submenu.addItem_(disabled_menu_item(f"ID {device.remote_link.link_id}"))
+        submenu.addItem_(disabled_menu_item(device.remote_link.server))
 
     if device.device_id == VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
@@ -3354,32 +3430,6 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
         remove.setRepresentedObject_(device.device_id)
         submenu.addItem_(remove)
 
-    item.setSubmenu_(submenu)
-    return item
-
-
-def linked_phone_links_for_target(target) -> tuple[IOSLink, ...]:
-    loader = getattr(target, "linked_phone_links", None)
-    if not callable(loader):
-        return ()
-    try:
-        return tuple(loader())
-    except Exception as exc:
-        log_status_bar(f"linked phone menu error: {exc}")
-        return ()
-
-
-def build_linked_phone_menu_item(link: IOSLink) -> NSMenuItem:
-    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(link.name, None, "")
-    item.setState_(1)
-    item.setToolTip_(f"Linked iPhone {link.link_id}")
-
-    submenu = NSMenu.alloc().init()
-    submenu.addItem_(disabled_menu_item("Linked iPhone"))
-    submenu.addItem_(disabled_menu_item(f"ID {link.link_id}"))
-    submenu.addItem_(disabled_menu_item(link.server))
-    submenu.addItem_(NSMenuItem.separatorItem())
-    submenu.addItem_(disabled_menu_item("Used by sidepulse push"))
     item.setSubmenu_(submenu)
     return item
 
@@ -5278,6 +5328,21 @@ def device_id_for_root(root: Path) -> str:
     return str(root.expanduser())
 
 
+def linked_phone_device_id(link: IOSLink) -> str:
+    return f"{LINKED_PHONE_DEVICE_PREFIX}{link.link_id}"
+
+
+def remote_event_data(snapshot: BatterySnapshot | None) -> dict[str, object]:
+    source: dict[str, object] = {"name": socket.gethostname()}
+    if snapshot is not None and snapshot.battery_present:
+        source["battery"] = {
+            "level": snapshot.percent,
+            "charging": snapshot.is_charging,
+            "plugged_in": snapshot.is_plugged,
+        }
+    return {"source": source}
+
+
 def device_connection_signature(
     devices: list[StatusBarDevice],
 ) -> tuple[tuple[str, str, str], ...]:
@@ -5286,18 +5351,16 @@ def device_connection_signature(
             (
                 device.device_id,
                 str(device.target),
-                device_mount_key(device.root),
+                (
+                    f"remote/{device.remote_link.name}:{device.remote_link.server}"
+                    if device.remote_link is not None
+                    else device_mount_key(device.root)
+                ),
             )
             for device in devices
             if device.connected
         )
     )
-
-
-def linked_phone_signature(
-    links: tuple[IOSLink, ...],
-) -> tuple[tuple[str, str, str], ...]:
-    return tuple(sorted((link.link_id, link.name, link.server) for link in links))
 
 
 def device_mount_key(root: Path) -> str:
@@ -5354,6 +5417,7 @@ def disambiguate_device_names(devices: list[StatusBarDevice]) -> list[StatusBarD
                 display=device.display,
                 brightness=device.brightness,
                 reason=device.reason,
+                remote_link=device.remote_link,
             )
         )
     return result

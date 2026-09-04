@@ -355,9 +355,12 @@ class MenuBuildTests(StatusBarTestCase):
             for index in range(item.submenu().numberOfItems())
             if item.submenu().itemAtIndex_(index).title()
         ]
+        self.assertIn("Agent Status", submenu_titles)
+        self.assertIn("Manual", submenu_titles)
+        self.assertNotIn("Battery Level", submenu_titles)
         self.assertIn("Linked iPhone", submenu_titles)
         self.assertIn("ID aaaaaaaaaaaa", submenu_titles)
-        self.assertIn("Used by sidepulse push", submenu_titles)
+        self.assertNotIn("Brightness 100%", submenu_titles)
 
     def test_recent_statuses_are_capped(self):
         """The menu must not grow unbounded with session count."""

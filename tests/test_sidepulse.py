@@ -1752,7 +1752,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(calls, [None])
 
-    def test_status_bar_poll_devices_refreshes_on_link_change(self) -> None:
+    def test_status_bar_poll_devices_refreshes_on_remote_device_change(self) -> None:
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1760,8 +1760,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         calls: list[object] = []
         target = SimpleNamespace(
-            observe_connected_devices=lambda: False,
-            observe_linked_phones=lambda: True,
+            observe_connected_devices=lambda: True,
             last_snapshot=object(),
             refresh_=lambda sender: calls.append(sender),
         )
@@ -1769,6 +1768,98 @@ class AgentMonitorTests(unittest.TestCase):
         status_bar.StatusBarController.poll_devices_once(target)
 
         self.assertEqual(calls, [None])
+
+    def test_status_bar_syncs_agent_status_to_linked_phone_once(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        link = status_bar.IOSLink("Peter's iPhone", "a" * 64)
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.linked_phone_device_id(link),
+            name=link.name,
+            root=Path("ios/aaaaaaaaaaaa"),
+            target=Path("ios/aaaaaaaaaaaa"),
+            connected=True,
+            display=status_bar.LED_DISPLAY_AGENT,
+            remote_link=link,
+        )
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            status_bar_devices=lambda remember=True: [device],
+            ensure_device_selection=lambda: None,
+            last_led_error=None,
+            device_errors={},
+            remote_led_program_by_device={},
+            last_led_display_kind_by_device={},
+            reset_led_controllers_for_device=lambda device_id: None,
+            active_led_display_kind_for_device=lambda item, battery: item.display,
+        )
+
+        with patch("sidepulse.status_bar.send_ios_program", return_value="OK") as send:
+            status_bar.StatusBarController.sync_leds_now(
+                fake,
+                AgentMode.WORKING,
+                None,
+                status_bar.LED_DISPLAY_AGENT,
+            )
+            status_bar.StatusBarController.sync_leds_now(
+                fake,
+                AgentMode.WORKING,
+                None,
+                status_bar.LED_DISPLAY_AGENT,
+            )
+
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], link)
+        self.assertIn("source", send.call_args.kwargs["data"])
+
+    def test_status_bar_syncs_battery_level_to_linked_phone(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        link = status_bar.IOSLink("Peter's iPhone", "b" * 64)
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.linked_phone_device_id(link),
+            name=link.name,
+            root=Path("ios/bbbbbbbbbbbb"),
+            target=Path("ios/bbbbbbbbbbbb"),
+            connected=True,
+            display=status_bar.LED_DISPLAY_BATTERY,
+            remote_link=link,
+        )
+        snapshot = BatterySnapshot(percent=57, is_plugged=False)
+        fake = SimpleNamespace(
+            settings=AgentMonitorSettings(),
+            status_bar_devices=lambda remember=True: [device],
+            ensure_device_selection=lambda: None,
+            last_led_error=None,
+            device_errors={},
+            remote_led_program_by_device={},
+            last_led_display_kind_by_device={},
+            reset_led_controllers_for_device=lambda device_id: None,
+            active_led_display_kind_for_device=lambda item, battery: item.display,
+        )
+
+        with patch("sidepulse.status_bar.send_ios_program", return_value="OK") as send:
+            status_bar.StatusBarController.sync_leds_now(
+                fake,
+                AgentMode.IDLE_READY,
+                snapshot,
+                status_bar.LED_DISPLAY_BATTERY,
+            )
+
+        self.assertEqual(
+            send.call_args.args[1],
+            status_bar.program_for_battery(snapshot, led_count=8, brightness=255),
+        )
+        self.assertEqual(
+            send.call_args.kwargs["data"]["source"]["battery"]["level"],
+            57,
+        )
 
     def test_status_bar_sync_skips_custom_device_display(self) -> None:
         try:
@@ -1857,6 +1948,39 @@ class AgentMonitorTests(unittest.TestCase):
         write.assert_called_once_with("off", device_path=device.target)
         self.assertEqual(fake.settings.display_for_device(device.device_id), LED_DISPLAY_CUSTOM)
         self.assertEqual(messages[-1], "SidePulse Dot: Manual, LEDs cleared.")
+
+    def test_status_bar_manual_linked_phone_clears_remote_leds(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        link = status_bar.IOSLink("Peter's iPhone", "c" * 64)
+        device = status_bar.StatusBarDevice(
+            device_id=status_bar.linked_phone_device_id(link),
+            name=link.name,
+            root=Path("ios/cccccccccccc"),
+            target=Path("ios/cccccccccccc"),
+            connected=True,
+            display=LED_DISPLAY_CUSTOM,
+            remote_link=link,
+        )
+        fake = SimpleNamespace(
+            last_battery_snapshot=BatterySnapshot(percent=49, is_plugged=False),
+            device_errors={},
+            last_led_error=None,
+        )
+
+        with patch("sidepulse.status_bar.send_ios_program", return_value="OK") as send:
+            error = status_bar.StatusBarController.clear_manual_device_display(fake, device)
+
+        self.assertIsNone(error)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[:2], (link, "off"))
+        self.assertEqual(
+            send.call_args.kwargs["data"]["source"]["battery"]["level"],
+            49,
+        )
 
     def test_status_bar_menu_has_sleep_prevention_title_and_policy_choices(self) -> None:
         try:
