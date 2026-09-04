@@ -28,10 +28,17 @@ Choose the level that fits how you want to use SidePulse.
 curl -fsSL https://sidepulse.io/setup.sh | bash
 ```
 
-The [setup script](scripts/setup.sh) creates an isolated environment under
+The command works on macOS and Linux with Python 3.10 or newer. The
+[setup script](scripts/setup.sh) creates an isolated environment under
 `~/.local/share/sidepulse/venv`, installs SidePulse from GitHub, links the CLI
-at `~/.local/bin/sidepulse`, and runs `sidepulse setup`. Run the same command
-again to upgrade to the newest version.
+at `~/.local/bin/sidepulse`, and runs `sidepulse setup`. On macOS, setup also
+installs the menu-bar app and hardware helpers. On Linux, it automatically
+uses CLI-only mode for mounted SidePulse devices and iPhone linking/push. Run
+the same command again to upgrade to the newest version.
+
+Linux setup installs the CLI and agent hooks, but not an always-running relay
+service yet. Local writes and iPhone pushes work immediately. For continuous
+local agent-status mirroring, keep `sidepulse agent-monitor leds` running.
 
 ### 2. Install into your own Python environment
 
@@ -94,13 +101,17 @@ printf 'off\n#ff3a00 pulse\nrepeat' | sidepulse write
 sidepulse push - --title "Deploying" < deploy.LED
 ```
 
-The CLI auto-detects mounted devices under `/Volumes` by looking for a
-SidePulse Pro/SidePulse Dot-style volume name or an existing `LEDS.LED`. For a
-specific local path, the existing `--device` option remains available:
+The CLI auto-detects mounted devices by looking for a SidePulse Pro/SidePulse
+Dot-style volume name or an existing `LEDS.LED`. It checks `/Volumes` on macOS
+and common removable-media locations such as `/media/$USER`,
+`/run/media/$USER`, and `/mnt` on Linux. For a specific local path, the
+existing `--device` option remains available:
 
 ```sh
 sidepulse write "off\n#ff3a00 1.6s pulse\nrepeat" --device /Volumes/SidePulsePro
 sidepulse write "off" --device /Volumes/SidePulsePro/LEDS.LED
+# Linux example:
+sidepulse write "off" --device /media/$USER/SidePulseDot
 ```
 
 The writer decodes simple escapes such as `\n`, then enforces the controller's
@@ -156,7 +167,7 @@ sidepulse battery configure --full-watts auto
 sidepulse battery configure --show-on-power-change yes --power-change-preview-seconds 7
 ```
 
-## sidepulse
+## macOS companion app
 
 `sidepulse` includes a companion menu-bar app for macOS that controls
 SidePulse Pro and SidePulse Dot.

@@ -43,6 +43,7 @@ from sidepulse.collector import (
 from sidepulse.cli import build_parser, visible_watch_statuses
 from sidepulse.device_writer import (
     DeviceWriteError,
+    default_mount_roots,
     discover_devices,
     normalize_led_text,
     validate_led_text,
@@ -3881,6 +3882,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         with (
+            patch.object(cli_module.sys, "platform", "darwin"),
             patch.object(cli_module, "install_codex_hooks", return_value=codex_result) as codex,
             patch.object(cli_module, "install_claude_hooks", return_value=claude_result) as claude,
             patch.object(
@@ -3930,6 +3932,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         with (
+            patch.object(cli_module.sys, "platform", "darwin"),
             patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
@@ -3942,6 +3945,33 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(result, 0)
         guard.assert_called_once_with(scope="user", dry_run=False)
         launch.assert_not_called()
+
+    def test_sidepulse_setup_is_cli_only_on_linux(self) -> None:
+        parser = cli_module.build_sidepulse_parser()
+        args = parser.parse_args(["setup"])
+        hook_result = SimpleNamespace(
+            provider="codex",
+            config_path=Path("/tmp/codex.toml"),
+            log_path=Path("/tmp/codex.jsonl"),
+            changed=False,
+            backup_path=None,
+        )
+
+        with (
+            patch.object(cli_module.sys, "platform", "linux"),
+            patch.object(cli_module, "install_hook_results", return_value=[hook_result]),
+            patch("sidepulse.sd_eject_guard_launch.install_sd_eject_guard") as guard,
+            patch("sidepulse.status_bar_launch.install_launch_agent") as launch,
+            patch("builtins.print") as output,
+        ):
+            result = cli_module.cmd_sidepulse_setup(args)
+
+        self.assertEqual(result, 0)
+        guard.assert_not_called()
+        launch.assert_not_called()
+        rendered = "\n".join(" ".join(map(str, call.args)) for call in output.call_args_list)
+        self.assertIn("CLI-only setup", rendered)
+        self.assertIn("linked phones and mounted SidePulse devices", rendered)
 
     def test_sidepulse_write_decodes_escaped_newlines_and_writes_leds_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3982,6 +4012,36 @@ class AgentMonitorTests(unittest.TestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].root, device)
             self.assertEqual(candidates[0].target, device / "LEDS.LED")
+
+    def test_linux_mount_roots_cover_common_desktop_locations(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SIDEPULSE_MOUNT_ROOTS", None)
+            roots = default_mount_roots(
+                platform="linux",
+                home=Path("/home/alice"),
+            )
+
+        self.assertIn(Path("/media/alice"), roots)
+        self.assertIn(Path("/run/media/alice"), roots)
+        self.assertIn(Path("/mnt"), roots)
+
+    def test_sidepulse_discovers_dot_across_default_mount_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = base / "media"
+            second = base / "run-media"
+            first.mkdir()
+            second.mkdir()
+            device = second / "SidePulseDot"
+            device.mkdir()
+
+            with patch(
+                "sidepulse.device_writer.default_mount_roots",
+                return_value=(first, second),
+            ):
+                candidates = discover_devices()
+
+        self.assertEqual([candidate.root for candidate in candidates], [device])
 
     def test_sidepulse_write_prefers_leds_led_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -112,7 +112,7 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     )
     setup = subparsers.add_parser(
         "setup",
-        help="Install agent hooks and start the macOS status-bar app.",
+        help="Install agent hooks and, on macOS, start the status-bar app.",
     )
     setup.add_argument(
         "provider",
@@ -295,7 +295,7 @@ def add_sidepulse_battery_parser(subparsers: argparse._SubParsersAction) -> None
     leds.add_argument(
         "--device",
         type=Path,
-        help="Mounted device folder or LED program file path. Defaults to auto-detecting /Volumes.",
+        help="Mounted device folder or LED program file path. Defaults to auto-detection.",
     )
     leds.add_argument(
         "--file-name",
@@ -939,6 +939,11 @@ def cmd_sidepulse_sdejectguard_logs(args: argparse.Namespace) -> int:
 def cmd_sidepulse_setup(args: argparse.Namespace) -> int:
     results = install_hook_results(args)
     print_install_results(results, dry_run=args.dry_run)
+
+    if sys.platform != "darwin":
+        print("macOS integrations: skipped (CLI-only setup on this platform)")
+        print("sidepulse: ready for linked phones and mounted SidePulse devices")
+        return 0
 
     from .sd_eject_guard_launch import SD_EJECT_GUARD_DISPLAY_NAME, SdEjectGuardInstallError, install_sd_eject_guard
 
