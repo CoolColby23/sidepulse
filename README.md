@@ -133,7 +133,7 @@ LED program and event metadata. Remote payloads also include the sending
 computer's name and available battery state. Set `SIDEPULSE_SERVER` to use
 another bridge origin.
 
-### Link a remote VM or computer
+### Link a remote VM or computer (WIP)
 
 The receiving Mac gets a persistent, random relay channel during setup. Run
 `sidepulse link` on the Mac to see the short command for another computer, then
