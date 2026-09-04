@@ -23,7 +23,8 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 if os.uname().sysname != "Darwin":  # pragma: no cover
     raise unittest.SkipTest("status-bar UI tests require macOS")
@@ -72,6 +73,7 @@ from sidepulse import status_bar as sb  # noqa: E402
 from sidepulse import virtual_device as vd  # noqa: E402
 from sidepulse.collector import MonitorSnapshot, SourceSpec  # noqa: E402
 from sidepulse.models import AgentMode, AgentStatus, AggregateStatus  # noqa: E402
+from sidepulse.settings import AgentMonitorSettings  # noqa: E402
 
 
 # A selector literal: camelCase identifier ending in a single colon.
@@ -360,7 +362,44 @@ class MenuBuildTests(StatusBarTestCase):
         self.assertNotIn("Battery Level", submenu_titles)
         self.assertIn("Linked iPhone", submenu_titles)
         self.assertIn("ID aaaaaaaaaaaa", submenu_titles)
+        self.assertIn("Remove iPhone...", submenu_titles)
         self.assertNotIn("Brightness 100%", submenu_titles)
+
+    def test_remove_linked_iphone_requires_confirmation_and_deletes_link(self):
+        link = sb.IOSLink("Peter's iPhone", "a" * 64)
+        target = SimpleNamespace(
+            linked_phone_links=lambda: (link,),
+            settings=AgentMonitorSettings(),
+            set_settings_message=Mock(),
+            reset_led_controllers_for_device=Mock(),
+            refresh_settings_window=Mock(),
+            refresh_=Mock(),
+        )
+        with (
+            patch("sidepulse.status_bar.confirm_linked_phone_removal", return_value=True),
+            patch("sidepulse.status_bar.remove_ios_link", return_value=link) as remove_link,
+            patch("sidepulse.status_bar.save_settings"),
+        ):
+            sb.StatusBarController.remove_linked_phone(target, link.token)
+
+        remove_link.assert_called_once_with(link.token)
+        target.reset_led_controllers_for_device.assert_called_once_with(
+            sb.linked_phone_device_id(link)
+        )
+        target.refresh_.assert_called_once_with(None)
+
+    def test_remove_linked_iphone_cancel_keeps_link(self):
+        link = sb.IOSLink("Peter's iPhone", "a" * 64)
+        target = SimpleNamespace(
+            linked_phone_links=lambda: (link,),
+        )
+        with (
+            patch("sidepulse.status_bar.confirm_linked_phone_removal", return_value=False),
+            patch("sidepulse.status_bar.remove_ios_link") as remove_link,
+        ):
+            sb.StatusBarController.remove_linked_phone(target, link.token)
+
+        remove_link.assert_not_called()
 
     def test_recent_statuses_are_capped(self):
         """The menu must not grow unbounded with session count."""

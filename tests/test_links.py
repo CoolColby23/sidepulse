@@ -26,6 +26,7 @@ from sidepulse.links import (  # noqa: E402
     pairing_url,
     parse_ios_registration,
     render_terminal_qr,
+    remove_ios_link,
     save_ios_links,
     send_ios_program,
     store_ios_link,
@@ -59,6 +60,18 @@ class LinkStorageTests(unittest.TestCase):
             stored = store_ios_link(IOSLink("New name", TOKEN_A), path)
             self.assertEqual(len(stored), 1)
             self.assertEqual(stored[0].name, "New name")
+
+    def test_remove_ios_link_removes_only_matching_phone(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "links.json"
+            first = IOSLink("Phone A", TOKEN_A)
+            second = IOSLink("Phone B", TOKEN_B)
+            save_ios_links((first, second), path)
+
+            removed = remove_ios_link(TOKEN_A, path)
+
+            self.assertEqual(removed, first)
+            self.assertEqual(load_ios_links(path), (second,))
 
     def test_pairing_channel_is_an_eleven_character_base64url_secret(self) -> None:
         channels = {new_pairing_channel() for _ in range(100)}

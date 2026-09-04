@@ -145,6 +145,16 @@ def store_ios_link(link: IOSLink, path: Path | None = None) -> tuple[IOSLink, ..
     return tuple(updated)
 
 
+def remove_ios_link(token: str, path: Path | None = None) -> IOSLink | None:
+    """Remove the phone matching *token* and return the removed link."""
+    current = load_ios_links(path)
+    removed = next((link for link in current if link.token == token), None)
+    if removed is None:
+        return None
+    save_ios_links((link for link in current if link.token != token), path)
+    return removed
+
+
 def new_pairing_channel() -> str:
     return secrets.token_urlsafe(8)
 

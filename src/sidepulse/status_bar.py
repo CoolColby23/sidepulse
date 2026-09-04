@@ -16,6 +16,8 @@ try:
         NSApp,
         NSApplication,
         NSApplicationActivationPolicyAccessory,
+        NSAlert,
+        NSAlertFirstButtonReturn,
         NSBackingStoreBuffered,
         NSBezierPath,
         NSBezelStyleRounded,
@@ -113,7 +115,7 @@ from .led_status import (
     program_for_agent_mode,
     write_mode_to_leds,
 )
-from .links import IOSLink, load_ios_links, send_ios_program
+from .links import IOSLink, load_ios_links, remove_ios_link, send_ios_program
 from .virtual_device import (
     FRAME_INTERVAL,
     VIRTUAL_DEVICE_ID,
@@ -1028,6 +1030,10 @@ class StatusBarController(NSObject):
         self.remove_remembered_device(sender.representedObject())
 
     @objc.IBAction
+    def removeLinkedPhone_(self, sender):
+        self.remove_linked_phone(sender.representedObject())
+
+    @objc.IBAction
     def quit_(self, _sender):
         self.closed_lid_awake.release()
         self.keep_awake.release()
@@ -1892,6 +1898,38 @@ class StatusBarController(NSObject):
 
         self.reset_led_controllers_for_device(str(device_id))
         self.set_settings_message(f"{device.name if device else device_id}: removed.")
+        self.refresh_settings_window()
+        self.refresh_(None)
+
+    def remove_linked_phone(self, token: str | None) -> None:
+        if not token:
+            return
+        link = next(
+            (entry for entry in self.linked_phone_links() if entry.token == str(token)),
+            None,
+        )
+        if link is None:
+            self.set_settings_message("That iPhone is no longer linked.")
+            self.refresh_(None)
+            return
+        if not confirm_linked_phone_removal(link.name):
+            return
+
+        device_id = linked_phone_device_id(link)
+        try:
+            removed = remove_ios_link(link.token)
+            if removed is None:
+                self.set_settings_message("That iPhone is no longer linked.")
+            else:
+                self.settings = self.settings.without_device(device_id)
+                save_settings(self.settings)
+                self.set_settings_message(f"{link.name}: unlinked.")
+        except Exception as exc:
+            self.set_settings_message(f"Could not remove {link.name}: {exc}")
+            self.settings = load_settings()
+            return
+
+        self.reset_led_controllers_for_device(device_id)
         self.refresh_settings_window()
         self.refresh_(None)
 
@@ -3407,6 +3445,14 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
         submenu.addItem_(disabled_menu_item("Linked iPhone"))
         submenu.addItem_(disabled_menu_item(f"ID {device.remote_link.link_id}"))
         submenu.addItem_(disabled_menu_item(device.remote_link.server))
+        remove_phone = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Remove iPhone...",
+            "removeLinkedPhone:",
+            "",
+        )
+        remove_phone.setTarget_(target)
+        remove_phone.setRepresentedObject_(device.remote_link.token)
+        submenu.addItem_(remove_phone)
 
     if device.device_id == VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
@@ -3533,6 +3579,18 @@ def build_setup_window(target: StatusBarController) -> NSWindow:
         "sleep_helper": sleep_helper,
     }
     return window
+
+
+def confirm_linked_phone_removal(name: str) -> bool:
+    alert = NSAlert.alloc().init()
+    alert.setMessageText_(f"Remove {name}?")
+    alert.setInformativeText_(
+        "This Mac will stop sending SidePulse updates to this iPhone. "
+        "You can link it again later."
+    )
+    alert.addButtonWithTitle_("Remove")
+    alert.addButtonWithTitle_("Cancel")
+    return alert.runModal() == NSAlertFirstButtonReturn
 
 
 def choose_debug_export_path(format_name: str) -> Path | None:
