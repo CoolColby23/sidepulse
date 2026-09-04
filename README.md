@@ -201,7 +201,7 @@ SidePulse Pro and SidePulse Dot.
 
 #### AI Agent Monitoring
 
-SidePulse can monitor AI agents such as Codex, Claude, and Grok through hooks, then
+SidePulse can monitor AI agents such as Codex, Claude, Grok, Cursor, and Junie through hooks, then
 translate the current agent state into a small, glanceable LED status.
 
 Agent status modes:
@@ -228,7 +228,7 @@ that depend on the hardware layout have only `-2.LED` and `-8.LED` variants.
 Custom programs are stored in the `animations/` folder beside `settings.json`.
 An animation may set its own `brightness`, which is multiplied by the device's
 brightness setting so the device setting remains the overall limit. The tab shows a
-live Screen Bar-rendered preview for every state;
+live SidePulse Notch-rendered preview for every state;
 **Show** sends that pattern to connected agent-display devices for three
 seconds, then restores live status. **Current** appears whenever individual
 state selections no longer match one of the built-in or saved profiles.
@@ -356,11 +356,11 @@ Set up this Mac explicitly after package install:
 sidepulse setup
 ```
 
-`sidepulse setup` installs or refreshes Codex, Claude, and Grok hooks, installs
-SidePulse Pro Eject Prevention, writes the status-bar LaunchAgent, starts both helpers
-immediately, and enables them at login. This is intentionally an explicit
-command instead of a `pip install` side effect. To set up only one provider, use
-`sidepulse setup codex`, `sidepulse setup claude`, or `sidepulse setup grok`.
+`sidepulse setup` installs or refreshes all supported agent hooks, including
+Junie CLI, installs SidePulse Pro Eject Prevention, writes the status-bar
+LaunchAgent, starts both helpers immediately, and enables them at login. This is
+intentionally an explicit command instead of a `pip install` side effect. To set
+up only one provider, pass its name, for example `sidepulse setup junie`.
 To skip the status-bar app but still install hooks and SidePulse Pro Eject Prevention, use
 `sidepulse setup --no-status-bar`.
 
@@ -417,6 +417,8 @@ sidepulse agent-monitor install
 sidepulse agent-monitor install codex
 sidepulse agent-monitor install claude
 sidepulse agent-monitor install grok
+sidepulse agent-monitor install cursor
+sidepulse agent-monitor install junie
 ```
 
 Each hook invokes a small, standard-library-only Python entry point. It writes
@@ -483,7 +485,7 @@ Codex `PermissionRequest` events are treated as Ask and remain sticky until the
 matching tool command finishes. This prevents unrelated same-session activity
 from hiding an approval prompt that is still waiting on the user.
 
-For Codex, Claude, or Grok projects that should report this reliably, add
+For Codex, Claude, Grok, Cursor, or Junie projects that should report this reliably, add
 guidance like this to the relevant agent instructions:
 
 ```text
@@ -518,6 +520,8 @@ sidepulse agent-monitor uninstall
 sidepulse agent-monitor uninstall codex
 sidepulse agent-monitor uninstall claude
 sidepulse agent-monitor uninstall grok
+sidepulse agent-monitor uninstall cursor
+sidepulse agent-monitor uninstall junie
 ```
 
 Install and start the macOS status-bar app:
@@ -568,22 +572,29 @@ battery status. When agent status is selected, `Show Battery on Plug/Unplug`
 can briefly show the battery animation for seven seconds after the power source
 changes.
 
-The Devices section also offers **Add Screen Bar**, an optional virtual
+The Devices section also offers **Add SidePulse Notch**, an optional virtual
 eight-LED device. It appears as a notch-shaped status-bar overlay that covers
 the camera island/notch footprint and adds a straight 5 px LED band along the
 bottom edge, or the corresponding top-center position on a display without a
 notch. Each virtual LED blends across a three-LED footprint: centered on the
 target LED, fading one LED width left and right. It shares the physical
 device's status animations, display-mode selection, and per-device brightness
-control. The Screen Bar evaluates the same `LEDS.LED` programs with the
+control. SidePulse Notch evaluates the same `LEDS.LED` programs with the
 firmware/websim `sdled.wasm` engine, then AppKit only draws the returned RGB
 frames.
 
 Open `Settings...` from the dropdown to manage agent integrations. The settings
-window can install or uninstall Codex, Claude, and Grok hooks. The transcript
+window can install or uninstall Codex, Claude, Grok, and Junie hooks. The transcript
 checkboxes control the file-based CLI/debug fallback; the status-bar app gets
 live updates from the local hook event socket. Settings are stored at
 `${XDG_CONFIG_HOME:-~/.config}/sidepulse/agent-monitor/settings.json`.
+
+Junie support uses its user-level `~/.junie/config.json` hooks. Junie currently
+emits hooks from its interactive and batch CLI hosts, including CLI sessions
+connected to a JetBrains IDE; Junie hosted directly through IDE/ACP does not yet
+emit hooks. SidePulse intentionally does not register a Junie `PermissionRequest`
+hook because a successful observer hook would automatically approve the requested
+action. Junie's normal approval prompts therefore remain unchanged.
 
 Settings can export the hook decision log as CSV or HTML. This log lives at
 `${XDG_STATE_HOME:-~/.local/state}/sidepulse/agent-monitor/event-status.jsonl`

@@ -915,7 +915,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertGreater(image.size().width, 38)
         self.assertEqual(image.size().height, 18)
 
-    def test_virtual_screen_bar_frame_covers_notch_plus_led_band(self) -> None:
+    def test_virtual_sidepulse_notch_frame_covers_notch_plus_led_band(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -946,7 +946,7 @@ class AgentMonitorTests(unittest.TestCase):
             ((0.0, 0.0), (232.0, 5.0)),
         )
 
-    def test_virtual_screen_bar_on_notchless_display_is_led_band_only(self) -> None:
+    def test_virtual_sidepulse_notch_on_notchless_display_is_led_band_only(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -974,7 +974,7 @@ class AgentMonitorTests(unittest.TestCase):
             ((850.0, 1075.0), (220.0, 5.0)),
         )
 
-    def test_virtual_screen_bar_redraws_at_60fps(self) -> None:
+    def test_virtual_sidepulse_notch_redraws_at_60fps(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -1076,7 +1076,7 @@ class AgentMonitorTests(unittest.TestCase):
         )
         self.assertEqual(controller.step(1320), [black] * 8)
 
-    def test_virtual_screen_bar_led_blend_spans_three_leds(self) -> None:
+    def test_virtual_sidepulse_notch_led_blend_spans_three_leds(self) -> None:
         try:
             from sidepulse import virtual_device
         except (ImportError, SystemExit) as exc:
@@ -1638,7 +1638,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertEqual(by_title["Manual"].state(), 1)
 
-    def test_status_bar_screen_bar_remove_lives_in_screen_bar_submenu(self) -> None:
+    def test_status_bar_sidepulse_notch_remove_lives_in_sidepulse_notch_submenu(self) -> None:
         try:
             from sidepulse import status_bar
         except SystemExit as exc:
@@ -1646,7 +1646,7 @@ class AgentMonitorTests(unittest.TestCase):
 
         device = status_bar.StatusBarDevice(
             device_id=status_bar.VIRTUAL_DEVICE_ID,
-            name="Screen Bar",
+            name=status_bar.VIRTUAL_DEVICE_NAME,
             root=Path(status_bar.VIRTUAL_DEVICE_ID),
             target=Path(status_bar.VIRTUAL_DEVICE_ID),
             connected=True,
@@ -1664,17 +1664,18 @@ class AgentMonitorTests(unittest.TestCase):
         )
 
         menu = status_bar.build_menu(snapshot, status_bar.STATE_IDLE, target)
+        self.assertEqual(status_bar.VIRTUAL_DEVICE_NAME, "SidePulse Notch")
         titles = [
             menu.itemAtIndex_(index).title()
             for index in range(menu.numberOfItems())
             if menu.itemAtIndex_(index).title()
         ]
-        screen_bar_item = next(
+        sidepulse_notch_item = next(
             menu.itemAtIndex_(index)
             for index in range(menu.numberOfItems())
-            if menu.itemAtIndex_(index).title() == "Screen Bar"
+            if menu.itemAtIndex_(index).title() == "SidePulse Notch"
         )
-        submenu = screen_bar_item.submenu()
+        submenu = sidepulse_notch_item.submenu()
         submenu_titles = [
             submenu.itemAtIndex_(index).title()
             for index in range(submenu.numberOfItems())
@@ -1686,8 +1687,8 @@ class AgentMonitorTests(unittest.TestCase):
             if submenu.itemAtIndex_(index).view() is not None
         )
 
-        self.assertNotIn("Remove Screen Bar", titles)
-        self.assertIn("Remove Screen Bar", submenu_titles)
+        self.assertNotIn("Remove SidePulse Notch", titles)
+        self.assertIn("Remove SidePulse Notch", submenu_titles)
         self.assertNotIn("Brightness 100%", submenu_titles)
         self.assertEqual(submenu_view_count, 0)
 
@@ -1700,7 +1701,7 @@ class AgentMonitorTests(unittest.TestCase):
             if menu.itemAtIndex_(index).title()
         ]
 
-        self.assertIn("Add Screen Bar", titles)
+        self.assertIn("Add SidePulse Notch", titles)
 
     def test_status_bar_observe_connected_device_resets_on_new_mount(self) -> None:
         try:
@@ -3864,6 +3865,13 @@ class AgentMonitorTests(unittest.TestCase):
             changed=True,
             backup_path=None,
         )
+        junie_result = SimpleNamespace(
+            provider="junie",
+            config_path=Path("/tmp/junie-config.json"),
+            log_path=Path("/tmp/junie.jsonl"),
+            changed=True,
+            backup_path=None,
+        )
         launch_result = SimpleNamespace(
             plist_path=Path("/tmp/io.sidepulse.agentstatus.plist"),
             changed=True,
@@ -3902,6 +3910,7 @@ class AgentMonitorTests(unittest.TestCase):
                 return_value=cursor_result,
             ) as cursor,
             patch.object(cli_module, "install_grok_hooks", return_value=grok_result) as grok,
+            patch.object(cli_module, "install_junie_hooks", return_value=junie_result) as junie,
             patch(
                 "sidepulse.sd_eject_guard_launch.install_sd_eject_guard",
                 return_value=guard_result,
@@ -3918,6 +3927,7 @@ class AgentMonitorTests(unittest.TestCase):
         claude.assert_called_once()
         cursor.assert_called_once()
         grok.assert_called_once()
+        junie.assert_called_once()
         guard.assert_called_once_with(scope="auto", dry_run=False)
         launch.assert_called_once_with(start=True)
         service.assert_called_once_with(start=True, dry_run=False)
@@ -5825,6 +5835,7 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertIn("codex", providers)
         self.assertIn("claude", providers)
         self.assertIn("grok", providers)
+        self.assertIn("junie", providers)
         self.assertNotIn("codex-transcripts", providers)
         self.assertNotIn("claude-transcripts", providers)
 

@@ -439,6 +439,24 @@ class WindowBuildTests(StatusBarTestCase):
         self.assertIsNotNone(window)
         self.assertTrue(window.title())
         self.assertEqual(window.contentView().frame().size.height, 560)
+        self.assertIn("cursor_hook_status", self.controller.settings_fields)
+        aligned_fields = (
+            "codex_hook_status",
+            "claude_hook_status",
+            "grok_hook_status",
+            "cursor_hook_status",
+            "junie_hook_status",
+            "codex_session_opener",
+            "claude_session_opener",
+            "grok_session_opener",
+        )
+        self.assertEqual(
+            {
+                self.controller.settings_fields[name].frame().origin.x
+                for name in aligned_fields
+            },
+            {130.0},
+        )
         self.assert_controls_are_wired(window)
 
     def test_settings_window_resizes_for_compact_animations_tab(self):

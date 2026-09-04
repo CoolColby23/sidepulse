@@ -101,10 +101,14 @@ from .ipc import HookEventServer, default_event_socket_path, default_latest_stat
 from .install import (
     install_claude_hooks,
     install_codex_hooks,
+    install_cursor_hooks,
     install_grok_hooks,
+    install_junie_hooks,
     uninstall_claude_hooks,
     uninstall_codex_hooks,
+    uninstall_cursor_hooks,
     uninstall_grok_hooks,
+    uninstall_junie_hooks,
 )
 from .led_status import (
     AgentLedController,
@@ -137,7 +141,9 @@ from .providers import (
     ProviderConfig,
     detect_claude_config,
     detect_codex_config,
+    detect_cursor_config,
     detect_grok_config,
+    detect_junie_config,
     default_state_dir,
     parse_log_line,
 )
@@ -271,7 +277,7 @@ class AnimationProgramTextView(NSTextView):
 
 
 class AgentAnimationMenuItemView(NSView):
-    """Interactive menu row with a Screen Bar-rendered animation preview."""
+    """Interactive menu row with a SidePulse Notch-rendered animation preview."""
 
     def initWithFrame_(self, frame):
         self = objc.super(AgentAnimationMenuItemView, self).initWithFrame_(frame)
@@ -351,7 +357,7 @@ STATUS_BAR_KEEPALIVE_VOLUME_NAMES = (
 STATUS_BAR_REFRESH_SECONDS = 15.0
 STATUS_BAR_DEVICE_POLL_SECONDS = 2.0
 STATUS_BAR_SESSION_HISTORY_LIMIT = 10
-SCREEN_BAR_FEATURE_ENABLED = True
+SIDEPULSE_NOTCH_FEATURE_ENABLED = True
 STATUS_BAR_MAX_LINES_PER_SOURCE = 500
 SETTINGS_WINDOW_WIDTH = 680
 SETTINGS_WINDOW_HEIGHT = 560
@@ -637,7 +643,7 @@ class StatusBarController(NSObject):
             True,
         )
         self.show_setup_window_if_needed()
-        if SCREEN_BAR_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
+        if SIDEPULSE_NOTCH_FEATURE_ENABLED and self.settings.virtual_status_device_enabled:
             self.virtual_status_device.show()
         else:
             self.virtual_status_device.hide()
@@ -873,6 +879,22 @@ class StatusBarController(NSObject):
         self.update_hooks("grok", install=False)
 
     @objc.IBAction
+    def installCursorHooks_(self, _sender):
+        self.update_hooks("cursor", install=True)
+
+    @objc.IBAction
+    def uninstallCursorHooks_(self, _sender):
+        self.update_hooks("cursor", install=False)
+
+    @objc.IBAction
+    def installJunieHooks_(self, _sender):
+        self.update_hooks("junie", install=True)
+
+    @objc.IBAction
+    def uninstallJunieHooks_(self, _sender):
+        self.update_hooks("junie", install=False)
+
+    @objc.IBAction
     def toggleCodexTranscripts_(self, sender):
         self.set_transcript_monitoring("codex", sender.state() == NSOnState)
 
@@ -996,7 +1018,7 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def toggleVirtualStatusDevice_(self, _sender):
-        if not SCREEN_BAR_FEATURE_ENABLED:
+        if not SIDEPULSE_NOTCH_FEATURE_ENABLED:
             self.set_virtual_status_device(False)
             return
         self.set_virtual_status_device(not self.settings.virtual_status_device_enabled)
@@ -1342,6 +1364,8 @@ class StatusBarController(NSObject):
         codex = detect_codex_config()
         claude = detect_claude_config()
         grok = detect_grok_config()
+        cursor = detect_cursor_config()
+        junie = detect_junie_config()
         set_field_value(
             self.settings_fields.get("codex_hook_status"),
             hook_status_text(codex),
@@ -1353,6 +1377,14 @@ class StatusBarController(NSObject):
         set_field_value(
             self.settings_fields.get("grok_hook_status"),
             hook_status_text(grok),
+        )
+        set_field_value(
+            self.settings_fields.get("cursor_hook_status"),
+            hook_status_text(cursor),
+        )
+        set_field_value(
+            self.settings_fields.get("junie_hook_status"),
+            hook_status_text(junie),
         )
         set_field_value(
             self.settings_fields.get("settings_path"),
@@ -1558,10 +1590,20 @@ class StatusBarController(NSObject):
                 result = install_claude_hooks()
             elif provider == "claude":
                 result = uninstall_claude_hooks()
-            elif install:
+            elif provider == "grok" and install:
                 result = install_grok_hooks()
-            else:
+            elif provider == "grok":
                 result = uninstall_grok_hooks()
+            elif provider == "cursor" and install:
+                result = install_cursor_hooks()
+            elif provider == "cursor":
+                result = uninstall_cursor_hooks()
+            elif provider == "junie" and install:
+                result = install_junie_hooks()
+            elif provider == "junie":
+                result = uninstall_junie_hooks()
+            else:
+                raise ValueError(f"Unsupported hook provider: {provider}")
         except Exception as exc:
             self.set_settings_message(f"{provider.title()} hooks failed: {exc}")
             self.refresh_settings_window()
@@ -1755,15 +1797,15 @@ class StatusBarController(NSObject):
             )
 
     def set_virtual_status_device(self, enabled: bool) -> None:
-        if not SCREEN_BAR_FEATURE_ENABLED:
+        if not SIDEPULSE_NOTCH_FEATURE_ENABLED:
             try:
                 self.settings = self.settings.with_virtual_status_device(False)
                 save_settings(self.settings)
             except Exception as exc:
-                self.set_settings_message(f"Could not disable Screen Bar: {exc}")
+                self.set_settings_message(f"Could not disable SidePulse Notch: {exc}")
                 return
             self.virtual_status_device.hide()
-            self.set_settings_message("Screen Bar is disabled for now.")
+            self.set_settings_message("SidePulse Notch is disabled for now.")
             self.refresh_(None)
             return
 
@@ -1777,7 +1819,7 @@ class StatusBarController(NSObject):
                 )
             save_settings(self.settings)
         except Exception as exc:
-            self.set_settings_message(f"Could not save Screen Bar: {exc}")
+            self.set_settings_message(f"Could not save SidePulse Notch: {exc}")
             return
         if enabled:
             self.virtual_status_device.show()
@@ -2615,7 +2657,7 @@ class StatusBarController(NSObject):
         for device in self.settings.devices:
             if device.device_id == VIRTUAL_DEVICE_ID:
                 if (
-                    SCREEN_BAR_FEATURE_ENABLED
+                    SIDEPULSE_NOTCH_FEATURE_ENABLED
                     and self.settings.virtual_status_device_enabled
                 ):
                     entries_by_id[device.device_id] = StatusBarDevice(
@@ -2757,7 +2799,7 @@ class StatusBarController(NSObject):
         mode: AgentMode,
         battery_snapshot: BatterySnapshot | None,
     ) -> None:
-        if not SCREEN_BAR_FEATURE_ENABLED:
+        if not SIDEPULSE_NOTCH_FEATURE_ENABLED:
             self.virtual_status_device.hide()
             return
         if not self.settings.virtual_status_device_enabled:
@@ -3345,9 +3387,9 @@ def build_menu(snapshot, state: StatusBarState, target: StatusBarController) -> 
         menu.addItem_(build_device_menu_item(device, target))
     if not devices:
         menu.addItem_(disabled_menu_item("No devices"))
-    if SCREEN_BAR_FEATURE_ENABLED and not target.settings.virtual_status_device_enabled:
+    if SIDEPULSE_NOTCH_FEATURE_ENABLED and not target.settings.virtual_status_device_enabled:
         virtual_toggle = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Add Screen Bar",
+            "Add SidePulse Notch",
             "toggleVirtualStatusDevice:",
             "",
         )
@@ -3456,13 +3498,13 @@ def build_device_menu_item(device: StatusBarDevice, target: StatusBarController)
 
     if device.device_id == VIRTUAL_DEVICE_ID:
         submenu.addItem_(NSMenuItem.separatorItem())
-        remove_screen_bar = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Remove Screen Bar",
+        remove_sidepulse_notch = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Remove SidePulse Notch",
             "toggleVirtualStatusDevice:",
             "",
         )
-        remove_screen_bar.setTarget_(target)
-        submenu.addItem_(remove_screen_bar)
+        remove_sidepulse_notch.setTarget_(target)
+        submenu.addItem_(remove_sidepulse_notch)
 
     if not device.connected:
         submenu.addItem_(NSMenuItem.separatorItem())
@@ -4344,43 +4386,102 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
 
     agent_animations_tab = animations_tab
 
-    add_label(agents_tab, "Agent Hooks", 24, 398, 200, 24)
-    add_label(agents_tab, "Codex", 32, 360, 80, 22)
-    codex_status = add_label(agents_tab, "", 130, 360, 240, 22)
-    add_button(agents_tab, "Install", 400, 356, 90, 28, target, "installCodexHooks:")
-    add_button(agents_tab, "Uninstall", 500, 356, 100, 28, target, "uninstallCodexHooks:")
+    section_x = 24
+    label_x = 32
+    value_x = 130
+    primary_action_x = 400
+    secondary_action_x = 500
+    value_width = primary_action_x - value_x - 5
 
-    add_label(agents_tab, "Claude", 32, 326, 80, 22)
-    claude_status = add_label(agents_tab, "", 130, 326, 240, 22)
-    add_button(agents_tab, "Install", 400, 322, 90, 28, target, "installClaudeHooks:")
-    add_button(agents_tab, "Uninstall", 500, 322, 100, 28, target, "uninstallClaudeHooks:")
+    add_label(agents_tab, "Agent Hooks", section_x, 398, 200, 24)
 
-    add_label(agents_tab, "Grok", 32, 292, 80, 22)
-    grok_status = add_label(agents_tab, "", 130, 292, 240, 22)
-    add_button(agents_tab, "Install", 400, 288, 90, 28, target, "installGrokHooks:")
-    add_button(agents_tab, "Uninstall", 500, 288, 100, 28, target, "uninstallGrokHooks:")
+    def add_hook_row(
+        title: str,
+        y: int,
+        install_selector: str,
+        uninstall_selector: str,
+    ):
+        add_label(agents_tab, title, label_x, y, 80, 22)
+        status = add_label(agents_tab, "", value_x, y, value_width, 22)
+        add_button(
+            agents_tab,
+            "Install",
+            primary_action_x,
+            y - 4,
+            90,
+            28,
+            target,
+            install_selector,
+        )
+        add_button(
+            agents_tab,
+            "Uninstall",
+            secondary_action_x,
+            y - 4,
+            100,
+            28,
+            target,
+            uninstall_selector,
+        )
+        return status
 
-    add_separator(agents_tab, 24, 258, tab_width - 48)
-    add_label(agents_tab, "Session Opening", 24, 224, 240, 24)
-    add_label(agents_tab, "Codex", 32, 188, 100, 22)
-    codex_opener = add_provider_opener_popup(agents_tab, "codex", 160, 186, target)
-    add_label(agents_tab, "Claude", 32, 154, 100, 22)
-    claude_opener = add_provider_opener_popup(agents_tab, "claude", 160, 152, target)
-    add_label(agents_tab, "Grok Sessions", 32, 120, 120, 22)
-    grok_opener = add_provider_opener_popup(agents_tab, "grok", 160, 118, target)
+    codex_status = add_hook_row(
+        "Codex", 364, "installCodexHooks:", "uninstallCodexHooks:"
+    )
+    claude_status = add_hook_row(
+        "Claude", 338, "installClaudeHooks:", "uninstallClaudeHooks:"
+    )
+    grok_status = add_hook_row(
+        "Grok", 312, "installGrokHooks:", "uninstallGrokHooks:"
+    )
+    cursor_status = add_hook_row(
+        "Cursor", 286, "installCursorHooks:", "uninstallCursorHooks:"
+    )
+    junie_status = add_hook_row(
+        "Junie", 260, "installJunieHooks:", "uninstallJunieHooks:"
+    )
 
-    add_label(agents_tab, "Terminal App", 376, 188, 120, 22)
-    terminal_popup = add_terminal_popup(agents_tab, 376, 156, target)
-    custom_terminal_path = add_label(agents_tab, "", 376, 128, 170, 22)
-    add_button(agents_tab, "Choose...", 500, 92, 100, 28, target, "chooseSessionTerminal:")
+    add_separator(agents_tab, section_x, 246, tab_width - 48)
+    add_label(agents_tab, "Session Opening", section_x, 220, 240, 24)
+    add_label(agents_tab, "Terminal App", primary_action_x, 220, 200, 24)
 
-    add_separator(agents_tab, 24, 80, tab_width - 48)
-    add_label(agents_tab, "Transcript Monitoring", 24, 46, 240, 24)
+    add_label(agents_tab, "Codex", label_x, 184, 90, 22)
+    codex_opener = add_provider_opener_popup(
+        agents_tab, "codex", value_x, 182, target, width=value_width
+    )
+    add_label(agents_tab, "Claude", label_x, 150, 90, 22)
+    claude_opener = add_provider_opener_popup(
+        agents_tab, "claude", value_x, 148, target, width=value_width
+    )
+    add_label(agents_tab, "Grok", label_x, 116, 90, 22)
+    grok_opener = add_provider_opener_popup(
+        agents_tab, "grok", value_x, 114, target, width=value_width
+    )
+
+    terminal_popup = add_terminal_popup(
+        agents_tab, primary_action_x, 182, target, width=200
+    )
+    custom_terminal_path = add_label(
+        agents_tab, "", primary_action_x, 150, 200, 22
+    )
+    add_button(
+        agents_tab,
+        "Choose...",
+        secondary_action_x,
+        114,
+        100,
+        28,
+        target,
+        "chooseSessionTerminal:",
+    )
+
+    add_separator(agents_tab, section_x, 78, tab_width - 48)
+    add_label(agents_tab, "Transcript Monitoring", section_x, 50, 240, 24)
     codex_transcripts = add_checkbox(
         agents_tab,
         "CLI fallback: Codex transcripts",
         32,
-        14,
+        18,
         260,
         24,
         target,
@@ -4390,7 +4491,7 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         agents_tab,
         "CLI fallback: Claude transcripts",
         312,
-        14,
+        18,
         260,
         24,
         target,
@@ -4582,6 +4683,8 @@ def build_settings_window(target: StatusBarController) -> NSWindow:
         "codex_hook_status": codex_status,
         "claude_hook_status": claude_status,
         "grok_hook_status": grok_status,
+        "cursor_hook_status": cursor_status,
+        "junie_hook_status": junie_status,
         "debug_log_status": debug_log_status,
         "codex_session_opener": codex_opener,
         "claude_session_opener": claude_opener,
@@ -5017,9 +5120,17 @@ def refresh_agent_animation_profile_popup(
             return
 
 
-def add_provider_opener_popup(parent, provider: str, x: int, y: int, target):
+def add_provider_opener_popup(
+    parent,
+    provider: str,
+    x: int,
+    y: int,
+    target,
+    *,
+    width: int = 180,
+):
     popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-        ((x, y), (180, 26)), False
+        ((x, y), (width, 26)), False
     )
     popup.setTarget_(target)
     popup.setAction_("setProviderOpenPreference:")
@@ -5032,9 +5143,9 @@ def add_provider_opener_popup(parent, provider: str, x: int, y: int, target):
     return popup
 
 
-def add_terminal_popup(parent, x: int, y: int, target):
+def add_terminal_popup(parent, x: int, y: int, target, *, width: int = 150):
     popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-        ((x, y), (150, 26)), False
+        ((x, y), (width, 26)), False
     )
     popup.setTarget_(target)
     popup.setAction_("setSessionTerminal:")
@@ -5374,7 +5485,7 @@ def restore_led_display(target, token_value) -> None:
 
 def hook_status_text(config: ProviderConfig) -> str:
     if not config.exists:
-        return f"Not installed - config will be created at {config.config_path}"
+        return "Not installed — config created on install"
     if config.hook_events:
         event_count = len(config.hook_events)
         suffix = "event" if event_count == 1 else "events"
