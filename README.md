@@ -643,6 +643,10 @@ and shows the path from provider hook event to interpreted SidePulse status.
 The `Keep Awake With Lid Closed` menu section controls the stronger sleep
 prevention policy:
 
+The intended closed-lid behavior, including the distinction between macOS
+clamshell mode and SidePulse's no-external-display fallback, is documented in
+[`docs/design/closed-lid-power.md`](docs/design/closed-lid-power.md).
+
 | Choice | Behavior |
 | --- | --- |
 | Never | Do not use the closed-lid sleep override. |

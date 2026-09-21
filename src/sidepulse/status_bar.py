@@ -141,8 +141,10 @@ from .lid_sleep import (
     LID_POLL_SECONDS,
     ClosedLidAwakeController,
     MacSleepSnapshot,
+    external_display_is_active,
     read_lid_closed,
     read_mac_sleep_snapshot,
+    run_pmset_displaysleepnow,
     sleep_helper_install_command,
     sleep_helper_installed,
 )
@@ -508,6 +510,20 @@ def lid_close_animation_should_run(
     return True
 
 
+def closed_lid_display_sleep_should_request(
+    *,
+    lid_closed: bool | None,
+    external_display_active: bool | None,
+    system_sleep_disabled: bool,
+) -> bool:
+    """Only sleep displays when it cannot affect an external monitor."""
+    return (
+        lid_closed is True
+        and external_display_active is False
+        and system_sleep_disabled
+    )
+
+
 def sleep_prevention_battery_safeguard(
     snapshot: BatterySnapshot | None,
     threshold_percent: float,
@@ -609,6 +625,7 @@ class StatusBarController(NSObject):
         self.keep_awake = KeepAwakeController()
         self.closed_lid_awake = ClosedLidAwakeController(
             use_system_disable=sleep_helper_installed(),
+            use_caffeinate=False,
         )
         self.last_keep_awake_error = None
         self.last_closed_lid_awake_error = None
@@ -633,6 +650,7 @@ class StatusBarController(NSObject):
         self.pending_lid_closed = None
         self.pending_lid_error = None
         self.lid_closed_led_hold_active = False
+        self.closed_lid_display_sleep_requested = False
         self.led_animation_until_monotonic = 0.0
         self.led_animation_token = 0
         self.virtual_status_device = VirtualStatusDevice.alloc().init()
@@ -3416,11 +3434,13 @@ class StatusBarController(NSObject):
         self.lid_poll_backoff_until_monotonic = 0.0
         if self.last_lid_closed is None:
             self.last_lid_closed = closed
+            self.sync_closed_lid_awake()
             return
         if closed == self.last_lid_closed:
             return
 
         self.last_lid_closed = closed
+        self.sync_closed_lid_awake()
         kind = LID_ANIMATION_CLOSED if closed else LID_ANIMATION_OPEN
         log_status_bar(f"lid_state={'closed' if closed else 'open'}")
         if closed:
@@ -3529,9 +3549,18 @@ class StatusBarController(NSObject):
 
     def sync_closed_lid_awake(self, *, agents_active: bool | None = None) -> None:
         was_active = self.closed_lid_awake.active()
-        self.closed_lid_awake.set_use_system_disable(sleep_helper_installed())
+        external_display_active = external_display_is_active()
+        battery_snapshot = getattr(self, "last_battery_snapshot", None)
+        clamshell_eligible = bool(
+            external_display_active is True
+            and battery_snapshot is not None
+            and battery_snapshot.is_plugged
+        )
+        self.closed_lid_awake.set_use_system_disable(
+            sleep_helper_installed() and not clamshell_eligible
+        )
         policy = self.settings.sleep_prevention_policy
-        if self.battery_sleep_safeguard_active:
+        if self.battery_sleep_safeguard_active or clamshell_eligible:
             policy = SLEEP_PREVENTION_NEVER
         self.closed_lid_awake.update(
             policy,
@@ -3549,6 +3578,24 @@ class StatusBarController(NSObject):
                 log_status_bar(
                     f"closed_lid_awake error: {self.last_closed_lid_awake_error}"
                 )
+
+        should_sleep_display = closed_lid_display_sleep_should_request(
+            lid_closed=getattr(self, "last_lid_closed", None),
+            external_display_active=external_display_active,
+            system_sleep_disabled=self.closed_lid_awake.system_disable_active(),
+        )
+        if not should_sleep_display:
+            self.closed_lid_display_sleep_requested = False
+            return
+        if getattr(self, "closed_lid_display_sleep_requested", False):
+            return
+        try:
+            run_pmset_displaysleepnow()
+            self.closed_lid_display_sleep_requested = True
+            log_status_bar("lid_display_sleep=requested")
+        except Exception as exc:
+            self.closed_lid_display_sleep_requested = False
+            log_status_bar(f"lid_display_sleep error: {exc}")
 
     def status_keepalive_targets(self) -> list[Path]:
         targets = self.current_led_targets()

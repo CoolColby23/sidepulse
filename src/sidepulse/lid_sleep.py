@@ -21,6 +21,7 @@ CAFFEINATE_CLOSED_LID_COMMAND = ("/usr/bin/caffeinate", "-ims")
 IOREG_CLAMSHELL_COMMAND = ("/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4")
 IOREG_SLEEP_DISABLED_COMMAND = ("/usr/sbin/ioreg", "-r", "-k", "SleepDisabled", "-d", "4")
 PMSET_ASSERTIONS_COMMAND = ("/usr/bin/pmset", "-g", "assertions")
+PMSET_DISPLAY_SLEEP_NOW_COMMAND = ("/usr/bin/pmset", "displaysleepnow")
 SUDO_PMSET_DISABLE_SLEEP_COMMAND = (
     "/usr/bin/sudo",
     "-n",
@@ -45,6 +46,10 @@ class SleepHelperInstallResult:
 
 
 class SleepHelperRequiredError(RuntimeError):
+    pass
+
+
+class DisplaySleepRequestError(RuntimeError):
     pass
 
 
@@ -93,6 +98,32 @@ def read_lid_closed(
         timeout=2,
     )
     return parse_bool_ioreg_property(result.stdout, "AppleClamshellState")
+
+
+def external_display_is_active() -> bool | None:
+    """Return whether CoreGraphics has an active non-built-in display.
+
+    ``None`` means that macOS could not provide a trustworthy display list. A
+    caller must treat that as unknown rather than risk sleeping an external
+    display with the global ``pmset displaysleepnow`` request.
+    """
+    try:
+        from Quartz import (
+            CGDisplayIsActive,
+            CGDisplayIsBuiltin,
+            CGGetOnlineDisplayList,
+        )
+
+        error, display_ids, count = CGGetOnlineDisplayList(32, None, None)
+    except Exception:
+        return None
+    if error != 0:
+        return None
+    return any(
+        not bool(CGDisplayIsBuiltin(display_id))
+        and bool(CGDisplayIsActive(display_id))
+        for display_id in display_ids[:count]
+    )
 
 
 def read_sleep_disabled(
@@ -206,6 +237,26 @@ def run_sudo_pmset_disablesleep(
         f"{sleep_helper_install_command()}"
         f"{detail}"
     )
+
+
+def run_pmset_displaysleepnow(
+    *,
+    runner: CommandRunner = subprocess.run,
+) -> None:
+    """Request normal macOS display sleep without changing panel power state."""
+    result = runner(
+        list(PMSET_DISPLAY_SLEEP_NOW_COMMAND),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode == 0:
+        return
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        detail = f" ({detail.splitlines()[0]})"
+    raise DisplaySleepRequestError(f"pmset displaysleepnow failed{detail}")
 
 
 def run_privileged_pmset_disablesleep(
@@ -349,6 +400,7 @@ class ClosedLidAwakeController:
         sleep_disabled_setter: Callable[[bool], None] = run_sudo_pmset_disablesleep,
         watch_current_process: bool = True,
         use_system_disable: bool = False,
+        use_caffeinate: bool = True,
     ) -> None:
         self.command = tuple(command)
         self.process_factory = process_factory or subprocess.Popen
@@ -356,6 +408,7 @@ class ClosedLidAwakeController:
         self.sleep_disabled_setter = sleep_disabled_setter
         self.watch_current_process = watch_current_process
         self.use_system_disable = use_system_disable
+        self.use_caffeinate = use_caffeinate
         self.process = None
         self.changed_system_disable = False
         self.system_disable_attempted = False
@@ -402,7 +455,7 @@ class ClosedLidAwakeController:
             except Exception as exc:
                 errors.append(f"disablesleep: {exc}")
 
-        if not self.process_running():
+        if self.use_caffeinate and not self.process_running():
             try:
                 self.process = self.process_factory(
                     self.caffeinate_command(),
@@ -457,6 +510,9 @@ class ClosedLidAwakeController:
 
     def active(self) -> bool:
         return self.process_running() or self.changed_system_disable
+
+    def system_disable_active(self) -> bool:
+        return self.last_system_disable_request is True
 
     def process_running(self) -> bool:
         return self.process is not None and self.process.poll() is None

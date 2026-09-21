@@ -76,14 +76,17 @@ from sidepulse.led_status import (
 )
 from sidepulse.lid_sleep import (
     ClosedLidAwakeController,
+    DisplaySleepRequestError,
     IOREG_SLEEP_DISABLED_COMMAND,
     MacSleepSnapshot,
     PMSET_ASSERTIONS_COMMAND,
     SleepHelperRequiredError,
     closed_lid_awake_should_hold,
+    external_display_is_active,
     parse_bool_ioreg_property,
     parse_pmset_assertions,
     read_mac_sleep_snapshot,
+    run_pmset_displaysleepnow,
     run_sudo_pmset_disablesleep,
     sleep_helper_sudoers_rule,
 )
@@ -5125,6 +5128,48 @@ class AgentMonitorTests(unittest.TestCase):
             )
         )
 
+    def test_lid_display_sleep_never_runs_with_an_external_or_unknown_display(self) -> None:
+        try:
+            from sidepulse import status_bar
+        except SystemExit as exc:
+            self.skipTest(str(exc))
+
+        self.assertTrue(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=False,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=True,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=None,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=False,
+                external_display_active=False,
+                system_sleep_disabled=True,
+            )
+        )
+        self.assertFalse(
+            status_bar.closed_lid_display_sleep_should_request(
+                lid_closed=True,
+                external_display_active=False,
+                system_sleep_disabled=False,
+            )
+        )
+
     def test_lid_poll_enables_hold_on_close_and_clears_it_on_open(self) -> None:
         try:
             from sidepulse import status_bar
@@ -5487,6 +5532,22 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertTrue(controller.process_running())
         self.assertFalse(controller.changed_system_disable)
 
+    def test_closed_lid_awake_controller_can_skip_duplicate_caffeinate(self) -> None:
+        disabled_calls: list[bool] = []
+        controller = ClosedLidAwakeController(
+            process_factory=lambda *_args, **_kwargs: FakeProcess(),
+            sleep_disabled_setter=disabled_calls.append,
+            use_system_disable=True,
+            use_caffeinate=False,
+        )
+
+        self.assertTrue(
+            controller.update(CLOSED_LID_AWAKE_ALWAYS, agents_active=False)
+        )
+        self.assertEqual(disabled_calls, [True])
+        self.assertFalse(controller.process_running())
+        self.assertTrue(controller.system_disable_active())
+
     def test_closed_lid_awake_controller_drives_existing_system_disable(self) -> None:
         disabled_calls: list[bool] = []
         controller = ClosedLidAwakeController(
@@ -5551,6 +5612,45 @@ class AgentMonitorTests(unittest.TestCase):
 
         self.assertIn("install-sleep-helper", str(ctx.exception))
         self.assertNotIn("/usr/bin/osascript", calls[0])
+
+    def test_display_sleep_request_uses_the_supported_pmset_command(self) -> None:
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        run_pmset_displaysleepnow(runner=runner)
+
+        self.assertEqual(calls[0][0], ["/usr/bin/pmset", "displaysleepnow"])
+        self.assertEqual(calls[0][1]["check"], False)
+
+    def test_display_sleep_request_reports_failure(self) -> None:
+        def runner(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 1, "", "not allowed")
+
+        with self.assertRaises(DisplaySleepRequestError) as ctx:
+            run_pmset_displaysleepnow(runner=runner)
+
+        self.assertIn("not allowed", str(ctx.exception))
+
+    def test_external_display_detector_requires_an_active_non_builtin_display(self) -> None:
+        quartz = SimpleNamespace(
+            CGGetOnlineDisplayList=lambda *_args: (0, (1, 2, 3), 3),
+            CGDisplayIsBuiltin=lambda display_id: display_id == 1,
+            CGDisplayIsActive=lambda display_id: display_id == 2,
+        )
+        with patch.dict(sys.modules, {"Quartz": quartz}):
+            self.assertTrue(external_display_is_active())
+
+    def test_external_display_detector_returns_unknown_on_failure(self) -> None:
+        quartz = SimpleNamespace(
+            CGGetOnlineDisplayList=lambda *_args: (1, (), 0),
+            CGDisplayIsBuiltin=lambda _display_id: False,
+            CGDisplayIsActive=lambda _display_id: True,
+        )
+        with patch.dict(sys.modules, {"Quartz": quartz}):
+            self.assertIsNone(external_display_is_active())
 
     def test_sleep_helper_sudoers_rule_is_narrow(self) -> None:
         self.assertEqual(
