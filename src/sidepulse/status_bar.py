@@ -137,7 +137,6 @@ from .virtual_device import (
     VirtualLedView,
     VirtualStatusDevice,
 )
-from .internal_display import InternalDisplayController
 from .lid_sleep import (
     LID_POLL_SECONDS,
     ClosedLidAwakeController,
@@ -608,7 +607,6 @@ class StatusBarController(NSObject):
         self.last_led_display_kind = LED_DISPLAY_AGENT
         self.last_connected_device_signature = None
         self.keep_awake = KeepAwakeController()
-        self.internal_display = InternalDisplayController()
         self.closed_lid_awake = ClosedLidAwakeController(
             use_system_disable=sleep_helper_installed(),
         )
@@ -634,8 +632,6 @@ class StatusBarController(NSObject):
         self.lid_poll_backoff_until_monotonic = 0.0
         self.pending_lid_closed = None
         self.pending_lid_error = None
-        self.pending_lid_panel_error = None
-        self.pending_lid_panel_state = None
         self.lid_closed_led_hold_active = False
         self.led_animation_until_monotonic = 0.0
         self.led_animation_token = 0
@@ -1123,14 +1119,12 @@ class StatusBarController(NSObject):
 
     @objc.IBAction
     def quit_(self, _sender):
-        self.internal_display.release()
         self.closed_lid_awake.release()
         self.keep_awake.release()
         NSApp.terminate_(self)
 
     def applicationWillTerminate_(self, _notification):
         self.stop_status_icon_animation()
-        self.internal_display.release()
         self.power_source_notifier.stop()
         if self.battery_timer is not None:
             self.battery_timer.invalidate()
@@ -3387,27 +3381,10 @@ class StatusBarController(NSObject):
         threading.Thread(target=self._read_lid_closed_async, daemon=True).start()
 
     def _read_lid_closed_async(self) -> None:
-        self.pending_lid_panel_error = None
-        self.pending_lid_panel_state = None
         try:
             closed = read_lid_closed()
             self.pending_lid_closed = closed
             self.pending_lid_error = None
-            panel = getattr(self, "internal_display", None)
-            if panel is not None:
-                previous_error = panel.last_error
-                was_off = panel.powered_off
-                panel.update(closed)
-                self.pending_lid_panel_error = (
-                    panel.last_error
-                    if panel.last_error != previous_error
-                    else None
-                )
-                self.pending_lid_panel_state = (
-                    panel.powered_off
-                    if panel.last_error is None and (was_off != panel.powered_off or previous_error)
-                    else None
-                )
         except Exception as exc:
             self.pending_lid_closed = None
             self.pending_lid_error = str(exc)
@@ -3435,12 +3412,6 @@ class StatusBarController(NSObject):
         if closed is None:
             return
         closed = bool(closed)
-        panel_error = getattr(self, "pending_lid_panel_error", None)
-        panel_state = getattr(self, "pending_lid_panel_state", None)
-        if panel_error:
-            log_status_bar(f"internal_display error: {panel_error}")
-        elif panel_state is not None:
-            log_status_bar(f"internal_display={'off' if panel_state else 'on'}")
         self.last_lid_error = None
         self.lid_poll_backoff_until_monotonic = 0.0
         if self.last_lid_closed is None:

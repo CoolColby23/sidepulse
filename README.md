@@ -643,13 +643,6 @@ and shows the path from provider hook event to interpreted SidePulse status.
 The `Keep Awake With Lid Closed` menu section controls the stronger sleep
 prevention policy:
 
-On supported Apple Silicon Macs, SidePulse requests built-in panel power off
-when the lid closes and restores it on opening. This targets the internal
-framebuffer only; external display power, brightness, and layout are untouched.
-The panel control uses the private macOS IOMobileFramebuffer API and logs an
-error if unavailable, without falling back to sleeping all displays. Pending
-panel restoration survives a SidePulse restart.
-
 | Choice | Behavior |
 | --- | --- |
 | Never | Do not use the closed-lid sleep override. |
