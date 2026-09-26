@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -35,15 +36,43 @@ from sidepulse.links import (  # noqa: E402
 
 TOKEN_A = "a" * 64
 TOKEN_B = "b" * 64
+DEV_TOKEN_A = "dev_" + TOKEN_A
 
 
 class LinkStorageTests(unittest.TestCase):
     def test_token_is_normalized_and_validated(self) -> None:
         self.assertEqual(normalize_apns_token("AA " * 32), TOKEN_A)
-        for invalid in ("", "a" * 63, "g" * 64):
+        self.assertEqual(normalize_apns_token(" DEV_" + "AA " * 32), DEV_TOKEN_A)
+        for invalid in (
+            "",
+            "a" * 63,
+            "g" * 64,
+            "dev_",
+            "dev_" + "a" * 63,
+            "dev_dev_" + TOKEN_A,
+            "test_" + TOKEN_A,
+            "dev_" + "g" * 64,
+            "dev_" + "a" * 65,
+        ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(LinkError):
                     normalize_apns_token(invalid)
+
+    def test_development_registration_response_keeps_prefix(self) -> None:
+        response = json.dumps(
+            {
+                "v": 1,
+                "type": "ios_registration",
+                "device": {
+                    "name": "Peter's iPhone",
+                    "platform": "ios",
+                    "bundle_id": "io.sidepulse.ios",
+                    "push_token": DEV_TOKEN_A.upper(),
+                },
+            }
+        )
+        link = parse_ios_registration(response, server="https://bridge.sidepulse.io")
+        self.assertEqual(link.token, DEV_TOKEN_A)
 
     def test_links_round_trip_with_private_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -52,6 +81,36 @@ class LinkStorageTests(unittest.TestCase):
             save_ios_links((link,), path)
             self.assertEqual(load_ios_links(path), (link,))
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_links_round_trip_development_and_legacy_production_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "links.json"
+            # Version 1 files created before development tokens contain plain hex.
+            path.write_text(
+                json.dumps({"version": 1, "ios": [{"name": "Old iPhone", "token": TOKEN_A}]}),
+                encoding="utf-8",
+            )
+            old_link = load_ios_links(path)[0]
+            dev_link = IOSLink("Development iPhone", DEV_TOKEN_A)
+
+            stored = store_ios_link(dev_link, path)
+
+            self.assertEqual(stored, (old_link, dev_link))
+            self.assertEqual(load_ios_links(path), (old_link, dev_link))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual([item["token"] for item in payload["ios"]], [TOKEN_A, DEV_TOKEN_A])
+
+    def test_production_and_development_tokens_are_distinct_destinations(self) -> None:
+        production = IOSLink("iPhone", TOKEN_A)
+        development = IOSLink("iPhone", DEV_TOKEN_A)
+        self.assertNotEqual(production.link_id, development.link_id)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "links.json"
+            self.assertEqual(store_ios_link(production, path), (production,))
+            self.assertEqual(store_ios_link(development, path), (production, development))
+            self.assertEqual(remove_ios_link(DEV_TOKEN_A, path), development)
+            self.assertEqual(load_ios_links(path), (production,))
 
     def test_relinking_a_token_updates_instead_of_duplicating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -138,6 +197,48 @@ class LinkStorageTests(unittest.TestCase):
         link = parse_ios_registration(response, server="https://bridge.sidepulse.io")
         self.assertEqual(link.name, "Peter's iPhone")
         self.assertEqual(link.token, TOKEN_B)
+
+
+class UnlinkCLITests(unittest.TestCase):
+    def test_unlink_lists_and_removes_only_exact_id_when_names_match(self) -> None:
+        production = IOSLink("iPhone", TOKEN_A)
+        development = IOSLink("iPhone", DEV_TOKEN_A)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "links.json"
+            save_ios_links((production, development), path)
+            with patch("sidepulse.links.default_links_path", return_value=path):
+                stdout = io.StringIO()
+                with patch("sys.stdout", stdout):
+                    self.assertEqual(sidepulse_main(["unlink"]), 0)
+                self.assertIn(production.link_id, stdout.getvalue())
+                self.assertIn(development.link_id, stdout.getvalue())
+
+                stderr = io.StringIO()
+                with patch("sys.stderr", stderr):
+                    self.assertEqual(sidepulse_main(["unlink", "iPhone"]), 1)
+                self.assertEqual(load_ios_links(path), (production, development))
+
+                stdout = io.StringIO()
+                with patch("sys.stdout", stdout):
+                    self.assertEqual(sidepulse_main(["unlink", development.link_id]), 0)
+                self.assertIn(development.link_id, stdout.getvalue())
+                self.assertEqual(load_ios_links(path), (production,))
+
+    def test_unlink_refuses_colliding_displayed_ids(self) -> None:
+        first = IOSLink("iPhone", DEV_TOKEN_A)
+        second = IOSLink("iPhone", "dev_" + "a" * 8 + "b" * 56)
+        self.assertEqual(first.link_id, second.link_id)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "links.json"
+            save_ios_links((first, second), path)
+            stderr = io.StringIO()
+            with (
+                patch("sidepulse.links.default_links_path", return_value=path),
+                patch("sys.stderr", stderr),
+            ):
+                self.assertEqual(sidepulse_main(["unlink", first.link_id]), 1)
+            self.assertIn("matches multiple links", stderr.getvalue())
+            self.assertEqual(load_ios_links(path), (first, second))
 
 
 class WriteFallbackTests(unittest.TestCase):
@@ -256,6 +357,20 @@ class WriteFallbackTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(send.call_args.args[:2], (phones[1], "off"))
+
+    def test_write_selects_production_and_development_destinations_separately(self) -> None:
+        phones = (IOSLink("iPhone", TOKEN_A), IOSLink("iPhone", DEV_TOKEN_A))
+        for phone in phones:
+            with self.subTest(link_id=phone.link_id):
+                with (
+                    patch("sidepulse.cli.discover_devices", return_value=[]),
+                    patch("sidepulse.cli.load_ios_links", return_value=phones),
+                    patch("sidepulse.cli._remote_event_data", return_value={}),
+                    patch("sidepulse.cli.send_ios_program", return_value="OK") as send,
+                ):
+                    result = sidepulse_main(["write", "off", "--to", phone.link_id])
+                self.assertEqual(result, 0)
+                self.assertEqual(send.call_args.args[0], phone)
 
     def test_notification_cannot_target_local_device(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -399,6 +514,41 @@ class IOSPayloadTests(unittest.TestCase):
         self.assertEqual(payload["aps"], {"content-available": 1})
         self.assertNotIn("title", payload)
         self.assertNotIn("body", payload)
+
+    def test_outgoing_url_preserves_production_and_development_routing(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"OK"
+        for token, expected_url in (
+            (TOKEN_A, f"https://bridge.sidepulse.io/api/leds/apns_{TOKEN_A}"),
+            (DEV_TOKEN_A, f"https://bridge.sidepulse.io/api/leds/apns_dev_{TOKEN_A}"),
+        ):
+            with self.subTest(token_prefix=token[:4]), patch(
+                "sidepulse.links.urllib.request.urlopen", return_value=response
+            ) as open_url:
+                send_ios_program(IOSLink("Phone", token), "off")
+                self.assertEqual(open_url.call_args.args[0].full_url, expected_url)
+
+    def test_apns_rejection_produces_failed_cli_result(self) -> None:
+        phone = IOSLink("Development iPhone", DEV_TOKEN_A)
+        stderr = io.StringIO()
+        apns_error = urllib.error.HTTPError(
+            "https://bridge.sidepulse.io/api/leds/apns_dev_" + TOKEN_A,
+            410,
+            "Gone",
+            {},
+            io.BytesIO(b"APNs rejected token"),
+        )
+        with (
+            patch("sidepulse.cli.discover_devices", return_value=[]),
+            patch("sidepulse.cli.load_ios_links", return_value=(phone,)),
+            patch("sidepulse.cli._remote_event_data", return_value={}),
+            patch("sidepulse.links.urllib.request.urlopen", side_effect=apns_error),
+            patch("sys.stderr", stderr),
+        ):
+            result = sidepulse_main(["write", "off", "--to", phone.link_id])
+
+        self.assertEqual(result, 1)
+        self.assertIn("APNs rejected token", stderr.getvalue())
 
 
 if __name__ == "__main__":

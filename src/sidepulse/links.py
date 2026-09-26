@@ -23,7 +23,7 @@ from .settings import default_config_dir
 DEFAULT_BRIDGE_SERVER = "https://bridge.sidepulse.io"
 PAIRING_TIMEOUT_SECONDS = 5 * 60
 IOS_BUNDLE_ID = "io.sidepulse.ios"
-APNS_TOKEN_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+APNS_TOKEN_PATTERN = re.compile(r"(?:dev_)?[0-9a-f]{64}")
 PAIRING_CHANNEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -75,7 +75,9 @@ def normalize_server(value: str) -> str:
 def normalize_apns_token(value: str) -> str:
     token = "".join(value.split()).lower()
     if not APNS_TOKEN_PATTERN.fullmatch(token):
-        raise LinkError("Push token must be exactly 64 hexadecimal characters.")
+        raise LinkError(
+            "Push token must be 64 hexadecimal characters, optionally prefixed with 'dev_'."
+        )
     return token
 
 

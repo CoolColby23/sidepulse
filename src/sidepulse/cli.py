@@ -55,6 +55,7 @@ from .links import (
     new_pairing_channel,
     normalize_apns_token,
     pairing_url,
+    remove_ios_link,
     render_terminal_qr,
     send_ios_program,
     store_ios_link,
@@ -191,6 +192,13 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
     )
     link.add_argument("relay_code", nargs="?", help="Relay code printed by the receiving Mac.")
     link.set_defaults(func=cmd_sidepulse_link)
+
+    unlink = subparsers.add_parser(
+        "unlink",
+        help="List linked iPhones or remove one by its displayed ID.",
+    )
+    unlink.add_argument("link_id", nargs="?", help="Exact linked iPhone ID to remove.")
+    unlink.set_defaults(func=cmd_sidepulse_unlink)
 
     service = subparsers.add_parser(
         "service",
@@ -777,6 +785,42 @@ def cmd_sidepulse_link(args: argparse.Namespace) -> int:
         "`sidepulse write` uses it when no local device is mounted; "
         "`sidepulse push` prefers it."
     )
+    return 0
+
+
+def cmd_sidepulse_unlink(args: argparse.Namespace) -> int:
+    links = load_ios_links()
+    if args.link_id is None:
+        if not links:
+            print("No linked iPhones.")
+            return 0
+        print("Linked iPhones:")
+        for link in links:
+            print(f"  {link.name} ({link.link_id})")
+        print("Remove one with `sidepulse unlink ID_FROM_LIST`.")
+        return 0
+
+    matches = [link for link in links if link.link_id.casefold() == args.link_id.casefold()]
+    if not matches:
+        print(f"sidepulse unlink: No linked iPhone has ID {args.link_id!r}.", file=sys.stderr)
+        return 1
+    if len(matches) != 1:
+        print(
+            f"sidepulse unlink: ID {args.link_id!r} matches multiple links. "
+            "Remove the intended entry from links.json by its full token.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        removed = remove_ios_link(matches[0].token)
+    except OSError as exc:
+        print(f"sidepulse unlink: Could not save the linked phones: {exc}", file=sys.stderr)
+        return 1
+    if removed is None:
+        print("sidepulse unlink: The linked iPhone has already been removed.", file=sys.stderr)
+        return 1
+    print(f"Unlinked {removed.name} ({removed.link_id}).")
     return 0
 
 

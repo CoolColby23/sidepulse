@@ -146,11 +146,28 @@ The writer decodes simple escapes such as `\n`, then enforces the controller's
 ### Link an iPhone
 
 Run one command and either scan the terminal QR code with the SidePulse iOS app
-or paste the 64-character push token shown by the app:
+or paste the push token shown by the app. Production tokens have 64 hexadecimal
+characters; development tokens have the `dev_` prefix followed by 64 hexadecimal
+characters. Keep the prefix when pasting or saving a development token.
 
 ```sh
 sidepulse link
 ```
+
+List saved iPhones and remove a stale link by its displayed ID:
+
+```sh
+sidepulse unlink
+sidepulse unlink ID_FROM_LIST
+sidepulse link
+```
+
+`unlink` requires an exact ID. This keeps phones with the same name separate.
+If two links have the same displayed ID, remove the intended entry by its full
+token from `~/.config/sidepulse/agent-monitor/links.json` (or the equivalent
+under `$XDG_CONFIG_HOME/sidepulse/agent-monitor/links.json`). Pair with the
+updated iOS build by scanning the QR code or pasting its current push token.
+Do not add or remove `dev_` by hand; the token determines the bridge route.
 
 Linked phones are stored locally. Remote LED-only writes are silent. Adding
 `--title` or `--message` produces one visible notification containing the same
