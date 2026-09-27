@@ -143,6 +143,23 @@ sidepulse write "off" --device /media/$USER/SidePulseDot
 The writer decodes simple escapes such as `\n`, then enforces the controller's
 512-byte and 20-line limits before writing the LED control file.
 
+For an **unmounted macOS device**, the standalone standard-library utility can
+write the existing `LEDS.LED` directly through `/dev/diskN` or `/dev/rdiskN`:
+
+```sh
+# Replace disk4 with the SidePulse device. Unmount first if already mounted.
+diskutil unmountDisk /dev/disk4
+sudo python3 scripts/write_led_raw.py /dev/rdisk4 'off\n#ff00ff 1s pulse\nrepeat'
+sudo python3 scripts/write_led_raw.py /dev/disk4 - < animation.LED
+```
+
+It requires a whole drive of **at most 300,000 bytes**, verified using device
+capacity queries on the open disk before writing. Partitions, unknown capacity,
+mounted volumes, and larger drives are rejected, with no override. The filesystem
+must be FAT12 starting at sector zero, with one FAT and 512-byte sectors. Programs
+are limited to 512 bytes and 20 lines. It writes the existing file's first data
+sector and updates its directory size, preserving its FAT allocation.
+
 ### Link an iPhone
 
 Run one command and either scan the terminal QR code with the SidePulse iOS app
