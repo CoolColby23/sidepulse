@@ -4,6 +4,8 @@ include README.md
 include pyproject.toml
 recursive-include src *.c *.LED *.py *.wasm
 recursive-include tests *.py
+include tests/fixtures/read2me-vectors.txt
+include src/sidepulse/_vendor/README.md
 
 prune .github
 prune data

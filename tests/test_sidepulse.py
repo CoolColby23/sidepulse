@@ -4994,11 +4994,11 @@ class AgentMonitorTests(unittest.TestCase):
         self.assertEqual(len(processes), 1)
         self.assertTrue(processes[0].terminated)
 
-    def test_keep_awake_touches_keepalive_file_once_per_interval(self) -> None:
+    def test_keep_awake_reads_status_file_once_per_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device = Path(tmp) / "SidePulsePro"
             device.mkdir()
-            status_path = device / "keepalive"
+            status_path = device / "STATUS.TXT"
             reads: list[Path] = []
 
             controller = KeepAwakeController(

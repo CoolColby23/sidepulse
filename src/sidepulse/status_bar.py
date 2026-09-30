@@ -3509,7 +3509,7 @@ class StatusBarController(NSObject):
             status_path = self.keep_awake.poke_status_file(target)
             if status_path is not None:
                 read_any = True
-                log_status_bar(f"sd_keepalive touch={status_path}")
+                log_status_bar(f"sd_keepalive read={status_path}")
         if not read_any and self.keep_awake.last_status_error != self.last_status_read_error:
             self.last_status_read_error = self.keep_awake.last_status_error
             if self.last_status_read_error:

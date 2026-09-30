@@ -14,7 +14,7 @@ from .models import AgentMode
 AWAKE_GRACE_SECONDS = 300.0
 SD_STATUS_READ_SECONDS = 60.0
 KEEPALIVE_FILE_NAME = "keepalive"
-STATUS_FILE_NAME = KEEPALIVE_FILE_NAME
+STATUS_FILE_NAME = "STATUS.TXT"
 CAFFEINATE_COMMAND = ("/usr/bin/caffeinate", "-ims")
 
 
@@ -36,7 +36,7 @@ class KeepAwakeController:
         self.status_read_seconds = status_read_seconds
         self.command = tuple(command)
         self.process_factory = process_factory or subprocess.Popen
-        self.status_reader = status_reader or touch_keepalive_file
+        self.status_reader = status_reader or read_status_file
         self.status_read_async = status_read_async
         self.watch_current_process = watch_current_process
         self.process = None
@@ -194,22 +194,21 @@ def status_file_for_target(target: Path) -> Path:
 def keepalive_file_for_target(target: Path) -> Path:
     known_file_names = KNOWN_LED_FILE_NAMES | {KEEPALIVE_FILE_NAME.upper(), "STATUS.TXT"}
     if target.name.upper() in known_file_names:
-        return target.parent / KEEPALIVE_FILE_NAME
-    return target / KEEPALIVE_FILE_NAME
+        return target.parent / STATUS_FILE_NAME
+    return target / STATUS_FILE_NAME
 
 
 def read_status_file(path: Path) -> None:
-    touch_keepalive_file(path)
+    from .device_writer import device_write_lock
+    from .readonly_control import read_status_bytes
+
+    with device_write_lock(path.parent):
+        read_status_bytes(path)
 
 
 def touch_keepalive_file(path: Path) -> None:
-    subprocess.run(
-        ["/usr/bin/touch", str(path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=2,
-        check=True,
-    )
+    """Compatibility alias: keepalive now reads STATUS.TXT without writing."""
+    read_status_file(status_file_for_target(path))
 
 
 def format_duration(seconds: int) -> str:

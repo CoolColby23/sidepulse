@@ -42,6 +42,7 @@ OUTPUT_PKG="$DIST_DIR/SidePulse-${VERSION}-${ARCH}.pkg"
     --specpath "$BUILD_DIR" \
     --collect-submodules Cocoa \
     --collect-data sidepulse.resources \
+    --collect-all libusb_package \
     "$ROOT_DIR/packaging/sidepulse_entry.py"
 
 /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string $VERSION" "$APP_PATH/Contents/Info.plist" 2>/dev/null || \

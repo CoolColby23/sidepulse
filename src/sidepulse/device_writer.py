@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import errno
+import hashlib
 import os
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +21,7 @@ DEVICE_NAME_HINTS = (
     "sidepulsedot",
     "pulsedot",
 )
+_WRITE_LOCK = threading.Lock()
 
 
 class DeviceWriteError(RuntimeError):
@@ -59,9 +64,26 @@ def write_normalized_led_program(
     if dry_run:
         return target
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    write_text_synced(target, program)
+    with device_write_lock(target.parent):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_text_synced(target, program)
     return target
+
+
+@contextmanager
+def device_write_lock(root: Path):
+    """Serialize this app's file/USB/read-channel writers across threads and processes."""
+    import fcntl
+
+    key = hashlib.sha256(os.fsencode(root.resolve())).hexdigest()
+    directory = Path.home() / ".cache" / "sidepulse" / "device-locks"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with _WRITE_LOCK, (directory / key).open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def write_text_synced(target: Path, text: str) -> None:
@@ -74,7 +96,17 @@ def write_text_synced(target: Path, text: str) -> None:
     """
 
     is_new = not path_exists(target)
-    with target.open("w", encoding="utf-8") as handle:
+    try:
+        handle = target.open("w", encoding="utf-8")
+    except OSError as exc:
+        if exc.errno not in (errno.EROFS, errno.EACCES, errno.EPERM):
+            raise
+        from .readonly_control import write_readonly_program
+
+        write_readonly_program(target, text)
+        return
+    # Only a denied open may change transports. Never replay a partial write.
+    with handle:
         handle.write(text)
         handle.flush()
         sync_fd(handle.fileno())

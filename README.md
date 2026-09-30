@@ -143,6 +143,27 @@ sidepulse write "off" --device /media/$USER/SidePulseDot
 The writer decodes simple escapes such as `\n`, then enforces the controller's
 512-byte and 20-line limits before writing the LED control file.
 
+Mounted drives restricted to **read-only storage**, including by an MDM policy,
+automatically use an alternate LED transport on **firmware 1.1 or newer**:
+SidePulse Pro uses READ2ME through SD reads of `setup.html` (macOS), and
+SidePulse Dot uses direct SPC2 USB control (macOS and Linux). This applies to
+the CLI, menu bar, battery display, and background service without extra flags.
+Dot's USB library is included with the app and installed as a Python dependency.
+
+The app tries a normal file write first and falls back only when opening
+`LEDS.LED` is denied as read-only or by permissions. A failure after writing
+begins is never replayed through another transport. The firmware version is
+checked in `STATUS.TXT`; older or unrecognized firmware produces an error.
+Upgrade older firmware using a computer that permits storage writes.
+
+Alternate transports require a valid device acknowledgement before reporting
+success. Dot is matched to the selected mount's USB connection, including when
+multiple devices are attached. USB access can still be blocked by management
+policy, and Pro's SD reader must support uncached reads; these failures are
+reported without changing mount permissions. The fallback controls live LEDs;
+it does not install firmware or change startup programs. Pro file contents may
+appear stale until remount; Dot USB commands do not modify `LEDS.LED`.
+
 For an **unmounted macOS device**, the standalone standard-library utility can
 write the existing `LEDS.LED` directly through `/dev/diskN` or `/dev/rdiskN`:
 
@@ -687,8 +708,8 @@ clamshell mode and SidePulse's no-external-display fallback, is documented in
 | When Agents Work | Keep the Mac awake while agents are Working / Tool Running / Progressing, plus the existing five-minute Ask / Done / Error grace period. |
 | Always | Keep the closed-lid sleep override active while the status-bar app is running. |
 
-The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by touching
-a `keepalive` file on each connected device at least once per minute. The
+The status-bar app still keeps the SidePulse Pro/SidePulse Dot volume active by reading
+`STATUS.TXT` with the existing uncached, read-only macOS transport on each connected device at least once per minute. The
 closed-lid policy uses the SidePulse sleep helper when it is installed. The PKG
 installer sets this up automatically; source/dev installs can run the one-time
 setup command:
