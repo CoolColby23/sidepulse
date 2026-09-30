@@ -18,6 +18,9 @@ The device mounts as a disk drive. You can control the LEDs by writing to `LEDS.
 
 The LED control DSL is described in [`LEDS_FORMAT.md`](LEDS_FORMAT.md).
 
+Firmware downloads and release notes are available in
+[`firmware/README.md`](firmware/README.md).
+
 ## Installation
 
 Choose the level that fits how you want to use SidePulse.
@@ -63,6 +66,44 @@ cd sidepulse
 python3 -m pip install -e .
 sidepulse setup
 ```
+
+### Firmware
+
+Show the firmware version of connected SidePulse devices:
+
+```sh
+sidepulse firmware version
+```
+
+Upgrade a connected device to the latest published firmware for its model:
+
+```sh
+sidepulse firmware upgrade
+sidepulse firmware upgrade --dry-run
+```
+
+The CLI downloads firmware from this repository on GitHub and verifies the ZIP
+and its contents before writing to the device. `--dry-run` downloads and checks
+the package without writing it. With multiple devices connected, select one
+using `--device /Volumes/SidePulse` or `--device /Volumes/PulseDot` (use the actual
+mount path on your computer).
+
+Choose a specific version or install a downloaded ZIP:
+
+```sh
+sidepulse firmware upgrade --version 1.1.0
+sidepulse firmware upgrade --file firmware/v1.1.0/sidepulse-pro-1.1.0-ota.zip
+```
+
+Use the ZIP for your model from the [firmware downloads](firmware/README.md).
+Local ZIPs work offline. The CLI rejects packages for the wrong model and older
+versions, and skips a version that is already installed. Copy-based upgrades
+require a writable device drive.
+
+After the transfer, leave the device connected for at least 10 seconds, then
+reconnect it and run `sidepulse firmware version` to confirm the installed
+version. Reconnecting avoids a cached status file. Use `sidepulse firmware
+version --json` for machine-readable output.
 
 ### Updating
 

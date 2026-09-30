@@ -137,6 +137,9 @@ def build_sidepulse_parser() -> argparse.ArgumentParser:
         help="Show the setup command without downloading or changing anything.",
     )
     update.set_defaults(func=cmd_sidepulse_update)
+    from .firmware import add_firmware_parser
+
+    add_firmware_parser(subparsers)
     subparsers.add_parser(
         "agent-monitor",
         help="Install hooks and show live AI agent statuses.",
