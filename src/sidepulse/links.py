@@ -23,7 +23,7 @@ from .settings import default_config_dir
 DEFAULT_BRIDGE_SERVER = "https://bridge.sidepulse.io"
 PAIRING_TIMEOUT_SECONDS = 5 * 60
 IOS_BUNDLE_ID = "io.sidepulse.ios"
-APNS_TOKEN_PATTERN = re.compile(r"(?:dev_)?[0-9a-f]{64}")
+APNS_TOKEN_PATTERN = re.compile(r"(?:dev_)?[0-9a-f]{64}(?:_[A-Za-z0-9_-]{1,128})?")
 PAIRING_CHANNEL_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -73,10 +73,16 @@ def normalize_server(value: str) -> str:
 
 
 def normalize_apns_token(value: str) -> str:
-    token = "".join(value.split()).lower()
+    text = value.strip()
+    prefix = "dev_" if text[:4].lower() == "dev_" else ""
+    raw = text[4:] if prefix else text
+    device, separator, key = raw.partition("_")
+    # Device-token hex is case-insensitive; shared keys are case-sensitive.
+    token = prefix + "".join(device.split()).lower() + (separator + key if separator else "")
     if not APNS_TOKEN_PATTERN.fullmatch(token):
         raise LinkError(
-            "Push token must be 64 hexadecimal characters, optionally prefixed with 'dev_'."
+            "Push token must be 64 hexadecimal characters, optionally prefixed with 'dev_' "
+            "and suffixed with '_<shared-key>' (1–128 letters, digits, underscores, or hyphens)."
         )
     return token
 
@@ -136,7 +142,9 @@ def store_ios_link(link: IOSLink, path: Path | None = None) -> tuple[IOSLink, ..
     updated: list[IOSLink] = []
     replaced = False
     for existing in current:
-        if existing.token == link.token:
+        existing_device = existing.token[:68] if existing.token.startswith("dev_") else existing.token[:64]
+        new_device = link.token[:68] if link.token.startswith("dev_") else link.token[:64]
+        if existing_device == new_device:
             updated.append(link)
             replaced = True
         else:

@@ -58,6 +58,34 @@ class LinkStorageTests(unittest.TestCase):
                 with self.assertRaises(LinkError):
                     normalize_apns_token(invalid)
 
+    def test_shared_key_case_is_preserved_through_pairing_and_storage(self) -> None:
+        for prefix in ("", "dev_"):
+            token = prefix + TOKEN_A + "_CaseSensitive_key-1234"
+            self.assertEqual(normalize_apns_token(prefix.upper() + TOKEN_A.upper() + "_CaseSensitive_key-1234"), token)
+            response = json.dumps({"v": 1, "type": "ios_registration", "device": {
+                "name": "iPhone", "bundle_id": "io.sidepulse.ios", "push_token": token,
+            }})
+            link = parse_ios_registration(response, server="https://bridge.sidepulse.io")
+            self.assertEqual(link.token, token)
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "links.json"
+                save_ios_links((link,), path)
+                self.assertEqual(load_ios_links(path), (link,))
+
+    def test_pairing_with_a_new_key_replaces_the_same_device_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "links.json"
+            store_ios_link(IOSLink("iPhone", TOKEN_A), path)
+            store_ios_link(IOSLink("iPhone", TOKEN_A + "_old-key"), path)
+            latest = IOSLink("iPhone", TOKEN_A + "_new-key")
+            self.assertEqual(store_ios_link(latest, path), (latest,))
+            self.assertEqual(load_ios_links(path), (latest,))
+
+    def test_malformed_shared_key_suffix_is_rejected(self) -> None:
+        for suffix in ("", "a" * 129, "bad/key", "bad.key", "bad key", "é"):
+            with self.subTest(suffix=suffix), self.assertRaises(LinkError):
+                normalize_apns_token(TOKEN_A + "_" + suffix)
+
     def test_development_registration_response_keeps_prefix(self) -> None:
         response = json.dumps(
             {
@@ -521,6 +549,8 @@ class IOSPayloadTests(unittest.TestCase):
         for token, expected_url in (
             (TOKEN_A, f"https://bridge.sidepulse.io/api/leds/apns_{TOKEN_A}"),
             (DEV_TOKEN_A, f"https://bridge.sidepulse.io/api/leds/apns_dev_{TOKEN_A}"),
+            (TOKEN_A + "_CaseSensitive_key", f"https://bridge.sidepulse.io/api/leds/apns_{TOKEN_A}_CaseSensitive_key"),
+            (DEV_TOKEN_A + "_CaseSensitive_key", f"https://bridge.sidepulse.io/api/leds/apns_dev_{TOKEN_A}_CaseSensitive_key"),
         ):
             with self.subTest(token_prefix=token[:4]), patch(
                 "sidepulse.links.urllib.request.urlopen", return_value=response

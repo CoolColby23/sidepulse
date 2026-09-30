@@ -227,7 +227,30 @@ sector and updates its directory size, preserving its FAT allocation.
 Run one command and either scan the terminal QR code with the SidePulse iOS app
 or paste the push token shown by the app. Production tokens have 64 hexadecimal
 characters; development tokens have the `dev_` prefix followed by 64 hexadecimal
-characters. Keep the prefix when pasting or saving a development token.
+characters. The app appends `_<shared-key>` to identify this sender; keep that
+suffix and its exact letter case when pasting or saving the token. Keep the
+`dev_` prefix on development tokens. Removing the key in the iOS app stops this
+sender's pushes from being processed; pair again to receive a new key.
+
+Pairing issues the key in the iOS app. Saving a new token for the same device
+and APNs environment replaces its previous saved link. The CLI preserves the
+key's case and sends the entire token in the bridge URL; the updated bridge
+strips the suffix for Apple and adds it as top-level `shared_key` in both the
+push and recovery payloads. A request body cannot override that key.
+
+The app accepts only locally active keys. Missing, unknown, or removed keys
+produce no LED write, inbox entry, sender activity, or link-state change. Their
+notifications are suppressed in the foreground and dismissed when the app or
+**Update from Server** handles them. The update action finishes quietly when
+there is nothing authorized to update; with no active keys it skips fetching.
+Background alerts can appear before iOS lets the app run cleanup.
+
+Settings → **Active Push Keys** shows only the last four key characters, last
+accepted activity, and lifetime received count. The app deduplicates the latest
+256 event/message IDs per sender across push and recovery. Removing a key
+revokes it on the phone; removing a saved CLI link alone does not revoke the
+phone's key. Use matching updated versions of the bridge, iOS app, and CLI;
+older unkeyed senders must obtain a new token.
 
 ```sh
 sidepulse link
