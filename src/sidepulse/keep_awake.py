@@ -200,7 +200,7 @@ def keepalive_file_for_target(target: Path) -> Path:
 
 def read_status_file(path: Path) -> None:
     from .device_writer import device_write_lock
-    from .readonly_control import read_status_bytes
+    from .status_reader import read_status_bytes
 
     with device_write_lock(path.parent):
         read_status_bytes(path)

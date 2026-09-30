@@ -11,7 +11,7 @@ import pytest
 from sidepulse import device_writer as writer
 from sidepulse import readonly_control as readonly
 from sidepulse import usb_control as usb
-from sidepulse import keep_awake
+from sidepulse import keep_awake, status_reader
 
 
 @pytest.fixture
@@ -287,7 +287,7 @@ def test_writer_serializes_threads(volume):
 
 def test_readonly_keepalive_reads_status(volume):
     with patch.object(keep_awake.subprocess, "run") as run, patch.object(
-        readonly, "read_status_bytes"
+        status_reader, "read_status_bytes"
     ) as read:
         controller = keep_awake.KeepAwakeController(status_read_async=False)
         assert controller.poke_status_file(volume / "LEDS.LED", now=0) == volume / "STATUS.TXT"
@@ -297,15 +297,15 @@ def test_readonly_keepalive_reads_status(volume):
 
 def test_keepalive_reads_status_without_firmware_validation(volume):
     (volume / "STATUS.TXT").write_text("legacy status\n")
-    with patch.object(readonly.sys, "platform", "linux"):
+    with patch.object(status_reader.sys, "platform", "linux"):
         keep_awake.read_status_file(volume / "STATUS.TXT")
     assert not (volume / "keepalive").exists()
 
 
 def test_keepalive_uses_uncached_mac_reader(volume):
-    from sidepulse._vendor import read2me
+    from sidepulse import status_reader as read2me
 
-    with patch.object(readonly.sys, "platform", "darwin"), patch.object(
+    with patch.object(status_reader.sys, "platform", "darwin"), patch.object(
         read2me, "_MacFile"
     ) as reader:
         reader.return_value.__enter__.return_value.read_at.return_value = b"status"
@@ -316,9 +316,9 @@ def test_keepalive_uses_uncached_mac_reader(volume):
 
 
 def test_keepalive_cache_invalidation_failure_prevents_read(volume):
-    from sidepulse._vendor import read2me
+    from sidepulse import status_reader as read2me
 
-    with patch.object(readonly.sys, "platform", "darwin"), patch.object(
+    with patch.object(status_reader.sys, "platform", "darwin"), patch.object(
         read2me, "_MacFile"
     ) as reader:
         stream = reader.return_value.__enter__.return_value
